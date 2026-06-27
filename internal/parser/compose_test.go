@@ -15,6 +15,11 @@ services:
     image: example/web:v1
     ports:
       - "8080:80"
+    networks:
+      frontend:
+        ipv4_address: 10.10.10.20
+    labels:
+      - "traefik.http.routers.web.rule=Host('web.example.test')"
     depends_on:
       - db
     environment:
@@ -45,4 +50,19 @@ services:
 	if got := project.Services[1].EnvVars; len(got) != 2 || got[0] != "LOG_LEVEL" || got[1] != "SECRET_TOKEN" {
 		t.Fatalf("env vars = %v, want names only", got)
 	}
+	if !contains(project.Services[1].Exposure, "http://10.10.10.20:80") {
+		t.Fatalf("exposure = %v, want static IP route", project.Services[1].Exposure)
+	}
+	if !contains(project.Services[1].Exposure, "https://web.example.test") {
+		t.Fatalf("exposure = %v, want traefik host route", project.Services[1].Exposure)
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

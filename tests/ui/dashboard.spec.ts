@@ -98,16 +98,20 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
   await page.goto(baseURL);
   await expect(page.getByRole("heading", { name: "GitOps Dashboard" })).toBeVisible();
   await expectMetric(page, "unknown", "0");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
+  await page.getByLabel("Use dark theme").check();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByLabel("Use dark theme").uncheck();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 
-  const repositoryPanel = panel(page, "Repositories");
-  await expect(repositoryPanel.locator(".row").filter({ hasText: "fixture" })).toContainText("not scanned");
   await page.getByRole("button", { name: "Refresh" }).click();
-  await expect(repositoryPanel.locator(".row").filter({ hasText: "fixture" })).toContainText("not scanned");
+  await expectMetric(page, "unknown", "0");
+  await expect(page.getByText("Commit")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Scan" }).click();
 
-  await expect(repositoryPanel.locator(".row").filter({ hasText: "fixture" })).toContainText("ok");
-  await expect(repositoryPanel.locator(".row").filter({ hasText: "fixture" })).not.toContainText("not scanned");
   await expectMetric(page, "unknown", "2");
 
   const servicesPanel = panel(page, "Services");
@@ -116,43 +120,29 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
   const apiCard = serviceGrid.locator("article.service").filter({ hasText: "api" });
   await expect(webCard).toBeVisible();
   await expect(webCard).toContainText("compose");
-  await expect(webCard).toContainText("production");
-  await expect(webCard).toContainText("prod/compose.yaml");
-  await expect(webCard).toContainText("example/web:v1");
-  await expect(webCard).toContainText("Config: APP_ENV");
-  await expect(webCard).toContainText("missing healthcheck");
+  await expect(webCard).toContainText("web.example.test");
   await expect(apiCard).toBeVisible();
   await expect(apiCard).toContainText("kubernetes");
+  await expect(apiCard).toContainText("api.example.test");
 
-  const scanRow = panel(page, "Scan History").locator(".scanRow").filter({ hasText: "fixture" }).first();
-  await expect(scanRow).toContainText("ok");
-  await expect(scanRow).not.toContainText("not recorded");
-
-  await servicesPanel.getByRole("combobox").selectOption("compose");
+  await servicesPanel.getByRole("button", { name: /^Compose/ }).click();
   await expect(serviceGrid.locator("article.service")).toHaveCount(1);
   await expect(webCard).toBeVisible();
-  await servicesPanel.getByRole("combobox").selectOption("kubernetes");
+  await servicesPanel.getByRole("button", { name: /^Kubernetes/ }).click();
   await expect(serviceGrid.locator("article.service")).toHaveCount(1);
   await expect(apiCard).toBeVisible();
-  await expect(detailPanel(page)).toContainText("Deployment");
-  await expect(detailPanel(page)).toContainText("prod");
   await expect(detailPanel(page)).toContainText("api");
-  await servicesPanel.getByRole("combobox").selectOption("all");
+  await servicesPanel.getByRole("button", { name: /^All/ }).click();
   await expect(serviceGrid.locator("article.service")).toHaveCount(2);
 
-  await page.locator("article.service").filter({ hasText: "api" }).click();
+  await apiCard.getByRole("heading", { name: "api" }).click();
   const detail = detailPanel(page);
-  await expect(detail.getByText("example/api:v1")).toBeVisible();
-  await expect(detail).toContainText("8080");
-  await expect(detail).toContainText("configMapRef/api-config");
+  await expect(detail.getByRole("heading", { name: "api" })).toBeVisible();
+  await expect(detail.getByRole("link", { name: "api.example.test" })).toHaveAttribute("href", "https://api.example.test/");
   await expect(detail.getByText("No live runtime status has been recorded for this service.")).toBeVisible();
 
-  await webCard.click();
-  await expect(detail).toContainText("8080:80");
-  await expect(detail).toContainText("db");
-  await expect(detail).toContainText("/srv/web:/data");
-  await expect(detail).toContainText("frontend");
-  await expect(detail).toContainText("APP_ENV");
+  await webCard.getByRole("heading", { name: "web" }).click();
+  await expect(detail.getByRole("link", { name: "web.example.test" })).toHaveAttribute("href", "https://web.example.test");
 
   await page.getByRole("button", { name: "Check Health" }).click();
   await expectMetric(page, "healthy", "1");
@@ -212,6 +202,8 @@ function createFixtureRepo(dir: string) {
     "      APP_ENV: production",
     "    ports:",
     "      - \"8080:80\"",
+    "    labels:",
+    "      - \"traefik.http.routers.web.rule=Host('web.example.test')\"",
     "    volumes:",
     "      - \"/srv/web:/data\"",
     "    networks:",
@@ -224,8 +216,16 @@ function createFixtureRepo(dir: string) {
     "metadata:",
     "  name: api",
     "  namespace: prod",
+    "  labels:",
+    "    app: api",
     "spec:",
+    "  selector:",
+    "    matchLabels:",
+    "      app: api",
     "  template:",
+    "    metadata:",
+    "      labels:",
+    "        app: api",
     "    spec:",
     "      containers:",
     "        - name: api",
@@ -243,6 +243,35 @@ function createFixtureRepo(dir: string) {
     "            httpGet:",
     "              path: /health",
     "              port: 8080",
+    "---",
+    "apiVersion: v1",
+    "kind: Service",
+    "metadata:",
+    "  name: api",
+    "  namespace: prod",
+    "spec:",
+    "  selector:",
+    "    app: api",
+    "  ports:",
+    "    - port: 80",
+    "      targetPort: 8080",
+    "---",
+    "apiVersion: networking.k8s.io/v1",
+    "kind: Ingress",
+    "metadata:",
+    "  name: api",
+    "  namespace: prod",
+    "spec:",
+    "  rules:",
+    "    - host: api.example.test",
+    "      http:",
+    "        paths:",
+    "          - path: /",
+    "            backend:",
+    "              service:",
+    "                name: api",
+    "                port:",
+    "                  number: 80",
     ""
   ].join("\n"));
   runGit(dir, "init", "-b", "main");
@@ -303,7 +332,7 @@ function panel(page: Page, heading: string) {
 }
 
 function detailPanel(page: Page) {
-  return panel(page, "Service Detail");
+  return page.locator("section.detailPanel");
 }
 
 async function expectMetric(page: Page, health: string, value: string) {

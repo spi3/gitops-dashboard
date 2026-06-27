@@ -3,46 +3,27 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 type Health = "healthy" | "degraded" | "unhealthy" | "unknown" | "error";
+type RuntimeFilter = "all" | "compose" | "kubernetes";
+type HealthFilter = "all" | Health;
+type Theme = "light" | "dark";
 
 type Repository = {
   name: string;
-  url: string;
-  defaultRef: string;
-  lastCommit: string;
-  lastScanAt: string;
-  status: string;
-  error: string;
 };
 
 type Scan = {
   id: number;
-  repository: string;
   status: string;
-  commitSha: string;
-  startedAt: string;
-  finishedAt: string;
-  error: string;
 };
 
 type Service = {
   id: string;
   name: string;
   repository: string;
-  sourceCommit: string;
   runtime: string;
-  kind: string;
-  namespace: string;
-  resourceName: string;
-  sourcePath: string;
   environment: string;
   health: Health;
-  images: string[];
-  ports: string[];
-  dependencies: string[];
-  storage: string[];
   exposure: string[];
-  configRefs: string[];
-  warnings: string[];
 };
 
 type StatusResult = {
@@ -61,6 +42,8 @@ type DashboardSummary = {
   generatedAt: string;
 };
 
+const healthOrder: Health[] = ["healthy", "degraded", "unhealthy", "unknown", "error"];
+
 const stateLabel: Record<Health, string> = {
   healthy: "Healthy",
   degraded: "Degraded",
@@ -69,11 +52,22 @@ const stateLabel: Record<Health, string> = {
   error: "Error"
 };
 
+const runtimeLabels: Record<RuntimeFilter, string> = {
+  all: "All",
+  compose: "Compose",
+  kubernetes: "Kubernetes"
+};
+
+const themeStorageKey = "gitops-dashboard-theme";
+
 function App() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [error, setError] = useState<string>("");
-  const [selectedRuntime, setSelectedRuntime] = useState<string>("all");
+  const [selectedRuntime, setSelectedRuntime] = useState<RuntimeFilter>("all");
+  const [selectedHealth, setSelectedHealth] = useState<HealthFilter>("all");
   const [selectedServiceId, setSelectedServiceId] = useState<string>("");
+  const [query, setQuery] = useState<string>("");
+  const [theme, setTheme] = useState<Theme>(initialTheme);
 
   async function load() {
     setError("");
@@ -90,41 +84,25 @@ function App() {
 
   async function post(path: string) {
     setError("");
-    const response = await fetch(path, { method: "POST" });
-    if (!response.ok) {
-      setError(`${path} failed: ${response.status}`);
-      return;
+    try {
+      const response = await fetch(path, { method: "POST" });
+      if (!response.ok) {
+        throw new Error(`${path} failed: ${response.status}`);
+      }
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `${path} failed`);
     }
-    await load();
   }
 
   useEffect(() => {
     void load();
   }, []);
 
-  const services = useMemo(() => {
-    if (!summary) {
-      return [];
-    }
-    if (selectedRuntime === "all") {
-      return summary.services;
-    }
-    return summary.services.filter((service) => service.runtime === selectedRuntime);
-  }, [selectedRuntime, summary]);
-
-  const selectedService = useMemo(() => {
-    if (!summary) {
-      return null;
-    }
-    return services.find((service) => service.id === selectedServiceId) ?? services[0] ?? null;
-  }, [selectedServiceId, services, summary]);
-
-  const selectedStatuses = useMemo(() => {
-    if (!selectedService || !summary) {
-      return [];
-    }
-    return summary.statuses.filter((status) => status.serviceId === selectedService.id);
-  }, [selectedService, summary]);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(themeStorageKey, theme);
+  }, [theme]);
 
   const counts = useMemo(() => {
     const result: Record<Health, number> = {
@@ -140,15 +118,77 @@ function App() {
     return result;
   }, [summary]);
 
+  const runtimeCounts = useMemo(() => {
+    const result: Record<RuntimeFilter, number> = {
+      all: summary?.services.length ?? 0,
+      compose: 0,
+      kubernetes: 0
+    };
+    for (const service of summary?.services ?? []) {
+      if (service.runtime === "compose" || service.runtime === "kubernetes") {
+        result[service.runtime] += 1;
+      }
+    }
+    return result;
+  }, [summary]);
+
+  const services = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return (summary?.services ?? []).filter((service) => {
+      if (selectedRuntime !== "all" && service.runtime !== selectedRuntime) {
+        return false;
+      }
+      if (selectedHealth !== "all" && service.health !== selectedHealth) {
+        return false;
+      }
+      if (normalizedQuery === "") {
+        return true;
+      }
+      return searchableServiceText(service).includes(normalizedQuery);
+    });
+  }, [query, selectedHealth, selectedRuntime, summary]);
+
+  const selectedService = useMemo(() => {
+    return services.find((service) => service.id === selectedServiceId) ?? services[0] ?? null;
+  }, [selectedServiceId, services]);
+
+  const selectedStatuses = useMemo(() => {
+    if (!selectedService || !summary) {
+      return [];
+    }
+    return summary.statuses.filter((status) => status.serviceId === selectedService.id);
+  }, [selectedService, summary]);
+
+  const latestScan = summary?.scans[0] ?? null;
+  const totalServices = summary?.services.length ?? 0;
+  const selectedAccess = selectedService ? accessTargets(selectedService) : [];
+
   return (
-    <main>
-      <header className="topbar">
-        <div>
+    <main className="appShell">
+      <header className="commandBar">
+        <div className="brandBlock">
           <h1>GitOps Dashboard</h1>
-          <p>Read-only inventory and health for GitOps repositories.</p>
+          <div className="systemMeta" aria-label="Dashboard summary">
+            <span>{summary?.repositories.length ?? 0} repos</span>
+            <span>{totalServices} services</span>
+            <span>{latestScan ? `last scan ${latestScan.status}` : "not scanned"}</span>
+            <span>{summary?.generatedAt ? formatDate(summary.generatedAt) : "loading"}</span>
+          </div>
         </div>
         <div className="actions">
-          <button onClick={() => void post("/api/scan")}>Scan</button>
+          <label className="themeToggle">
+            <input
+              type="checkbox"
+              checked={theme === "dark"}
+              onChange={(event) => setTheme(event.target.checked ? "dark" : "light")}
+              aria-label="Use dark theme"
+            />
+            <span className="switchTrack" aria-hidden="true">
+              <span className="switchThumb" />
+            </span>
+            <span>Dark</span>
+          </label>
+          <button className="primaryAction" onClick={() => void post("/api/scan")}>Scan</button>
           <button onClick={() => void post("/api/monitor")}>Check Health</button>
           <button onClick={() => void load()}>Refresh</button>
         </div>
@@ -156,8 +196,8 @@ function App() {
 
       {error ? <section className="error">{error}</section> : null}
 
-      <section className="metrics">
-        {(Object.keys(counts) as Health[]).map((health) => (
+      <section className="metrics" aria-label="Service health">
+        {healthOrder.map((health) => (
           <article key={health} className={`metric ${health}`}>
             <span>{stateLabel[health]}</span>
             <strong>{counts[health]}</strong>
@@ -165,148 +205,211 @@ function App() {
         ))}
       </section>
 
-      <section className="panel">
-        <div className="panelHeader">
-          <h2>Repositories</h2>
-          <span>{summary?.repositories.length ?? 0}</span>
-        </div>
-        <div className="table">
-          <div className="row head">
-            <span>Name</span>
-            <span>Ref</span>
-            <span>Status</span>
-            <span>Commit</span>
-          </div>
-          {(summary?.repositories ?? []).map((repo) => (
-            <div className="row" key={repo.name}>
-              <span>{repo.name}</span>
-              <span>{repo.defaultRef || "default"}</span>
-              <span>{repo.error || repo.status || "unknown"}</span>
-              <span>{repo.lastCommit || "not scanned"}</span>
+      <div className="workspace">
+        <section className="panel inventoryPanel">
+          <div className="panelHeader inventoryHeader">
+            <div>
+              <h2>Services</h2>
+              <span className="panelCount">{services.length} of {totalServices}</span>
             </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panelHeader">
-          <h2>Scan History</h2>
-          <span>{summary?.scans.length ?? 0}</span>
-        </div>
-        <div className="table scans">
-          <div className="row scanRow head">
-            <span>Repository</span>
-            <span>Status</span>
-            <span>Commit</span>
-            <span>Finished</span>
-          </div>
-          {(summary?.scans ?? []).map((scan) => (
-            <div className="row scanRow" key={scan.id}>
-              <span>{scan.repository}</span>
-              <span>{scan.error || scan.status}</span>
-              <span>{scan.commitSha || "not recorded"}</span>
-              <span>{scan.finishedAt || scan.startedAt}</span>
+            <div className="inventoryControls">
+              <label className="searchField">
+                <span className="srOnly">Search services</span>
+                <input
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search services"
+                />
+              </label>
+              <div className="segmented" aria-label="Runtime filter">
+                {(Object.keys(runtimeLabels) as RuntimeFilter[]).map((runtime) => (
+                  <button
+                    key={runtime}
+                    className={selectedRuntime === runtime ? "selected" : ""}
+                    aria-pressed={selectedRuntime === runtime}
+                    onClick={() => setSelectedRuntime(runtime)}
+                  >
+                    <span>{runtimeLabels[runtime]}</span>
+                    <strong>{runtimeCounts[runtime]}</strong>
+                  </button>
+                ))}
+              </div>
+              <label className="healthFilter">
+                <span className="srOnly">Health filter</span>
+                <select
+                  value={selectedHealth}
+                  onChange={(event) => setSelectedHealth(event.target.value as HealthFilter)}
+                >
+                  <option value="all">All health</option>
+                  {healthOrder.map((health) => (
+                    <option key={health} value={health}>{stateLabel[health]}</option>
+                  ))}
+                </select>
+              </label>
             </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panelHeader">
-          <h2>Services</h2>
-          <select value={selectedRuntime} onChange={(event) => setSelectedRuntime(event.target.value)}>
-            <option value="all">All runtimes</option>
-            <option value="compose">Docker Compose</option>
-            <option value="kubernetes">Kubernetes</option>
-          </select>
-        </div>
-        <div className="serviceGrid">
-          {services.map((service) => (
-            <article
-              className={`service ${selectedService?.id === service.id ? "selected" : ""}`}
-              key={service.id}
-              onClick={() => setSelectedServiceId(service.id)}
-            >
-              <div className="serviceTitle">
-                <h3>{service.name}</h3>
+          </div>
+          <div className="serviceGrid serviceList">
+            {services.map((service) => (
+              <article
+                className={`service ${selectedService?.id === service.id ? "selected" : ""}`}
+                key={service.id}
+                onClick={() => setSelectedServiceId(service.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelectedServiceId(service.id);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+              >
+                <div className="serviceTitle">
+                  <h3>{service.name}</h3>
+                  <span>{service.runtime}</span>
+                </div>
+                <div className="accessCell">
+                  {accessTargets(service).slice(0, 3).map((route) => (
+                    <a
+                      href={route.href}
+                      key={route.href}
+                      onClick={(event) => event.stopPropagation()}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      {route.label}
+                    </a>
+                  ))}
+                  {accessTargets(service).length === 0 ? <span>No route discovered</span> : null}
+                </div>
                 <span className={`badge ${service.health}`}>{stateLabel[service.health]}</span>
-              </div>
-              <dl>
-                <dt>Repository</dt>
-                <dd>{service.repository}</dd>
-                <dt>Runtime</dt>
-                <dd>{service.runtime}</dd>
-                <dt>Environment</dt>
-                <dd>{service.environment || "unknown"}</dd>
-                <dt>Source</dt>
-                <dd>{service.sourcePath}</dd>
-              </dl>
-              <p>{formatList(service.images, "No image declared")}</p>
-              {service.configRefs.length ? <p>Config: {service.configRefs.join(", ")}</p> : null}
-              {service.warnings.length ? (
-                <ul>
-                  {service.warnings.map((warning) => <li key={warning}>{warning}</li>)}
-                </ul>
-              ) : null}
-            </article>
-          ))}
-        </div>
-      </section>
-
-      {selectedService ? (
-        <section className="panel">
-          <div className="panelHeader">
-            <h2>Service Detail</h2>
-            <span className={`badge ${selectedService.health}`}>{stateLabel[selectedService.health]}</span>
-          </div>
-          <div className="detailGrid">
-            <dl>
-              <dt>Name</dt>
-              <dd>{selectedService.name}</dd>
-              <dt>Repository</dt>
-              <dd>{selectedService.repository}</dd>
-              <dt>Commit</dt>
-              <dd>{selectedService.sourceCommit || "not scanned"}</dd>
-              <dt>Kind</dt>
-              <dd>{selectedService.kind || selectedService.runtime}</dd>
-              <dt>Namespace</dt>
-              <dd>{selectedService.namespace || "default"}</dd>
-              <dt>Resource</dt>
-              <dd>{selectedService.resourceName || selectedService.name}</dd>
-            </dl>
-            <dl>
-              <dt>Images</dt>
-              <dd>{formatList(selectedService.images, "none")}</dd>
-              <dt>Ports</dt>
-              <dd>{formatList(selectedService.ports, "none")}</dd>
-              <dt>Dependencies</dt>
-              <dd>{formatList(selectedService.dependencies, "none")}</dd>
-              <dt>Storage</dt>
-              <dd>{formatList(selectedService.storage, "none")}</dd>
-              <dt>Exposure</dt>
-              <dd>{formatList(selectedService.exposure, "none")}</dd>
-              <dt>Config</dt>
-              <dd>{formatList(selectedService.configRefs, "none")}</dd>
-            </dl>
-          </div>
-          <div className="statusList">
-            {selectedStatuses.length ? selectedStatuses.map((status) => (
-              <div className="statusItem" key={`${status.serviceId}-${status.target}`}>
-                <span className={`badge ${status.health}`}>{stateLabel[status.health]}</span>
-                <strong>{status.target}</strong>
-                <span>{status.message || "no message"}</span>
-                <time>{status.checkedAt || "not checked"}</time>
-              </div>
-            )) : <p>No live runtime status has been recorded for this service.</p>}
+              </article>
+            ))}
+            {services.length === 0 ? <p className="emptyState">No services match the current filters.</p> : null}
           </div>
         </section>
-      ) : null}
+
+        {selectedService ? (
+          <section className="panel detailPanel">
+            <div className="panelHeader detailHeader">
+              <div>
+                <h2>{selectedService.name}</h2>
+                <span className="panelCount">{selectedService.runtime} / {selectedService.repository}</span>
+              </div>
+              <span className={`badge ${selectedService.health}`}>{stateLabel[selectedService.health]}</span>
+            </div>
+            <div className="detailBody">
+              <div className="accessList">
+                {selectedAccess.length ? selectedAccess.map((route) => (
+                  <a href={route.href} key={route.href} rel="noreferrer" target="_blank">
+                    {route.label}
+                  </a>
+                )) : <p>No access route was discovered in Git.</p>}
+              </div>
+            </div>
+            <div className="statusList">
+              {selectedStatuses.length ? selectedStatuses.map((status) => (
+                <div className="statusItem" key={`${status.serviceId}-${status.target}`}>
+                  <span className={`badge ${status.health}`}>{stateLabel[status.health]}</span>
+                  <strong>{status.target}</strong>
+                  <span>{status.message || "no message"}</span>
+                  <time>{status.checkedAt ? formatDate(status.checkedAt) : "not checked"}</time>
+                </div>
+              )) : <p>No live runtime status has been recorded for this service.</p>}
+            </div>
+          </section>
+        ) : null}
+      </div>
     </main>
   );
 }
 
-function formatList(values: string[], fallback: string) {
-  return values.length ? values.join(", ") : fallback;
+function initialTheme(): Theme {
+  const savedTheme = window.localStorage.getItem(themeStorageKey);
+  if (savedTheme === "light" || savedTheme === "dark") {
+    return savedTheme;
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function searchableServiceText(service: Service) {
+  return [
+    service.name,
+    service.repository,
+    service.runtime,
+    service.environment,
+    ...service.exposure
+  ].join(" ").toLowerCase();
+}
+
+function formatDate(value: string) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function accessTargets(service: Service) {
+  const targets = new Map<string, { href: string; label: string }>();
+  for (const route of service.exposure.filter(isAccessRoute)) {
+    const href = hrefForRoute(route);
+    const key = href.replace(/\/$/, "");
+    if (!targets.has(key)) {
+      targets.set(key, { href, label: labelForRoute(route) });
+    }
+  }
+  return Array.from(targets.values());
+}
+
+function isAccessRoute(value: string) {
+  const host = hostForRoute(value);
+  if (isClusterInternalHost(host)) {
+    return false;
+  }
+  if (/^(https?|ssh):\/\//.test(value)) {
+    return true;
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?(\/.*)?$/.test(value)) {
+    return true;
+  }
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:\d+)?(\/.*)?$/i.test(value);
+}
+
+function hrefForRoute(value: string) {
+  if (/^(https?|ssh):\/\//.test(value)) {
+    return value;
+  }
+  const host = hostForRoute(value);
+  const scheme = host.endsWith(".lan") || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? "http" : "https";
+  return `${scheme}://${value}`;
+}
+
+function labelForRoute(value: string) {
+  return value.replace(/^(https?|ssh):\/\//, "").replace(/\/$/, "");
+}
+
+function hostForRoute(value: string) {
+  if (/^(https?|ssh):\/\//.test(value)) {
+    try {
+      return new URL(value).hostname;
+    } catch {
+      return "";
+    }
+  }
+  return value.split(/[/:]/, 1)[0] ?? "";
+}
+
+function isClusterInternalHost(host: string) {
+  return host.endsWith(".svc") || host.includes(".svc.") || host.endsWith(".cluster.local");
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

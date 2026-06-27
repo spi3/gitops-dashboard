@@ -36,7 +36,7 @@ func (scanner Scanner) RunScheduled(ctx context.Context) {
 	if len(scanner.cfg.Repositories) == 0 {
 		return
 	}
-	if err := os.MkdirAll(scanner.cfg.Server.RepoCacheDir, 0o700); err != nil {
+	if _, err := scanner.ensureRepoCacheDir(); err != nil {
 		scanner.logger.Error("scheduled scans disabled", "error", err)
 		return
 	}
@@ -58,8 +58,8 @@ func (scanner Scanner) RunScheduled(ctx context.Context) {
 }
 
 func (scanner Scanner) ScanAll(ctx context.Context) error {
-	if err := os.MkdirAll(scanner.cfg.Server.RepoCacheDir, 0o700); err != nil {
-		return fmt.Errorf("create repository cache: %w", err)
+	if _, err := scanner.ensureRepoCacheDir(); err != nil {
+		return err
 	}
 	if err := scanner.store.EnsureRepositories(ctx, scanner.cfg.Repositories); err != nil {
 		return err
@@ -109,14 +109,20 @@ func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig
 		services, err = scanner.parseRepo(path, repo.Name, strings.TrimSpace(commit))
 		return err
 	}()
-	if err := scanner.store.FinishScan(ctx, scanID, repo.Name, strings.TrimSpace(commit), services, scanErr); err != nil {
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := scanner.store.FinishScan(finishCtx, scanID, repo.Name, strings.TrimSpace(commit), services, scanErr); err != nil {
 		return err
 	}
 	return scanErr
 }
 
 func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
-	repoPath := filepath.Join(scanner.cfg.Server.RepoCacheDir, safeName(repo.Name))
+	repoCacheDir, err := scanner.ensureRepoCacheDir()
+	if err != nil {
+		return "", err
+	}
+	repoPath := filepath.Join(repoCacheDir, safeName(repo.Name))
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
 		if _, err := gitOutput(ctx, repoPath, gitEnv(repo), "fetch", "--all", "--prune"); err != nil {
 			return "", err
@@ -143,10 +149,21 @@ func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfi
 		args = append(args, "--branch", repo.DefaultRef)
 	}
 	args = append(args, cloneURL, repoPath)
-	if _, err := gitOutput(ctx, scanner.cfg.Server.RepoCacheDir, gitEnv(repo), args...); err != nil {
+	if _, err := gitOutput(ctx, repoCacheDir, gitEnv(repo), args...); err != nil {
 		return "", err
 	}
 	return repoPath, nil
+}
+
+func (scanner Scanner) ensureRepoCacheDir() (string, error) {
+	repoCacheDir, err := filepath.Abs(scanner.cfg.Server.RepoCacheDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository cache: %w", err)
+	}
+	if err := os.MkdirAll(repoCacheDir, 0o700); err != nil {
+		return "", fmt.Errorf("create repository cache: %w", err)
+	}
+	return repoCacheDir, nil
 }
 
 func (scanner Scanner) cloneURL(repo config.RepositoryConfig) (string, error) {
@@ -167,6 +184,8 @@ func (scanner Scanner) cloneURL(repo config.RepositoryConfig) (string, error) {
 
 func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Service, error) {
 	var services []core.Service
+	var kubeResources []parser.KubernetesResource
+	var traefikRoutes []parser.TraefikRoute
 	var parseErrors []string
 	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -197,7 +216,16 @@ func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Serv
 				parseErrors = append(parseErrors, fmt.Sprintf("%s: %v", rel, err))
 				return nil
 			}
-			services = append(services, scanner.kubeServices(repoName, commit, rel, parsed)...)
+			for i := range parsed {
+				parsed[i].SourcePath = rel
+			}
+			kubeResources = append(kubeResources, parsed...)
+			routes, err := parser.ParseTraefikRoutes(path)
+			if err != nil {
+				parseErrors = append(parseErrors, fmt.Sprintf("%s: %v", rel, err))
+				return nil
+			}
+			traefikRoutes = append(traefikRoutes, routes...)
 		}
 		return nil
 	})
@@ -208,6 +236,8 @@ func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Serv
 		sort.Strings(parseErrors)
 		return services, fmt.Errorf("parse errors: %s", strings.Join(parseErrors, "; "))
 	}
+	services = append(services, scanner.kubeServices(repoName, commit, enrichKubernetesExposure(kubeResources))...)
+	services = applyTraefikRoutes(services, traefikRoutes)
 	return services, nil
 }
 
@@ -231,7 +261,7 @@ func (scanner Scanner) composeServices(repoName, commit, sourcePath string, proj
 			Ports:        svc.Ports,
 			Dependencies: svc.DependsOn,
 			Storage:      svc.Volumes,
-			Exposure:     svc.Networks,
+			Exposure:     uniqueSorted(append(append([]string{}, svc.Networks...), svc.Exposure...)),
 			ConfigRefs:   svc.EnvVars,
 			Warnings:     warnings,
 		})
@@ -239,27 +269,28 @@ func (scanner Scanner) composeServices(repoName, commit, sourcePath string, proj
 	return services
 }
 
-func (scanner Scanner) kubeServices(repoName, commit, sourcePath string, resources []parser.KubernetesResource) []core.Service {
+func (scanner Scanner) kubeServices(repoName, commit string, resources []parser.KubernetesResource) []core.Service {
 	var services []core.Service
 	for _, resource := range resources {
 		if !resource.IsWorkload() {
 			continue
 		}
-		id := serviceID(repoName, "kubernetes", sourcePath, resource.Namespace+"/"+resource.Name)
+		id := serviceID(repoName, "kubernetes", resource.SourcePath, resource.Namespace+"/"+resource.Name)
 		services = append(services, core.Service{
 			ID:           id,
 			Name:         resource.Name,
 			Repository:   repoName,
 			SourceCommit: commit,
-			SourcePath:   sourcePath,
+			SourcePath:   resource.SourcePath,
 			Runtime:      "kubernetes",
 			Kind:         resource.Kind,
 			Namespace:    resource.Namespace,
 			ResourceName: resource.Name,
-			Environment:  environment.Infer(sourcePath),
+			Environment:  environment.Infer(resource.SourcePath),
 			Health:       core.HealthUnknown,
 			Images:       resource.Images,
 			Ports:        resource.Ports,
+			Dependencies: resource.Dependencies,
 			Storage:      resource.Storage,
 			Exposure:     resource.Exposure,
 			ConfigRefs:   resource.ConfigRefs,
@@ -267,6 +298,94 @@ func (scanner Scanner) kubeServices(repoName, commit, sourcePath string, resourc
 		})
 	}
 	return services
+}
+
+func enrichKubernetesExposure(resources []parser.KubernetesResource) []parser.KubernetesResource {
+	ingressByService := map[string][]string{}
+	configByName := map[string][]string{}
+	var services []parser.KubernetesResource
+	for _, resource := range resources {
+		key := namespacedName(resource.Namespace, resource.Name)
+		if resource.Kind == "Ingress" {
+			for _, backend := range resource.Backends {
+				ingressByService[namespacedName(resource.Namespace, backend)] = append(ingressByService[namespacedName(resource.Namespace, backend)], resource.Exposure...)
+			}
+		}
+		if resource.Kind == "ConfigMap" {
+			configByName[key] = append(configByName[key], resource.Exposure...)
+		}
+		if resource.Kind == "Service" {
+			services = append(services, resource)
+		}
+	}
+	for i := range resources {
+		resource := &resources[i]
+		if !resource.IsWorkload() {
+			continue
+		}
+		exposure := append([]string{}, resource.Exposure...)
+		for _, service := range services {
+			if service.Namespace != resource.Namespace || !selectorMatches(service.Selector, resource.Labels) {
+				continue
+			}
+			exposure = append(exposure, service.Exposure...)
+			exposure = append(exposure, ingressByService[namespacedName(service.Namespace, service.Name)]...)
+		}
+		for _, ref := range resource.ConfigRefs {
+			if strings.HasPrefix(ref, "ConfigMap/") {
+				exposure = append(exposure, configByName[namespacedName(resource.Namespace, strings.TrimPrefix(ref, "ConfigMap/"))]...)
+			}
+		}
+		resource.Exposure = uniqueSorted(exposure)
+	}
+	return resources
+}
+
+func selectorMatches(selector, labels map[string]string) bool {
+	if len(selector) == 0 || len(labels) == 0 {
+		return false
+	}
+	for key, value := range selector {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func namespacedName(namespace, name string) string {
+	if namespace == "" {
+		namespace = "default"
+	}
+	return namespace + "/" + name
+}
+
+func applyTraefikRoutes(services []core.Service, routes []parser.TraefikRoute) []core.Service {
+	routesByName := map[string][]string{}
+	for _, route := range routes {
+		key := normalizedName(route.Service)
+		routesByName[key] = append(routesByName[key], route.Routes...)
+	}
+	for i := range services {
+		for _, key := range serviceRouteKeys(services[i]) {
+			services[i].Exposure = append(services[i].Exposure, routesByName[key]...)
+		}
+		services[i].Exposure = uniqueSorted(services[i].Exposure)
+	}
+	return services
+}
+
+func serviceRouteKeys(service core.Service) []string {
+	return uniqueSorted([]string{
+		normalizedName(service.Name),
+		normalizedName(service.ResourceName),
+	})
+}
+
+func normalizedName(value string) string {
+	value = strings.ToLower(value)
+	replacer := strings.NewReplacer("_", "-", ".", "-")
+	return replacer.Replace(value)
 }
 
 func gitOutput(ctx context.Context, dir string, env []string, args ...string) (string, error) {
@@ -316,6 +435,21 @@ func compact(values []string) []string {
 		if value != "" {
 			result = append(result, value)
 		}
+	}
+	return result
+}
+
+func uniqueSorted(values []string) []string {
+	values = compact(values)
+	sort.Strings(values)
+	result := values[:0]
+	previous := ""
+	for _, value := range values {
+		if value == previous {
+			continue
+		}
+		result = append(result, value)
+		previous = value
 	}
 	return result
 }

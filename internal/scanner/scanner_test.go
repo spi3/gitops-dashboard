@@ -60,6 +60,56 @@ func TestScanAllClonesAndParsesFixtureRepository(t *testing.T) {
 	if !runtimes["compose"] || !runtimes["kubernetes"] {
 		t.Fatalf("runtimes = %#v", runtimes)
 	}
+	servicesByName := map[string][]string{}
+	for _, service := range summary.Services {
+		servicesByName[service.Name] = service.Exposure
+	}
+	if !contains(servicesByName["web"], "https://web.example.test") {
+		t.Fatalf("web exposure = %v, want traefik route", servicesByName["web"])
+	}
+	if !contains(servicesByName["api"], "https://api.example.test/") {
+		t.Fatalf("api exposure = %v, want ingress route", servicesByName["api"])
+	}
+	if !contains(servicesByName["api"], "https://api-alt.example.test") {
+		t.Fatalf("api exposure = %v, want traefik route", servicesByName["api"])
+	}
+}
+
+func TestScanAllUsesRelativeRepoCacheFromWorkingDirectory(t *testing.T) {
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	store, err := storage.Open(filepath.Join("data", "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      "data",
+			RepoCacheDir: filepath.Join("data", "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "data", "repos", "fixture", ".git")); err != nil {
+		t.Fatalf("expected clone in configured cache: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "data", "repos", "data")); err == nil {
+		t.Fatalf("scanner nested relative repo cache under itself")
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 }
 
 func TestCloneURLInjectsTokenWithoutMutatingConfig(t *testing.T) {
@@ -108,6 +158,8 @@ services:
     image: example/web:v1
     ports:
       - "8080:80"
+    labels:
+      - "traefik.http.routers.web.rule=Host('web.example.test')"
 `)
 	writeFile(t, filepath.Join(dir, "prod", "app.yaml"), `
 apiVersion: apps/v1
@@ -115,8 +167,16 @@ kind: Deployment
 metadata:
   name: api
   namespace: prod
+  labels:
+    app: api
 spec:
+  selector:
+    matchLabels:
+      app: api
   template:
+    metadata:
+      labels:
+        app: api
     spec:
       containers:
         - name: api
@@ -129,10 +189,53 @@ spec:
             httpGet:
               path: /health
               port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: prod
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: prod
+spec:
+  rules:
+    - host: api.example.test
+      http:
+        paths:
+          - path: /
+            backend:
+              service:
+                name: api
+`)
+	writeFile(t, filepath.Join(dir, "prod", "dynamic.yaml"), `
+http:
+  routers:
+    api:
+      rule: Host(`+"`"+`api-alt.example.test`+"`"+`)
+      service: api
 `)
 	runGit(t, dir, "add", ".")
 	runGit(t, dir, "commit", "-m", "fixture")
 	return dir
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func writeFile(t *testing.T, path, content string) {

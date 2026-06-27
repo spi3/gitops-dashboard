@@ -110,6 +110,27 @@ make test
 make ui-e2e
 ```
 
+Frontend hot reload uses Vite as the browser entry point and proxies API
+requests to the Go server. Run these in two terminals:
+
+```sh
+make dev-server
+make dev-ui
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5173
+```
+
+The Vite proxy defaults to `http://127.0.0.1:18080`. Override it when the Go
+server is listening elsewhere:
+
+```sh
+make dev-ui VITE_API_TARGET=http://127.0.0.1:19090
+```
+
 ## Documentation
 
 - [Vision](docs/vision.md)

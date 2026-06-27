@@ -21,6 +21,7 @@ type ComposeService struct {
 	Ports     []string
 	Volumes   []string
 	Networks  []string
+	Exposure  []string
 	DependsOn []string
 	EnvVars   []string
 	Warnings  []string
@@ -38,6 +39,7 @@ type composeService struct {
 	Networks    any            `yaml:"networks"`
 	DependsOn   any            `yaml:"depends_on"`
 	Environment any            `yaml:"environment"`
+	Labels      any            `yaml:"labels"`
 	Healthcheck map[string]any `yaml:"healthcheck"`
 }
 
@@ -82,6 +84,7 @@ func ParseCompose(path string) (ComposeProject, error) {
 			Ports:     stringifySlice(raw.Ports),
 			Volumes:   stringifySlice(raw.Volumes),
 			Networks:  networks(raw.Networks),
+			Exposure:  composeExposure(raw),
 			DependsOn: dependsOn(raw.DependsOn),
 			EnvVars:   envVars(raw.Environment),
 		}
@@ -115,6 +118,111 @@ func envVars(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func composeExposure(service composeService) []string {
+	var result []string
+	for _, port := range service.Ports {
+		result = append(result, publishedPortRoutes(port)...)
+	}
+	result = append(result, staticAddressRoutes(service.Networks, service.Ports)...)
+	result = append(result, labelRoutes(service.Labels)...)
+	return uniqueSorted(result)
+}
+
+func publishedPortRoutes(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		host, published, ok := shortPublishedPort(typed)
+		if !ok || host == "" || host == "0.0.0.0" {
+			return nil
+		}
+		return []string{accessRoute(host, published)}
+	case map[string]any:
+		published := stringValue(typed["published"])
+		host := stringValue(typed["host_ip"])
+		if published == "" || host == "" || host == "0.0.0.0" {
+			return nil
+		}
+		return []string{accessRoute(host, published)}
+	default:
+		return nil
+	}
+}
+
+func shortPublishedPort(value string) (string, string, bool) {
+	value = strings.TrimSpace(strings.SplitN(value, "/", 2)[0])
+	if !strings.Contains(value, ":") {
+		return "", "", false
+	}
+	parts := strings.Split(value, ":")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	published := parts[len(parts)-2]
+	host := ""
+	if len(parts) > 2 {
+		host = strings.Join(parts[:len(parts)-2], ":")
+	}
+	if published == "" {
+		return "", "", false
+	}
+	return host, published, true
+}
+
+func staticAddressRoutes(networks any, ports []any) []string {
+	var addresses []string
+	for _, network := range mapValue(networks) {
+		ip := stringValue(mapValue(network)["ipv4_address"])
+		if ip != "" {
+			addresses = append(addresses, ip)
+		}
+	}
+	var targetPorts []string
+	for _, port := range ports {
+		if target := targetPort(port); target != "" {
+			targetPorts = append(targetPorts, target)
+		}
+	}
+	var result []string
+	for _, address := range uniqueSorted(addresses) {
+		if len(targetPorts) == 0 {
+			result = append(result, accessRoute(address, ""))
+			continue
+		}
+		for _, port := range uniqueSorted(targetPorts) {
+			result = append(result, accessRoute(address, port))
+		}
+	}
+	return result
+}
+
+func targetPort(value any) string {
+	switch typed := value.(type) {
+	case string:
+		value := strings.TrimSpace(strings.SplitN(typed, "/", 2)[0])
+		parts := strings.Split(value, ":")
+		return parts[len(parts)-1]
+	case map[string]any:
+		return stringValue(typed["target"])
+	default:
+		return ""
+	}
+}
+
+func labelRoutes(value any) []string {
+	var result []string
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			result = append(result, hostRules(stringify(item))...)
+		}
+	case map[string]any:
+		for _, item := range typed {
+			result = append(result, hostRules(stringValue(item))...)
+		}
+	}
+	return uniqueSorted(result)
 }
 
 func stringify(value any) string {
