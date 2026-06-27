@@ -1,7 +1,34 @@
-.gitdb/
+# Dependencies
 node_modules/
+
+# Build output
 dist/
-data/
 /gitops-dashboard
+
+# Runtime state
+data/
+
+# Test output
+coverage/
 playwright-report/
 test-results/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Logs and temporary files
+*.log
+tmp/
+.tmp/
+.cache/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+
+# Legacy Codex alternate Git metadata
+.gitdb/
