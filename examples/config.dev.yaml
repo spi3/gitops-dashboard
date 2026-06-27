@@ -1,0 +1,12 @@
+server:
+  listen: ":18080"
+  dataDir: "data/dev"
+  repoCacheDir: "data/dev/repos"
+auth:
+  mode: dev-no-auth
+monitoring:
+  defaultInterval: 30s
+repositories: []
+runtime:
+  docker: []
+  kubernetes: []

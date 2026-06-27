@@ -1,0 +1,7 @@
+.gitdb/
+node_modules/
+dist/
+data/
+gitops-dashboard
+playwright-report/
+test-results/

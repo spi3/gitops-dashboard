@@ -1,0 +1,23 @@
+services:
+  dashboard:
+    image: gitops-dashboard:latest
+    command: ["-config", "/config/config.yaml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+      - dashboard-data:/data
+      - ./ssh:/ssh:ro
+      - ./kube:/kube:ro
+
+  docker-agent:
+    image: gitops-dashboard:latest
+    command: ["-mode", "agent", "-config", "/config/agent.yaml"]
+    volumes:
+      - ./config:/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - dashboard
+
+volumes:
+  dashboard-data:

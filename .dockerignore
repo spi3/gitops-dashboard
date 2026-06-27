@@ -1,0 +1,6 @@
+.git
+.gitdb
+node_modules
+data
+gitops-dashboard
+*.db

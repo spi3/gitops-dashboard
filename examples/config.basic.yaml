@@ -1,0 +1,15 @@
+server:
+  listen: ":18081"
+  dataDir: "data/basic"
+  repoCacheDir: "data/basic/repos"
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHash: "$2a$05$dSx9hFRBCW//D8TYRpxLf.gd8KNgi6C/New8A3K1uINKSfthilkga"
+monitoring:
+  defaultInterval: 30s
+repositories: []
+runtime:
+  docker: []
+  kubernetes: []

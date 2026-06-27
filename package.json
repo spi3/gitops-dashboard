@@ -1,0 +1,33 @@
+{
+  "name": "gitops-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "format": "node scripts/check-format.mjs",
+    "lint": "eslint web --ext .ts,.tsx",
+    "test": "npm run typecheck && npm run lint",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install chromium",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "Apache-2.0",
+  "description": "Read-only GitOps-inspired dashboard for homelab and self-hosted repositories.",
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "eslint": "^10.6.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.0",
+    "vite": "^8.1.0"
+  }
+}
