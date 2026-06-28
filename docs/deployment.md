@@ -50,6 +50,12 @@ docker build -t gitops-dashboard:latest .
 docker compose -f examples/docker-compose.yaml up
 ```
 
+Pushes to `main` run the GitHub Actions workflow in `.github/workflows/ci.yml`.
+After tests pass, the workflow publishes the image to GitHub Container Registry:
+
+- `ghcr.io/spi3/gitops-dashboard:latest`
+- `ghcr.io/spi3/gitops-dashboard:sha-<short-sha>`
+
 The Compose file mounts `examples/compose-config` into both containers:
 
 - `config.yaml`: dashboard server config with an accepted agent token.

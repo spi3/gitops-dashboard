@@ -85,6 +85,9 @@ docker build -t gitops-dashboard:latest .
 docker compose -f examples/docker-compose.yaml up
 ```
 
+Pushes to `main` run tests and publish the container image to GitHub Container
+Registry as `ghcr.io/spi3/gitops-dashboard:latest` and a short SHA tag.
+
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `X-Agent-Token` value. The server must accept the same token through
 `auth.agent.tokens` or a Docker target `agentToken`. Expected mounts, token
