@@ -1,0 +1,18 @@
+server:
+  listen: ":8080"
+  dataDir: "/data"
+  repoCacheDir: "/data/repos"
+auth:
+  mode: dev-no-auth
+  agent:
+    tokens:
+      - replace-me-with-a-long-random-agent-token
+monitoring:
+  defaultInterval: 30s
+repositories: []
+runtime:
+  docker:
+    - name: compose-docker-agent
+      kind: agent
+      agentToken: replace-me-with-a-long-random-agent-token
+  kubernetes: []

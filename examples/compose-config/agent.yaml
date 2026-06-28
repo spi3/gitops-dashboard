@@ -1,0 +1,15 @@
+auth:
+  mode: dev-no-auth
+monitoring:
+  defaultInterval: 30s
+repositories: []
+runtime:
+  docker: []
+  kubernetes: []
+agent:
+  serverUrl: ws://dashboard:8080/api/agents/connect
+  target: compose-docker-agent
+  token: replace-me-with-a-long-random-agent-token
+  interval: 30s
+  docker:
+    host: unix:///var/run/docker.sock

@@ -49,3 +49,15 @@ repositories:
 		t.Fatal("Load succeeded with invalid scanInterval")
 	}
 }
+
+func TestLoadComposeExampleConfigs(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{
+		filepath.Join("..", "..", "examples", "compose-config", "config.yaml"),
+		filepath.Join("..", "..", "examples", "compose-config", "agent.yaml"),
+	} {
+		if _, err := Load(path); err != nil {
+			t.Fatalf("Load(%s): %v", path, err)
+		}
+	}
+}

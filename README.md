@@ -58,7 +58,8 @@ Use:
 - `examples/config.dev.yaml` for local no-auth development.
 - `examples/config.basic.yaml` for basic-auth local testing.
 - `examples/docker-compose.yaml` for the server and remote-agent deployment
-  shape.
+  shape, backed by `examples/compose-config/config.yaml` and
+  `examples/compose-config/agent.yaml`.
 
 Repository credentials should be mounted through files or environment variables.
 Secret values from repositories and manifests are not rendered back in the UI.
@@ -77,7 +78,18 @@ Agent mode runs the remote Docker monitor:
 gitops-dashboard -mode agent -config /config/agent.yaml
 ```
 
-Expected mounts are documented in [docs/deployment.md](docs/deployment.md).
+In Compose, the same image can run both modes:
+
+```sh
+docker build -t gitops-dashboard:latest .
+docker compose -f examples/docker-compose.yaml up
+```
+
+The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
+`X-Agent-Token` value. The server must accept the same token through
+`auth.agent.tokens` or a Docker target `agentToken`. Expected mounts, token
+configuration, and the full agent config shape are documented in
+[docs/deployment.md](docs/deployment.md).
 
 ## Development
 
