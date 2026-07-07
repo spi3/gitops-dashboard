@@ -97,74 +97,74 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
 
   await page.goto(baseURL);
   await expect(page.getByRole("heading", { name: "GitOps Dashboard" })).toBeVisible();
-  await expectMetric(page, "unknown", "0");
+  await expect(page.locator(".sentence")).toHaveText("Waiting for the first scan");
+  await expect(page.getByText("Nothing here yet")).toBeVisible();
+
   await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
-  await page.getByLabel("Use dark theme").check();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  const themeButton = page.getByRole("button", { name: "Use dark theme" });
+  await themeButton.click();
+  const flipped = await page.locator("html").getAttribute("data-theme");
   await page.reload();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.getByLabel("Use dark theme").uncheck();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", flipped ?? "dark");
 
-  await page.getByRole("button", { name: "Refresh" }).click();
-  await expectMetric(page, "unknown", "0");
-  await expect(page.getByText("Commit")).toHaveCount(0);
+  await page.getByRole("button", { name: "Sync repos" }).click();
+  await expect(page.locator(".sentence")).toHaveText("Waiting for live checks");
+  await expect(page.getByRole("heading", { name: "Production" })).toBeVisible();
+  await expect(page.locator(".tally")).toHaveText("0 of 2 up");
 
-  await page.getByRole("button", { name: "Scan" }).click();
+  const webTile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "web", exact: true }) });
+  const apiTile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "api", exact: true }) });
+  await expect(webTile).toBeVisible();
+  await expect(apiTile).toBeVisible();
+  await expect(webTile.locator(".stateWord")).toHaveText("No data");
+  await expect(webTile.getByRole("link", { name: /web\.example\.test/ })).toHaveAttribute("href", "https://web.example.test");
+  await expect(apiTile.getByRole("link", { name: /api\.example\.test/ })).toHaveAttribute("href", "https://api.example.test/");
+  await expect(webTile.getByText("no checks yet")).toBeVisible();
+  await expect(webTile.locator(".tick.empty")).toHaveCount(28);
 
-  await expectMetric(page, "unknown", "2");
+  await page.locator(".searchField input").fill("api");
+  await expect(webTile).toBeHidden();
+  await expect(apiTile).toBeVisible();
+  await page.locator(".searchField input").fill("");
+  await expect(webTile).toBeVisible();
 
-  const servicesPanel = panel(page, "Services");
-  const serviceGrid = servicesPanel.locator(".serviceGrid");
-  const webCard = serviceGrid.locator("article.service").filter({ hasText: "web" });
-  const apiCard = serviceGrid.locator("article.service").filter({ hasText: "api" });
-  await expect(webCard).toBeVisible();
-  await expect(webCard).toContainText("compose");
-  await expect(webCard).toContainText("web.example.test");
-  await expect(apiCard).toBeVisible();
-  await expect(apiCard).toContainText("kubernetes");
-  await expect(apiCard).toContainText("api.example.test");
+  await page.getByRole("button", { name: /Needs attention/ }).click();
+  await expect(page.getByText("No services match")).toBeVisible();
+  await page.getByRole("button", { name: "Clear filters" }).click();
+  await expect(webTile).toBeVisible();
 
-  await servicesPanel.getByRole("button", { name: /^Compose/ }).click();
-  await expect(serviceGrid.locator("article.service")).toHaveCount(1);
-  await expect(webCard).toBeVisible();
-  await servicesPanel.getByRole("button", { name: /^Kubernetes/ }).click();
-  await expect(serviceGrid.locator("article.service")).toHaveCount(1);
-  await expect(apiCard).toBeVisible();
-  await expect(detailPanel(page)).toContainText("api");
-  await servicesPanel.getByRole("button", { name: /^All/ }).click();
-  await expect(serviceGrid.locator("article.service")).toHaveCount(2);
+  await page.getByRole("button", { name: "Check now" }).click();
+  await expect(page.locator(".sentence")).toHaveText("Everything checked is up");
+  await expect(page.locator(".tally")).toHaveText("1 of 2 up");
+  await expect(webTile.locator(".stateWord")).toHaveText("Up");
+  await expect(webTile.locator(".tick.healthy")).toHaveCount(1);
+  await expect(webTile.getByText(/100% · 24h/)).toBeVisible();
+  await expect(apiTile.locator(".stateWord")).toHaveText("No data");
 
-  await apiCard.getByRole("heading", { name: "api" }).click();
-  const detail = detailPanel(page);
-  await expect(detail.getByRole("heading", { name: "api" })).toBeVisible();
-  await expect(detail.getByRole("link", { name: "api.example.test" })).toHaveAttribute("href", "https://api.example.test/");
-  await expect(detail.getByText("No live runtime status has been recorded for this service.")).toBeVisible();
+  await webTile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.getByRole("heading", { name: "web" })).toBeVisible();
+  await expect(drawer.getByText(/Up · Compose · Production/)).toBeVisible();
+  await expect(drawer.getByRole("link", { name: /web\.example\.test/ })).toHaveAttribute("href", "https://web.example.test");
+  await expect(drawer.locator(".targetHead strong")).toHaveText("local-docker");
+  await expect(drawer.locator(".targetHead span")).toHaveText(/100% · 1 check · 24h/);
+  await expect(drawer.locator(".targetNote")).toContainText("Up 5 minutes");
+  await expect(drawer.locator(".chip")).toHaveText("db");
+  await expect(drawer.locator(".provenance").first()).toContainText("fixture · prod/compose.yaml @");
+  await page.keyboard.press("Escape");
+  await expect(drawer).toBeHidden();
 
-  await webCard.getByRole("heading", { name: "web" }).click();
-  await expect(detail.getByRole("link", { name: "web.example.test" })).toHaveAttribute("href", "https://web.example.test");
-
-  await page.getByRole("button", { name: "Check Health" }).click();
-  await expectMetric(page, "healthy", "1");
-  await expectMetric(page, "unknown", "1");
-  await expect(webCard.locator(".badge")).toHaveText("Healthy");
-  await expect(detail.locator(".statusItem")).toContainText("local-docker");
-  await expect(detail.locator(".statusItem")).toContainText("Up 5 minutes");
-  await expect(detail.locator(".statusItem")).not.toContainText("not checked");
-
-  await page.getByRole("button", { name: "Refresh" }).click();
-  await expectMetric(page, "healthy", "1");
-  await expect(detail.locator(".statusItem")).toContainText("local-docker");
+  await expect(page.locator(".foot")).toContainText("last sync ok");
 
   await page.route("**/api/summary", async (route) => {
     await route.fulfill({ status: 500, body: "summary unavailable" });
   });
   allowExpectedNetworkError = true;
-  await page.getByRole("button", { name: "Refresh" }).click();
-  await expect(page.locator("section.error")).toContainText("summary request failed: 500");
+  await page.getByRole("button", { name: "Check now" }).click();
+  await expect(page.getByRole("alert")).toContainText("summary request failed: 500");
   await page.unroute("**/api/summary");
-  await page.getByRole("button", { name: "Refresh" }).click();
-  await expect(page.locator("section.error")).toBeHidden();
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect(page.getByRole("alert")).toBeHidden();
   allowExpectedNetworkError = false;
 
   expect(browserIssues).toEqual([]);
@@ -179,15 +179,46 @@ test("renders every supported health state in the browser", async ({ page }) => 
   });
 
   await page.goto(baseURL);
-  for (const health of ["healthy", "degraded", "unhealthy", "unknown", "error"]) {
-    await expectMetric(page, health, "1");
+  await expect(page.locator(".sentence")).toHaveText("3 services need attention");
+  const expectations: Array<[string, string]> = [
+    ["healthy-service", "Up"],
+    ["degraded-service", "Degraded"],
+    ["unhealthy-service", "Down"],
+    ["unknown-service", "No data"],
+    ["error-service", "Check failed"]
+  ];
+  for (const [name, word] of expectations) {
+    const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name, exact: true }) });
+    await expect(tile.locator(".stateWord")).toHaveText(word);
   }
-  const serviceGrid = panel(page, "Services").locator(".serviceGrid");
-  await expect(serviceGrid.locator(".badge.healthy")).toHaveText("Healthy");
-  await expect(serviceGrid.locator(".badge.degraded")).toHaveText("Degraded");
-  await expect(serviceGrid.locator(".badge.unhealthy")).toHaveText("Unhealthy");
-  await expect(serviceGrid.locator(".badge.unknown")).toHaveText("Unknown");
-  await expect(serviceGrid.locator(".badge.error")).toHaveText("Error");
+
+  await page.getByRole("button", { name: /Needs attention/ }).click();
+  await expect(page.locator("article.tile")).toHaveCount(3);
+});
+
+test("renders uptime history and drawer details from the summary", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithUptimeHistory())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "media", exact: true }) });
+  await expect(tile.locator(".tick.healthy")).toHaveCount(5);
+  await expect(tile.locator(".tick.unhealthy")).toHaveCount(1);
+  await expect(tile.locator(".tick.empty")).toHaveCount(22);
+  await expect(tile.getByText("83.3% · 24h")).toBeVisible();
+  await expect(tile.locator(".pulseStrip")).toHaveAttribute("aria-label", /Last 6 checks/);
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.locator(".targetHead span")).toHaveText("83.3% · 6 checks · 24h");
+  await expect(drawer.locator(".tick")).toHaveCount(40);
+  await expect(drawer.getByRole("link", { name: /media\.example\.test/ })).toBeVisible();
+  await drawer.getByRole("button", { name: "Close details" }).click();
+  await expect(drawer).toBeHidden();
 });
 
 function createFixtureRepo(dir: string) {
@@ -327,22 +358,31 @@ function createFakeDockerServer() {
   });
 }
 
-function panel(page: Page, heading: string) {
-  return page.locator("section.panel").filter({ has: page.getByRole("heading", { name: heading }) });
+function baseService(id: string, name: string, health: string) {
+  return {
+    id,
+    name,
+    repository: "fixture",
+    sourceCommit: "abc123def456",
+    runtime: "compose",
+    kind: "Service",
+    namespace: "",
+    resourceName: name,
+    sourcePath: "prod/compose.yaml",
+    environment: "production",
+    health,
+    images: [`example/${name}:v1`],
+    ports: [],
+    dependencies: [],
+    storage: [],
+    exposure: [],
+    configRefs: [],
+    warnings: []
+  };
 }
 
-function detailPanel(page: Page) {
-  return page.locator("section.detailPanel");
-}
-
-async function expectMetric(page: Page, health: string, value: string) {
-  const metric = page.locator(`.metric.${health}`);
-  await expect(metric.locator("strong")).toHaveText(value);
-}
-
-function summaryWithEveryHealthState() {
+function summaryShell(services: unknown[], uptime: unknown[]) {
   const now = new Date().toISOString();
-  const healthStates = ["healthy", "degraded", "unhealthy", "unknown", "error"];
   return {
     repositories: [{
       name: "fixture",
@@ -362,29 +402,39 @@ function summaryWithEveryHealthState() {
       finishedAt: now,
       error: ""
     }],
-    services: healthStates.map((health, index) => ({
-      id: `svc-${health}`,
-      name: `${health}-service`,
-      repository: "fixture",
-      sourceCommit: "abc123",
-      runtime: index % 2 === 0 ? "compose" : "kubernetes",
-      kind: index % 2 === 0 ? "Service" : "Deployment",
-      namespace: "prod",
-      resourceName: `${health}-service`,
-      sourcePath: "prod/app.yaml",
-      environment: "production",
-      health,
-      images: [`example/${health}:v1`],
-      ports: [],
-      dependencies: [],
-      storage: [],
-      exposure: [],
-      configRefs: [],
-      warnings: []
-    })),
+    services,
     statuses: [],
+    uptime,
     generatedAt: now
   };
+}
+
+function summaryWithEveryHealthState() {
+  const healthStates = ["healthy", "degraded", "unhealthy", "unknown", "error"];
+  return summaryShell(
+    healthStates.map((health) => baseService(`svc-${health}`, `${health}-service`, health)),
+    []
+  );
+}
+
+function summaryWithUptimeHistory() {
+  const service = {
+    ...baseService("svc-media", "media", "healthy"),
+    exposure: ["media.example.test"],
+    dependencies: ["db"]
+  };
+  const samples = ["healthy", "healthy", "unhealthy", "healthy", "healthy", "healthy"].map((health, index) => ({
+    health,
+    checkedAt: new Date(Date.now() - (6 - index) * 60_000).toISOString(),
+    message: health === "unhealthy" ? "Exited (1) 5 minutes ago" : "Up 5 minutes"
+  }));
+  return summaryShell([service], [{
+    serviceId: "svc-media",
+    target: "local-docker",
+    uptimePercent: 83.3,
+    checkCount: 6,
+    samples
+  }]);
 }
 
 async function waitForServer(url: string) {

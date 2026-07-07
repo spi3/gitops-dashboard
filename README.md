@@ -20,9 +20,9 @@ configured.
   targets.
 - Remote Docker monitoring agent mode over WebSocket.
 - Read-only Kubernetes monitoring with mounted kubeconfig files.
-- React dashboard with repository overview, scan history, service catalog,
-  service detail, runtime filtering, static warnings, health metrics, and live
-  status rows.
+- React dashboard with at-a-glance status, per-service uptime history from the
+  monitors, clickable routes and DNS names discovered in Git, and a detail
+  drawer with live check results and Git provenance.
 - Playwright browser coverage for the dashboard workflow.
 
 ## Quick Start

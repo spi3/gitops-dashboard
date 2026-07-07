@@ -61,11 +61,26 @@ type StatusResult struct {
 	CheckedAt time.Time   `json:"checkedAt"`
 }
 
+type UptimeSample struct {
+	Health    HealthState `json:"health"`
+	CheckedAt time.Time   `json:"checkedAt"`
+	Message   string      `json:"message"`
+}
+
+type UptimeStat struct {
+	ServiceID     string         `json:"serviceId"`
+	Target        string         `json:"target"`
+	UptimePercent float64        `json:"uptimePercent"`
+	CheckCount    int            `json:"checkCount"`
+	Samples       []UptimeSample `json:"samples"`
+}
+
 type DashboardSummary struct {
 	Repositories []Repository   `json:"repositories"`
 	Services     []Service      `json:"services"`
 	Scans        []Scan         `json:"scans"`
 	Statuses     []StatusResult `json:"statuses"`
+	Uptime       []UptimeStat   `json:"uptime"`
 	GeneratedAt  time.Time      `json:"generatedAt"`
 }
 

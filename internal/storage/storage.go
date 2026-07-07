@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -172,6 +174,10 @@ func (store *Store) Summary(ctx context.Context) (core.DashboardSummary, error) 
 	if err != nil {
 		return core.DashboardSummary{}, err
 	}
+	uptime, err := store.UptimeStats(ctx)
+	if err != nil {
+		return core.DashboardSummary{}, err
+	}
 	applyLatestStatus(services, statuses)
 	if repos == nil {
 		repos = []core.Repository{}
@@ -185,11 +191,15 @@ func (store *Store) Summary(ctx context.Context) (core.DashboardSummary, error) 
 	if statuses == nil {
 		statuses = []core.StatusResult{}
 	}
+	if uptime == nil {
+		uptime = []core.UptimeStat{}
+	}
 	return core.DashboardSummary{
 		Repositories: repos,
 		Services:     services,
 		Scans:        scans,
 		Statuses:     statuses,
+		Uptime:       uptime,
 		GeneratedAt:  time.Now().UTC(),
 	}, nil
 }
@@ -339,13 +349,118 @@ func normalizeService(service core.Service) core.Service {
 }
 
 func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) error {
-	_, err := store.db.ExecContext(ctx, `
+	checkedAt := status.CheckedAt.UTC().Format(time.RFC3339)
+	message := redact(status.Message)
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO status_results(service_id, target, health, message, checked_at)
 VALUES(?, ?, ?, ?, ?)
 ON CONFLICT(service_id, target) DO UPDATE SET
   health=excluded.health, message=excluded.message, checked_at=excluded.checked_at
-`, status.ServiceID, status.Target, string(status.Health), redact(status.Message), status.CheckedAt.UTC().Format(time.RFC3339))
-	return err
+`, status.ServiceID, status.Target, string(status.Health), message, checkedAt)
+	if err != nil {
+		return fmt.Errorf("upsert status %s/%s: %w", status.ServiceID, status.Target, err)
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO status_history(service_id, target, health, message, checked_at)
+VALUES(?, ?, ?, ?, ?)
+`, status.ServiceID, status.Target, string(status.Health), message, checkedAt)
+	if err != nil {
+		return fmt.Errorf("insert status history %s/%s: %w", status.ServiceID, status.Target, err)
+	}
+	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff); err != nil {
+		return fmt.Errorf("prune status history: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (store *Store) UptimeStats(ctx context.Context) ([]core.UptimeStat, error) {
+	windowStart := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
+	stats := map[string]*core.UptimeStat{}
+	order := []string{}
+	countRows, err := store.db.QueryContext(ctx, `
+SELECT service_id, target,
+       SUM(CASE WHEN health IN ('healthy', 'degraded') THEN 1 ELSE 0 END) AS up_count,
+       COUNT(*) AS total_count
+FROM status_history WHERE checked_at >= ?
+GROUP BY service_id, target
+`, windowStart)
+	if err != nil {
+		return nil, fmt.Errorf("query uptime counts: %w", err)
+	}
+	defer countRows.Close()
+	for countRows.Next() {
+		var serviceID, target string
+		var upCount, totalCount int
+		if err := countRows.Scan(&serviceID, &target, &upCount, &totalCount); err != nil {
+			return nil, err
+		}
+		percent := 0.0
+		if totalCount > 0 {
+			percent = math.Round((100*float64(upCount)/float64(totalCount))*10) / 10
+		}
+		key := serviceID + "\x00" + target
+		stats[key] = &core.UptimeStat{
+			ServiceID:     serviceID,
+			Target:        target,
+			UptimePercent: percent,
+			CheckCount:    totalCount,
+			Samples:       []core.UptimeSample{},
+		}
+		order = append(order, key)
+	}
+	if err := countRows.Err(); err != nil {
+		return nil, err
+	}
+	sampleRows, err := store.db.QueryContext(ctx, `
+SELECT service_id, target, health, message, checked_at FROM (
+  SELECT service_id, target, health, message, checked_at,
+         ROW_NUMBER() OVER (PARTITION BY service_id, target ORDER BY checked_at DESC, id DESC) AS row_num
+  FROM status_history WHERE checked_at >= ?
+) WHERE row_num <= 40
+ORDER BY service_id, target, checked_at ASC
+`, windowStart)
+	if err != nil {
+		return nil, fmt.Errorf("query uptime samples: %w", err)
+	}
+	defer sampleRows.Close()
+	for sampleRows.Next() {
+		var serviceID, target, health, message, checkedAt string
+		if err := sampleRows.Scan(&serviceID, &target, &health, &message, &checkedAt); err != nil {
+			return nil, err
+		}
+		stat, ok := stats[serviceID+"\x00"+target]
+		if !ok {
+			continue
+		}
+		sample := core.UptimeSample{
+			Health:  core.HealthState(health),
+			Message: redact(message),
+		}
+		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
+			sample.CheckedAt = parsed
+		}
+		stat.Samples = append(stat.Samples, sample)
+	}
+	if err := sampleRows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]core.UptimeStat, 0, len(order))
+	for _, key := range order {
+		result = append(result, *stats[key])
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].ServiceID != result[j].ServiceID {
+			return result[i].ServiceID < result[j].ServiceID
+		}
+		return result[i].Target < result[j].Target
+	})
+	return result, nil
 }
 
 func (store *Store) UpsertAgent(ctx context.Context, message core.AgentMessage) error {
@@ -438,4 +553,16 @@ CREATE TABLE IF NOT EXISTS agents (
   last_seen_at TEXT NOT NULL,
   status_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS status_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service_id TEXT NOT NULL,
+  target TEXT NOT NULL,
+  health TEXT NOT NULL,
+  message TEXT NOT NULL,
+  checked_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_status_history_lookup
+ON status_history(service_id, target, checked_at);
 `
