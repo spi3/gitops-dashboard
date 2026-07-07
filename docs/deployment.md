@@ -61,6 +61,10 @@ After tests pass, the workflow publishes the image to GitHub Container Registry:
 - `ghcr.io/spi3/gitops-dashboard:latest`
 - `ghcr.io/spi3/gitops-dashboard:sha-<short-sha>`
 
+The full container and service versioning process, including release tags and
+GitOps deployment pinning guidance, is documented in
+[versioning.md](versioning.md).
+
 The Compose file mounts `examples/compose-config` into both containers:
 
 - `config.yaml`: dashboard server config that reads the accepted agent token

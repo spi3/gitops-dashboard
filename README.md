@@ -128,6 +128,8 @@ docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 
 Pushes to `main` run tests and publish the container image to GitHub Container
 Registry as `ghcr.io/spi3/gitops-dashboard:latest` and a short SHA tag.
+The versioning policy for release tags, immutable image pins, and service
+version inventory is documented in [docs/versioning.md](docs/versioning.md).
 
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `X-Agent-Token` value. The server must accept the same token through
@@ -225,6 +227,7 @@ make dev-ui VITE_API_TARGET=http://127.0.0.1:19090
 - [Requirements](docs/requirements.md)
 - [Tech Stack](docs/tech_stack.md)
 - [Deployment](docs/deployment.md)
+- [Versioning](docs/versioning.md)
 - [Implementation Plan](docs/implementation_plan.md)
 - [Task Tracker](docs/tasks/tracker.md)
 
