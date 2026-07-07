@@ -89,6 +89,41 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 	return combined
 }
 
+func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentMessage) error {
+	if err := monitor.store.UpsertAgent(ctx, message); err != nil {
+		return err
+	}
+	services, err := monitor.store.Services(ctx)
+	if err != nil {
+		return err
+	}
+	target := strings.TrimSpace(message.Target)
+	if target == "" {
+		return nil
+	}
+	checkedAt := message.CheckedAt.UTC()
+	if checkedAt.IsZero() {
+		checkedAt = time.Now().UTC()
+	}
+	containers := agentDockerContainers(message.Containers)
+	for _, service := range services {
+		if service.Runtime != "compose" || composeServiceTarget(service) != target {
+			continue
+		}
+		health, statusMessage := dockerHealth(service, containers)
+		if err := monitor.store.UpsertStatus(ctx, core.StatusResult{
+			ServiceID: service.ID,
+			Target:    target,
+			Health:    health,
+			Message:   statusMessage,
+			CheckedAt: checkedAt,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkDocker(checkCtx, target, services)
@@ -178,6 +213,21 @@ func dockerHealth(service core.Service, containers []dockerContainer) (core.Heal
 	for _, container := range containers {
 		if matchesContainer(service, container) {
 			if strings.EqualFold(container.State, "running") {
+				switch strings.ToLower(strings.TrimSpace(container.Health)) {
+				case "unhealthy":
+					return core.HealthUnhealthy, container.Status
+				case "starting":
+					return core.HealthDegraded, container.Status
+				case "healthy":
+					return core.HealthHealthy, container.Status
+				}
+				status := strings.ToLower(container.Status)
+				if strings.Contains(status, "(unhealthy)") {
+					return core.HealthUnhealthy, container.Status
+				}
+				if strings.Contains(status, "(health: starting)") {
+					return core.HealthDegraded, container.Status
+				}
 				return core.HealthHealthy, container.Status
 			}
 			return core.HealthUnhealthy, container.Status
@@ -206,6 +256,35 @@ type dockerContainer struct {
 	Image  string   `json:"Image"`
 	State  string   `json:"State"`
 	Status string   `json:"Status"`
+	Health string   `json:"Health"`
+}
+
+func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
+	containers := make([]dockerContainer, 0, len(statuses))
+	for _, status := range statuses {
+		var names []string
+		if status.Name != "" {
+			names = []string{status.Name}
+		}
+		containers = append(containers, dockerContainer{
+			ID:     status.ID,
+			Names:  names,
+			Image:  status.Image,
+			State:  status.State,
+			Status: status.Status,
+			Health: status.Health,
+		})
+	}
+	return containers
+}
+
+func composeServiceTarget(service core.Service) string {
+	path := strings.ReplaceAll(service.SourcePath, "\\", "/")
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 && parts[0] == "docker_files" {
+		return parts[1]
+	}
+	return ""
 }
 
 func listDockerContainers(ctx context.Context, host string) ([]dockerContainer, error) {

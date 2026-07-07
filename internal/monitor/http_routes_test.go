@@ -28,11 +28,16 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 		{ID: "up", Exposure: []string{"https://up.example.test"}},
 		{ID: "down", Exposure: []string{"https://down.example.test"}},
 		{ID: "get-only", Exposure: []string{"https://get-only.example.test"}},
+		{ID: "fallback", Exposure: []string{"https://bad.example.test", "https://good.example.test"}},
 		{ID: "internal", Exposure: []string{"service/api", "http://api"}},
 	}
 	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
 		status := http.StatusNoContent
 		switch req.URL.Host {
+		case "bad.example.test":
+			return nil, errors.New("dial failed")
+		case "good.example.test":
+			status = http.StatusOK
 		case "down.example.test":
 			status = http.StatusServiceUnavailable
 		case "get-only.example.test":
@@ -66,6 +71,9 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	if byService["get-only"].Health != core.HealthHealthy {
 		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
 	}
+	if byService["fallback"].Health != core.HealthHealthy || !strings.Contains(byService["fallback"].Message, "good.example.test") {
+		t.Fatalf("fallback status = %#v, want healthy good route", byService["fallback"])
+	}
 	if _, ok := byService["internal"]; ok {
 		t.Fatalf("internal service produced status: %#v", byService["internal"])
 	}
@@ -94,6 +102,63 @@ func TestNormalizeHTTPRoute(t *testing.T) {
 			got, ok := normalizeHTTPRoute(tc.candidate)
 			if ok != tc.ok || got != tc.want {
 				t.Fatalf("normalizeHTTPRoute(%q) = %q, %v; want %q, %v", tc.candidate, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func TestFirstHTTPRoutePrefersMostSpecificRoute(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		exposure []string
+		want     string
+	}{
+		{
+			name: "compose service vlan ip has better lan url",
+			exposure: []string{
+				"gitops_dashboard",
+				"http://10.10.10.135",
+				"http://gitops-dashboard.lan:8080",
+				"https://gitops-dashboard.regulalabs.com",
+				"servlan",
+			},
+			want: "http://gitops-dashboard.lan:8080",
+		},
+		{
+			name: "kubernetes service ip has ingress hostname",
+			exposure: []string{
+				"http://10.122.122.200:80",
+				"http://jellyfin.lan/",
+				"https://jellyfin.regulalabs.com",
+				"service/jellyfin",
+			},
+			want: "http://jellyfin.lan/",
+		},
+		{
+			name: "fallback to only bare ip route",
+			exposure: []string{
+				"servlan",
+				"http://10.10.10.55",
+			},
+			want: "http://10.10.10.55",
+		},
+		{
+			name: "prefer shorter hostname when route scores tie",
+			exposure: []string{
+				"https://whoami-auth.edge.regulalabs.com",
+				"https://whoami.edge.regulalabs.com",
+				"https://whoami.regulalabs.com",
+			},
+			want: "https://whoami.regulalabs.com",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := firstHTTPRoute(tc.exposure)
+			if !ok || got != tc.want {
+				t.Fatalf("firstHTTPRoute(%v) = %q, %v; want %q, true", tc.exposure, got, ok, tc.want)
 			}
 		})
 	}

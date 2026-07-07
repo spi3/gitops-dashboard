@@ -133,7 +133,7 @@ func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
 			app.logger.Info("agent disconnected", "error", err)
 			return
 		}
-		if err := app.store.UpsertAgent(r.Context(), message); err != nil {
+		if err := app.monitor.ApplyAgentReport(r.Context(), message); err != nil {
 			app.logger.Error("agent status persist failed", "error", err)
 			return
 		}

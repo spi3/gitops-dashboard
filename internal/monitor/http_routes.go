@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -43,12 +44,12 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	sem := make(chan struct{}, httpRouteConcurrency)
 
 	for _, service := range services {
-		route, ok := firstHTTPRoute(service.Exposure)
-		if !ok {
+		routes := httpRoutes(service.Exposure)
+		if len(routes) == 0 {
 			continue
 		}
 		wg.Add(1)
-		go func(service core.Service, route string) {
+		go func(service core.Service, routes []string) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -56,7 +57,7 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 			case <-ctx.Done():
 				return
 			}
-			health, message := checkHTTPRoute(ctx, client, route)
+			health, message := checkHTTPRouteCandidates(ctx, client, routes)
 			results <- core.StatusResult{
 				ServiceID: service.ID,
 				Target:    targetName,
@@ -64,7 +65,7 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 				Message:   message,
 				CheckedAt: time.Now().UTC(),
 			}
-		}(service, route)
+		}(service, routes)
 	}
 
 	go func() {
@@ -78,6 +79,22 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 		}
 	}
 	return nil
+}
+
+func checkHTTPRouteCandidates(ctx context.Context, client *http.Client, routes []string) (core.HealthState, string) {
+	bestHealth := core.HealthUnknown
+	bestMessage := ""
+	for _, route := range routes {
+		health, message := checkHTTPRoute(ctx, client, route)
+		if health == core.HealthHealthy {
+			return health, message
+		}
+		if bestMessage == "" || routeResultPriority(health) > routeResultPriority(bestHealth) {
+			bestHealth = health
+			bestMessage = message
+		}
+	}
+	return bestHealth, bestMessage
 }
 
 func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (core.HealthState, string) {
@@ -117,13 +134,36 @@ func doRouteRequest(ctx context.Context, client *http.Client, method, route stri
 }
 
 func firstHTTPRoute(exposure []string) (string, bool) {
+	routes := httpRoutes(exposure)
+	if len(routes) == 0 {
+		return "", false
+	}
+	return routes[0], true
+}
+
+func httpRoutes(exposure []string) []string {
+	var routes []string
+	seen := map[string]bool{}
 	for _, candidate := range exposure {
 		route, ok := normalizeHTTPRoute(candidate)
-		if ok {
-			return route, true
+		if !ok {
+			continue
 		}
+		if seen[route] {
+			continue
+		}
+		seen[route] = true
+		routes = append(routes, route)
 	}
-	return "", false
+	sort.SliceStable(routes, func(i, j int) bool {
+		leftScore := routeScore(routes[i])
+		rightScore := routeScore(routes[j])
+		if leftScore != rightScore {
+			return leftScore > rightScore
+		}
+		return preferRoute(routes[i], routes[j])
+	})
+	return routes
 }
 
 func normalizeHTTPRoute(candidate string) (string, bool) {
@@ -178,4 +218,51 @@ func hostOnly(host string) string {
 		return parsedHost
 	}
 	return withoutPath
+}
+
+func routeScore(route string) int {
+	parsed, err := url.Parse(route)
+	if err != nil {
+		return 0
+	}
+	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
+	score := 0
+	if net.ParseIP(host) == nil {
+		score += 100
+		if strings.HasSuffix(host, ".lan") {
+			score += 30
+		}
+	}
+	if parsed.Port() != "" {
+		score += 20
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		score += 10
+	}
+	if parsed.Scheme == "https" {
+		score += 5
+	}
+	return score
+}
+
+func preferRoute(candidate, current string) bool {
+	if len(candidate) != len(current) {
+		return len(candidate) < len(current)
+	}
+	return candidate < current
+}
+
+func routeResultPriority(health core.HealthState) int {
+	switch health {
+	case core.HealthHealthy:
+		return 4
+	case core.HealthDegraded:
+		return 3
+	case core.HealthUnhealthy:
+		return 2
+	case core.HealthError:
+		return 1
+	default:
+		return 0
+	}
 }
