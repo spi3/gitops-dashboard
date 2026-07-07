@@ -82,6 +82,51 @@ runtime:
 	}
 }
 
+func TestLoadConfigLoadsPingRuntime(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  ping:
+    - name: homelab
+      ansibleInventory: /config/hosts.yml
+      interval: 1m
+      timeout: 2s
+      environment: infrastructure
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Runtime.Ping) != 1 {
+		t.Fatalf("ping targets = %#v", cfg.Runtime.Ping)
+	}
+	if cfg.Runtime.Ping[0].EffectiveName() != "homelab" {
+		t.Fatalf("effective name = %q, want homelab", cfg.Runtime.Ping[0].EffectiveName())
+	}
+}
+
+func TestLoadConfigRejectsEmptyPingTarget(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  ping:
+    - name: empty
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load succeeded with empty ping target")
+	}
+}
+
 func TestLoadComposeExampleConfigs(t *testing.T) {
 	t.Parallel()
 	for _, path := range []string{

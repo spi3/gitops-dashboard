@@ -31,6 +31,7 @@ the dashboard server at `/api/agents/connect`.
 - `/data`: SQLite database and repository cache.
 - `/ssh`: optional SSH keys and known hosts for private Git repositories.
 - `/kube`: optional kubeconfig files for Kubernetes monitoring.
+- `/ansible`: optional Ansible YAML inventories for host ping monitoring.
 
 ## Required Agent Mounts
 
@@ -129,9 +130,24 @@ process health even when basic auth protects the dashboard and API.
 Configuration is file based for v1. The UI may show effective configuration
 state, but it must not edit configuration.
 
-Runtime monitoring starts automatically for configured HTTP route, Docker, and
-Kubernetes targets. The default cadence is `monitoring.defaultInterval`, and
-each target can override it with `interval`.
+Runtime monitoring starts automatically for configured HTTP route, Docker,
+Kubernetes, and ping targets. The default cadence is
+`monitoring.defaultInterval`, and each target can override it with `interval`.
+
+Host ping monitoring can be driven from an Ansible YAML inventory:
+
+```yaml
+runtime:
+  ping:
+    - name: homelab-hosts
+      ansibleInventory: /ansible/hosts.yml
+      interval: 1m
+      timeout: 2s
+```
+
+Each host under an inventory `hosts` map becomes a dashboard `Host` service. If
+the host has `ansible_host`, that address is pinged; otherwise the inventory
+host name is pinged.
 
 Repository scans are available on demand through the dashboard/API. A repository
 can also opt into scheduled scans by setting `scanInterval` in its file-based

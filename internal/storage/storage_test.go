@@ -86,6 +86,50 @@ func TestStorePersistsSummary(t *testing.T) {
 	}
 }
 
+func TestReplaceConfiguredServicesPreservesStableStatusHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "host-1",
+		Name:        "serenity",
+		Repository:  "ping/hosts",
+		SourcePath:  "hosts.yml",
+		Runtime:     "host",
+		Kind:        "Host",
+		Health:      core.HealthUnknown,
+		Environment: "infrastructure",
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "ping/hosts", "hosts.yml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "host-1",
+		Target:    "ping/hosts",
+		Health:    core.HealthHealthy,
+		Message:   "pong",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "ping/hosts", "hosts.yml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='host-1'"); got != 1 {
+		t.Fatalf("stable host history rows = %d, want 1", got)
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "ping/hosts", "hosts.yml", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='host-1'"); got != 0 {
+		t.Fatalf("removed host history rows = %d, want 0", got)
+	}
+}
+
 func countRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var count int

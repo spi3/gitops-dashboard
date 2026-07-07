@@ -4,7 +4,7 @@ GitOps Dashboard is a read-only dashboard for homelab and
 self-hosted repositories. It scans configured Git repositories, discovers Docker
 Compose and generic Kubernetes manifests, builds a normalized service inventory,
 and displays live health/status when HTTP route, Docker, or Kubernetes
-monitoring targets are configured.
+monitoring targets or host ping inventories are configured.
 
 ## Current Capabilities
 
@@ -22,6 +22,7 @@ monitoring targets are configured.
 - Remote Docker agent mode over WebSocket for collecting and storing Docker
   reports.
 - Read-only Kubernetes monitoring with mounted kubeconfig files.
+- Host ping monitoring from configured Ansible `hosts.yml` inventories.
 - React dashboard with at-a-glance status, per-service uptime history from the
   monitors, clickable routes and DNS names discovered in Git, and a detail
   drawer with live check results and Git provenance.
@@ -118,7 +119,7 @@ configuration, and the full agent config shape are documented in
 Current limitation: agent reports are accepted and stored, but `kind: agent`
 Docker targets do not yet feed per-service health or uptime rows. Today,
 dashboard health rows come from direct Docker Engine targets, HTTP route checks,
-and Kubernetes targets.
+Kubernetes targets, and host ping targets.
 
 To get per-service Docker health rows today, configure a direct Docker target on
 the dashboard server:
@@ -129,6 +130,22 @@ runtime:
     - name: local-docker
       host: unix:///var/run/docker.sock
 ```
+
+To add host health rows from an Ansible YAML inventory, mount the inventory into
+the dashboard container and configure a ping target:
+
+```yaml
+runtime:
+  ping:
+    - name: homelab-hosts
+      ansibleInventory: /config/hosts.yml
+      interval: 1m
+      timeout: 2s
+```
+
+The dashboard reads `hosts` entries from the inventory, prefers `ansible_host`
+when present, creates one `Host` row per inventory host, and checks each host
+with the system `ping` command.
 
 ## Development
 

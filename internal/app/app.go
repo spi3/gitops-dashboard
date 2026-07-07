@@ -50,6 +50,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 	app.scanner = scanner.New(cfg, store, logger)
 	app.monitor = monitor.New(cfg, store, logger)
+	if err := app.monitor.SyncPingTargets(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	return app, nil
 }
 

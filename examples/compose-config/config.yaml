@@ -20,3 +20,4 @@ runtime:
       interval: 1m
       timeout: 5s
   kubernetes: []
+  ping: []

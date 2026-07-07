@@ -6,6 +6,8 @@ repositories: []
 runtime:
   docker: []
   kubernetes: []
+  http: []
+  ping: []
 agent:
   serverUrl: ws://dashboard:8080/api/agents/connect
   target: compose-docker-agent

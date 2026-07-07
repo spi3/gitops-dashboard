@@ -125,6 +125,8 @@ The dashboard must support:
 - Users must be able to configure Kubernetes monitoring targets.
 - Users must be able to configure HTTP route monitoring targets for discovered
   service URLs.
+- Users must be able to configure host ping monitoring from Ansible YAML
+  inventories.
 - Docker targets must support both local and remote engines.
 - Remote Docker targets must use a read-only daemon/agent that runs near the
   Docker engine and connects outbound to the dashboard server.
@@ -182,6 +184,15 @@ The dashboard must support:
   conditions when available.
 - Kubernetes monitoring must report connection, authentication, authorization,
   and missing-resource errors clearly.
+
+### Host Ping Monitoring
+
+- The system must detect hosts from configured Ansible `hosts.yml` inventories.
+- Host detection must read inventory `hosts` maps and prefer `ansible_host` as
+  the ping address when present.
+- Each detected host must be represented in the shared inventory/status model.
+- Host ping monitoring must record reachable, down, and check-failed states in
+  the shared status history.
 
 ### Dashboard
 

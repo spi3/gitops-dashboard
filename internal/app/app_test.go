@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -55,5 +56,48 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("frontend status = %d", res.Code)
+	}
+}
+
+func TestNewSyncsConfiguredPingInventory(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	inventory := filepath.Join(dataDir, "hosts.yml")
+	if err := os.WriteFile(inventory, []byte(`
+all:
+  hosts:
+    serenity:
+      ansible_host: serenity.lan
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Ping: []config.PingTarget{{Name: "homelab", AnsibleInventory: inventory}},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	summary, err := app.store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Services) != 1 {
+		t.Fatalf("services = %#v, want one host", summary.Services)
+	}
+	service := summary.Services[0]
+	if service.Name != "serenity" || service.Runtime != "host" || service.ResourceName != "serenity.lan" {
+		t.Fatalf("service = %#v", service)
 	}
 }

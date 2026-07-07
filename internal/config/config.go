@@ -57,6 +57,7 @@ type RuntimeConfig struct {
 	Docker     []DockerTarget     `yaml:"docker"`
 	Kubernetes []KubernetesTarget `yaml:"kubernetes"`
 	HTTP       []HTTPRouteTarget  `yaml:"http"`
+	Ping       []PingTarget       `yaml:"ping"`
 }
 
 type DockerTarget struct {
@@ -78,6 +79,15 @@ type HTTPRouteTarget struct {
 	Name     string `yaml:"name"`
 	Interval string `yaml:"interval"`
 	Timeout  string `yaml:"timeout"`
+}
+
+type PingTarget struct {
+	Name             string `yaml:"name"`
+	Host             string `yaml:"host"`
+	AnsibleInventory string `yaml:"ansibleInventory"`
+	Interval         string `yaml:"interval"`
+	Timeout          string `yaml:"timeout"`
+	Environment      string `yaml:"environment"`
 }
 
 type MonitoringConfig struct {
@@ -175,6 +185,17 @@ func (cfg Config) Validate() error {
 			return err
 		}
 	}
+	for _, target := range cfg.Runtime.Ping {
+		if target.Host == "" && target.AnsibleInventory == "" {
+			return fmt.Errorf("runtime.ping target requires host or ansibleInventory")
+		}
+		if _, err := target.IntervalDuration(); err != nil {
+			return err
+		}
+		if _, err := target.TimeoutDuration(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -224,6 +245,38 @@ func (target HTTPRouteTarget) IntervalDuration() (time.Duration, error) {
 
 func (target HTTPRouteTarget) TimeoutDuration() (time.Duration, error) {
 	return optionalPositiveDuration(target.Timeout, "runtime.http.timeout")
+}
+
+func (target PingTarget) EffectiveName() string {
+	if target.Name != "" {
+		return target.Name
+	}
+	if target.Host != "" {
+		return target.Host
+	}
+	if target.AnsibleInventory != "" {
+		name := filepath.Base(target.AnsibleInventory)
+		if name != "." && name != string(filepath.Separator) {
+			return name
+		}
+	}
+	return "hosts"
+}
+
+func (target PingTarget) CheckInterval(defaultInterval time.Duration) time.Duration {
+	interval, err := target.IntervalDuration()
+	if err != nil || interval == 0 {
+		return defaultInterval
+	}
+	return interval
+}
+
+func (target PingTarget) IntervalDuration() (time.Duration, error) {
+	return optionalPositiveDuration(target.Interval, "runtime.ping.interval")
+}
+
+func (target PingTarget) TimeoutDuration() (time.Duration, error) {
+	return optionalPositiveDuration(target.Timeout, "runtime.ping.timeout")
 }
 
 func (cfg RepositoryConfig) ScanDuration() (time.Duration, error) {

@@ -478,7 +478,9 @@ function ServiceDrawer({ onClose, service, statuses, uptime }: {
               ))}
             </ul>
           ) : (
-            <p className="quiet">No routes or DNS names were found in Git for this service.</p>
+            <p className="quiet">
+              {service.runtime === "host" ? "No openable route was found for this host." : "No routes or DNS names were found in Git for this service."}
+            </p>
           )}
         </section>
 
@@ -525,7 +527,7 @@ function ServiceDrawer({ onClose, service, statuses, uptime }: {
         ) : null}
 
         <section className="drawerSection">
-          <h3>Declared in Git</h3>
+          <h3>{service.runtime === "host" ? "Configured from" : "Declared in Git"}</h3>
           <p className="provenance">
             {service.repository} {"·"} {service.sourcePath}{commit ? ` @ ${commit}` : ""}
           </p>
@@ -724,6 +726,9 @@ function environmentLabel(value: string) {
 function runtimeLabel(value: string) {
   if (value === "kubernetes") {
     return "Kubernetes";
+  }
+  if (value === "host") {
+    return "Host";
   }
   return titleize(value || "other");
 }

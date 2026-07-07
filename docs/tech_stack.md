@@ -148,6 +148,22 @@ Recommended approach:
 Kubernetes integration should be read-only and limited to list/watch/get style
 operations.
 
+## Host Ping Integration
+
+Host monitoring should support configured Ansible YAML inventories and produce
+ordinary runtime status rows.
+
+Recommended approach:
+
+- Parse mounted `hosts.yml` files with the existing YAML parser dependency.
+- Read inventory `hosts` maps recursively through groups and children.
+- Prefer `ansible_host` as the ping address when present.
+- Represent each discovered host as a normalized `Host` inventory item.
+- Use the system `ping` command behind a narrow internal function so tests can
+  inject deterministic reachability results.
+
+Host ping integration should be read-only and limited to reachability checks.
+
 ## YAML and Spec Parsing
 
 Recommended approach:
@@ -185,7 +201,7 @@ The container should include:
 - Go backend binary
 - Built frontend assets
 - Required static files
-- Runtime dependencies needed for Git operations
+- Runtime dependencies needed for Git operations and ping checks
 
 The container should support mounts for:
 
@@ -194,6 +210,7 @@ The container should support mounts for:
 - Repository cache directory
 - SSH keys and known hosts
 - Kubeconfig files for Kubernetes monitoring
+- Ansible YAML inventories for host ping monitoring
 - Remote Docker agent tokens or certificates
 
 The app should expose one HTTP port and use health/readiness endpoints for

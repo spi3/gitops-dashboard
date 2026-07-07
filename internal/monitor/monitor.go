@@ -48,6 +48,9 @@ func (monitor Monitor) Run(ctx context.Context) {
 	for _, target := range monitor.cfg.Runtime.HTTP {
 		go monitor.runHTTPRouteLoop(ctx, target, target.CheckInterval(defaultInterval))
 	}
+	for _, target := range monitor.cfg.Runtime.Ping {
+		go monitor.runPingLoop(ctx, target, target.CheckInterval(defaultInterval))
+	}
 }
 
 func (monitor Monitor) CheckAll(ctx context.Context) error {
@@ -77,6 +80,12 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 			combined = err
 		}
 	}
+	for _, target := range monitor.cfg.Runtime.Ping {
+		if err := monitor.checkPing(ctx, target); err != nil {
+			monitor.logger.Error("ping monitoring failed", "target", target.EffectiveName(), "error", err)
+			combined = err
+		}
+	}
 	return combined
 }
 
@@ -95,6 +104,12 @@ func (monitor Monitor) runKubernetesLoop(ctx context.Context, target config.Kube
 func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPRouteTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkHTTPRoutes(checkCtx, target, services)
+	})
+}
+
+func (monitor Monitor) runPingLoop(ctx context.Context, target config.PingTarget, interval time.Duration) {
+	monitor.runTargetLoop(ctx, target.EffectiveName(), interval, func(checkCtx context.Context, _ []core.Service) error {
+		return monitor.checkPing(checkCtx, target)
 	})
 }
 
