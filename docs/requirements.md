@@ -126,7 +126,7 @@ The dashboard must support:
 - Users must be able to configure HTTP route monitoring targets for discovered
   service URLs.
 - Users must be able to configure host ping monitoring from Ansible YAML
-  inventories.
+  inventories in configured repositories.
 - Docker targets must support both local and remote engines.
 - Remote Docker targets must use a read-only daemon/agent that runs near the
   Docker engine and connects outbound to the dashboard server.
@@ -187,7 +187,8 @@ The dashboard must support:
 
 ### Host Ping Monitoring
 
-- The system must detect hosts from configured Ansible `hosts.yml` inventories.
+- The system must detect hosts from configured Ansible `hosts.yml` inventories
+  stored in configured repositories.
 - Host detection must read inventory `hosts` maps and prefer `ansible_host` as
   the ping address when present.
 - Each detected host must be represented in the shared inventory/status model.

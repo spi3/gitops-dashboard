@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/hostinventory"
+	"github.com/example/gitops-dashboard/internal/scanner"
 )
 
 const (
@@ -34,14 +36,50 @@ func (monitor Monitor) SyncPingTargets(ctx context.Context) error {
 }
 
 func (monitor Monitor) syncPingTarget(ctx context.Context, target config.PingTarget) ([]core.Service, error) {
-	services, err := hostinventory.ServicesForTarget(target)
+	inventoryPath, commit, err := monitor.resolvePingInventory(ctx, target)
 	if err != nil {
 		return nil, err
 	}
-	if err := monitor.store.ReplaceConfiguredServices(ctx, hostinventory.RepositoryName(target), hostinventory.Source(target), services); err != nil {
+	services, err := hostinventory.ServicesForTarget(target, inventoryPath, commit)
+	if err != nil {
+		return nil, err
+	}
+	if err := monitor.store.ReplaceRuntimeServices(ctx, hostinventory.RepositoryName(target), hostinventory.Source(target), "host", services); err != nil {
 		return nil, err
 	}
 	return services, nil
+}
+
+func (monitor Monitor) resolvePingInventory(ctx context.Context, target config.PingTarget) (string, string, error) {
+	if target.AnsibleInventory == "" {
+		return "", "", nil
+	}
+	if target.Repository == "" {
+		return target.AnsibleInventory, "", nil
+	}
+	repo, ok := monitor.repository(target.Repository)
+	if !ok {
+		return "", "", fmt.Errorf("runtime.ping repository %q is not defined", target.Repository)
+	}
+	repoScanner := scanner.New(monitor.cfg, monitor.store, monitor.logger)
+	repoPath, err := repoScanner.SyncRepo(ctx, repo)
+	if err != nil {
+		return "", "", err
+	}
+	commit, err := scanner.CurrentCommit(ctx, repoPath)
+	if err != nil {
+		return "", "", err
+	}
+	return filepath.Join(repoPath, filepath.FromSlash(target.AnsibleInventory)), commit, nil
+}
+
+func (monitor Monitor) repository(name string) (config.RepositoryConfig, bool) {
+	for _, repo := range monitor.cfg.Repositories {
+		if repo.Name == name {
+			return repo, true
+		}
+	}
+	return config.RepositoryConfig{}, false
 }
 
 func (monitor Monitor) checkPing(ctx context.Context, target config.PingTarget) error {

@@ -159,6 +159,68 @@ ON CONFLICT(name) DO UPDATE SET
 	return tx.Commit()
 }
 
+func (store *Store) ReplaceRuntimeServices(ctx context.Context, repositoryName, source, runtime string, services []core.Service) error {
+	if source == "" {
+		source = repositoryName
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO repositories(name, url, default_ref, last_scan_at, status, error)
+VALUES(?, ?, 'configured', ?, 'configured', '')
+ON CONFLICT(name) DO NOTHING
+`, repositoryName, source, now)
+	if err != nil {
+		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
+	}
+
+	currentRows, err := tx.QueryContext(ctx, `SELECT id FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
+	if err != nil {
+		return err
+	}
+	currentIDs := map[string]struct{}{}
+	for currentRows.Next() {
+		var id string
+		if err := currentRows.Scan(&id); err != nil {
+			_ = currentRows.Close()
+			return err
+		}
+		currentIDs[id] = struct{}{}
+	}
+	if err := currentRows.Close(); err != nil {
+		return err
+	}
+	newIDs := map[string]struct{}{}
+	for _, service := range services {
+		newIDs[service.ID] = struct{}{}
+	}
+	for id := range currentIDs {
+		if _, ok := newIDs[id]; ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source); err != nil {
+		return err
+	}
+	for _, service := range services {
+		if err := insertService(ctx, tx, service); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (store *Store) StartScan(ctx context.Context, repoName string) (int64, error) {
 	result, err := store.db.ExecContext(ctx, `
 INSERT INTO scans(repository, status, started_at) VALUES(?, 'running', ?)

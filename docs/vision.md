@@ -182,7 +182,8 @@ Version 1 monitoring inputs should include:
 - Kubernetes API status from configured local or remote clusters using mounted
   kubeconfig files for resources discovered from generic manifests
 - HTTP health checks where endpoints can be configured or inferred safely
-- Host reachability checks from configured Ansible `hosts.yml` inventories
+- Host reachability checks from Ansible `hosts.yml` inventories in configured
+  repositories
 
 Potential future monitoring inputs:
 

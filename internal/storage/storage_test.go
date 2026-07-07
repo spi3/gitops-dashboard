@@ -130,6 +130,75 @@ func TestReplaceConfiguredServicesPreservesStableStatusHistory(t *testing.T) {
 	}
 }
 
+func TestReplaceRuntimeServicesPreservesOtherRepositoryServices(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "kube",
+		URL:        "https://example.invalid/kube.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "kube")
+	if err != nil {
+		t.Fatal(err)
+	}
+	composeService := core.Service{
+		ID:           "compose-1",
+		Name:         "web",
+		Repository:   "kube",
+		SourceCommit: "abc123",
+		SourcePath:   "docker_files/web/docker-compose.yml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.FinishScan(ctx, scanID, "kube", "abc123", []core.Service{composeService}, nil); err != nil {
+		t.Fatal(err)
+	}
+	hostService := core.Service{
+		ID:           "host-1",
+		Name:         "serenity",
+		Repository:   "kube",
+		SourceCommit: "abc123",
+		SourcePath:   "infrastructure/inventory/hosts.yml",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "kube", "infrastructure/inventory/hosts.yml", "host", []core.Service{hostService}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "host-1",
+		Target:    "homelab",
+		Health:    core.HealthHealthy,
+		Message:   "pong",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "kube", "infrastructure/inventory/hosts.yml", "host", nil); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Services) != 1 || summary.Services[0].ID != "compose-1" {
+		t.Fatalf("services = %#v, want only compose service preserved", summary.Services)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='host-1'"); got != 0 {
+		t.Fatalf("removed host history rows = %d, want 0", got)
+	}
+}
+
 func countRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var count int

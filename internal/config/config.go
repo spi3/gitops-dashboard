@@ -100,6 +100,7 @@ type HTTPRouteTarget struct {
 type PingTarget struct {
 	Name             string `yaml:"name"`
 	Host             string `yaml:"host"`
+	Repository       string `yaml:"repository"`
 	AnsibleInventory string `yaml:"ansibleInventory"`
 	Interval         string `yaml:"interval"`
 	Timeout          string `yaml:"timeout"`
@@ -359,9 +360,27 @@ func (cfg Config) Validate() error {
 			return err
 		}
 	}
+	repositoryNames := map[string]struct{}{}
+	for _, repo := range cfg.Repositories {
+		repositoryNames[repo.Name] = struct{}{}
+	}
 	for _, target := range cfg.Runtime.Ping {
 		if target.Host == "" && target.AnsibleInventory == "" {
 			return fmt.Errorf("runtime.ping target requires host or ansibleInventory")
+		}
+		if target.Repository != "" && target.AnsibleInventory == "" {
+			return fmt.Errorf("runtime.ping repository requires ansibleInventory")
+		}
+		if target.AnsibleInventory != "" {
+			if target.Repository == "" {
+				return fmt.Errorf("runtime.ping ansibleInventory requires repository")
+			}
+			if _, ok := repositoryNames[target.Repository]; !ok {
+				return fmt.Errorf("runtime.ping repository %q is not defined in repositories", target.Repository)
+			}
+			if err := validateRepoRelativePath("runtime.ping.ansibleInventory", target.AnsibleInventory); err != nil {
+				return err
+			}
 		}
 		if _, err := target.IntervalDuration(); err != nil {
 			return err
@@ -445,7 +464,7 @@ func (target PingTarget) EffectiveName() string {
 		return target.Host
 	}
 	if target.AnsibleInventory != "" {
-		name := filepath.Base(target.AnsibleInventory)
+		name := filepath.Base(filepath.FromSlash(target.AnsibleInventory))
 		if name != "." && name != string(filepath.Separator) {
 			return name
 		}
@@ -489,6 +508,17 @@ func optionalPositiveDuration(value, field string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be greater than zero", field)
 	}
 	return interval, nil
+}
+
+func validateRepoRelativePath(field, value string) error {
+	if filepath.IsAbs(value) {
+		return fmt.Errorf("%s must be a repository-relative path", field)
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(value))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s must stay inside the repository", field)
+	}
+	return nil
 }
 
 func (cfg RepositoryConfig) Token() (string, error) {

@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/example/gitops-dashboard/internal/config"
@@ -115,15 +117,18 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 func TestNewSyncsConfiguredPingInventory(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
-	inventory := filepath.Join(dataDir, "hosts.yml")
-	if err := os.WriteFile(inventory, []byte(`
+	source := filepath.Join(dataDir, "source")
+	writeFile(t, filepath.Join(source, "infrastructure", "inventory", "hosts.yml"), `
 all:
   hosts:
     serenity:
       ansible_host: serenity.lan
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+`)
+	runGit(t, source, "init", "-b", "main")
+	runGit(t, source, "config", "user.name", "Test")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "add", ".")
+	runGit(t, source, "commit", "-m", "fixture")
 	cfg := config.Config{
 		Server: config.ServerConfig{
 			Listen:       ":0",
@@ -132,8 +137,17 @@ all:
 		},
 		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
 		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
 		Runtime: config.RuntimeConfig{
-			Ping: []config.PingTarget{{Name: "homelab", AnsibleInventory: inventory}},
+			Ping: []config.PingTarget{{
+				Name:             "homelab",
+				Repository:       "fixture",
+				AnsibleInventory: "infrastructure/inventory/hosts.yml",
+			}},
 		},
 	}
 	app, err := New(cfg, slog.Default())
@@ -152,5 +166,28 @@ all:
 	service := summary.Services[0]
 	if service.Name != "serenity" || service.Runtime != "host" || service.ResourceName != "serenity.lan" {
 		t.Fatalf("service = %#v", service)
+	}
+	if service.Repository != "fixture" || service.SourcePath != "infrastructure/inventory/hosts.yml" {
+		t.Fatalf("service provenance = %#v", service)
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(content)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
 }

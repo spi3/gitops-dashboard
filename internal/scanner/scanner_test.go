@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/example/gitops-dashboard/internal/config"
+	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
 
@@ -72,6 +73,68 @@ func TestScanAllClonesAndParsesFixtureRepository(t *testing.T) {
 	}
 	if !contains(servicesByName["api"], "https://api-alt.example.test") {
 		t.Fatalf("api exposure = %v, want traefik route", servicesByName["api"])
+	}
+}
+
+func TestScanAllDiscoversPingHostsFromConfiguredRepository(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	writeFile(t, filepath.Join(source, "infrastructure", "inventory", "hosts.yml"), `
+all:
+  hosts:
+    serenity:
+      ansible_host: serenity.lan
+`)
+	runGit(t, source, "add", ".")
+	runGit(t, source, "commit", "-m", "add inventory")
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Runtime: config.RuntimeConfig{
+			Ping: []config.PingTarget{{
+				Name:             "homelab",
+				Repository:       "fixture",
+				AnsibleInventory: "infrastructure/inventory/hosts.yml",
+			}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var host core.Service
+	for _, service := range summary.Services {
+		if service.Runtime == "host" {
+			host = service
+			break
+		}
+	}
+	if host.Name != "serenity" || host.Repository != "fixture" || host.SourcePath != "infrastructure/inventory/hosts.yml" || host.ResourceName != "serenity.lan" {
+		t.Fatalf("host service = %#v", host)
+	}
+	if host.SourceCommit == "" {
+		t.Fatal("host SourceCommit is empty")
 	}
 }
 

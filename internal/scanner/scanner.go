@@ -18,6 +18,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/environment"
+	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/parser"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
@@ -115,6 +116,15 @@ func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig
 		return err
 	}
 	return scanErr
+}
+
+func (scanner Scanner) SyncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
+	return scanner.syncRepo(ctx, repo)
+}
+
+func CurrentCommit(ctx context.Context, repoPath string) (string, error) {
+	commit, err := gitOutput(ctx, repoPath, nil, "rev-parse", "HEAD")
+	return strings.TrimSpace(commit), err
 }
 
 func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
@@ -245,6 +255,27 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 	}
 	services = append(services, scanner.kubeServices(repo.Name, commit, enrichKubernetesExposure(kubeResources))...)
 	services = applyTraefikRoutes(services, traefikRoutes)
+	pingServices, err := scanner.pingServices(repoPath, repo.Name, commit)
+	if err != nil {
+		return services, err
+	}
+	services = append(services, pingServices...)
+	return services, nil
+}
+
+func (scanner Scanner) pingServices(repoPath, repoName, commit string) ([]core.Service, error) {
+	var services []core.Service
+	for _, target := range scanner.cfg.Runtime.Ping {
+		if target.Repository != repoName || target.AnsibleInventory == "" {
+			continue
+		}
+		inventoryPath := filepath.Join(repoPath, filepath.FromSlash(target.AnsibleInventory))
+		parsed, err := hostinventory.ServicesForTarget(target, inventoryPath, commit)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", target.AnsibleInventory, err)
+		}
+		services = append(services, parsed...)
+	}
 	return services, nil
 }
 

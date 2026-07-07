@@ -90,10 +90,14 @@ func TestLoadConfigLoadsPingRuntime(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 auth:
   mode: dev-no-auth
+repositories:
+  - name: kube
+    url: https://example.invalid/kube.git
 runtime:
   ping:
     - name: homelab
-      ansibleInventory: /config/hosts.yml
+      repository: kube
+      ansibleInventory: infrastructure/inventory/hosts.yml
       interval: 1m
       timeout: 2s
       environment: infrastructure
@@ -109,6 +113,9 @@ runtime:
 	}
 	if cfg.Runtime.Ping[0].EffectiveName() != "homelab" {
 		t.Fatalf("effective name = %q, want homelab", cfg.Runtime.Ping[0].EffectiveName())
+	}
+	if cfg.Runtime.Ping[0].Repository != "kube" {
+		t.Fatalf("repository = %q, want kube", cfg.Runtime.Ping[0].Repository)
 	}
 }
 
@@ -358,6 +365,71 @@ runtime:
 	}
 }
 
+func TestLoadConfigRejectsPingInventoryWithoutRepository(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  ping:
+    - name: homelab
+      ansibleInventory: infrastructure/inventory/hosts.yml
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "ansibleInventory requires repository") {
+		t.Fatalf("error = %q", errText)
+	}
+}
+
+func TestLoadConfigRejectsPingInventoryOutsideRepository(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+repositories:
+  - name: kube
+    url: https://example.invalid/kube.git
+runtime:
+  ping:
+    - name: homelab
+      repository: kube
+      ansibleInventory: ../hosts.yml
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "must stay inside the repository") {
+		t.Fatalf("error = %q", errText)
+	}
+}
+
+func TestLoadConfigRejectsPingInventoryUnknownRepository(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+repositories:
+  - name: kube
+    url: https://example.invalid/kube.git
+runtime:
+  ping:
+    - name: homelab
+      repository: missing
+      ansibleInventory: infrastructure/inventory/hosts.yml
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "is not defined in repositories") {
+		t.Fatalf("error = %q", errText)
+	}
+}
+
 func TestLoadComposeExampleConfigs(t *testing.T) {
 	t.Setenv("GITOPS_DASHBOARD_AGENT_TOKEN", "example-agent-token")
 	serverConfig := filepath.Join("..", "..", "examples", "compose-config", "config.yaml")
@@ -368,4 +440,13 @@ func TestLoadComposeExampleConfigs(t *testing.T) {
 	if _, err := LoadForMode(agentConfig, ModeAgent); err != nil {
 		t.Fatalf("LoadForMode(%s, %s): %v", agentConfig, ModeAgent, err)
 	}
+}
+
+func loadError(t *testing.T, path string) string {
+	t.Helper()
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want error")
+	}
+	return err.Error()
 }

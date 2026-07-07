@@ -22,7 +22,8 @@ monitoring targets or host ping inventories are configured.
 - Remote Docker agent mode over WebSocket for collecting Docker reports and
   showing agent connection/container state.
 - Read-only Kubernetes monitoring with mounted kubeconfig files.
-- Host ping monitoring from configured Ansible `hosts.yml` inventories.
+- Host ping monitoring from Ansible `hosts.yml` inventories in configured
+  repositories.
 - React dashboard with at-a-glance status, per-service uptime history from the
   monitors, clickable routes and DNS names discovered in Git, and a detail
   drawer with live check results and Git provenance.
@@ -154,21 +155,25 @@ runtime:
       host: unix:///var/run/docker.sock
 ```
 
-To add host health rows from an Ansible YAML inventory, mount the inventory into
-the dashboard container and configure a ping target:
+To add host health rows from an Ansible YAML inventory, keep the inventory in a
+configured repository and point the ping target at that repo-relative path:
 
 ```yaml
+repositories:
+  - name: kube
+    url: https://github.com/spi3/kube
 runtime:
   ping:
     - name: homelab-hosts
-      ansibleInventory: /config/hosts.yml
+      repository: kube
+      ansibleInventory: infrastructure/inventory/hosts.yml
       interval: 1m
       timeout: 2s
 ```
 
-The dashboard reads `hosts` entries from the inventory, prefers `ansible_host`
-when present, creates one `Host` row per inventory host, and checks each host
-with the system `ping` command.
+The dashboard syncs the named repository, reads `hosts` entries from the
+inventory, prefers `ansible_host` when present, creates one `Host` row per
+inventory host, and checks each host with the system `ping` command.
 
 ## Development
 

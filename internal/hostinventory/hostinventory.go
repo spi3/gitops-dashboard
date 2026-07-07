@@ -13,6 +13,9 @@ import (
 )
 
 func RepositoryName(target config.PingTarget) string {
+	if target.Repository != "" {
+		return target.Repository
+	}
 	return "ping/" + target.EffectiveName()
 }
 
@@ -26,10 +29,10 @@ func Source(target config.PingTarget) string {
 	return "runtime.ping"
 }
 
-func ServicesForTarget(target config.PingTarget) ([]core.Service, error) {
+func ServicesForTarget(target config.PingTarget, inventoryPath, commit string) ([]core.Service, error) {
 	hosts := map[string]parser.AnsibleHost{}
 	if target.AnsibleInventory != "" {
-		parsed, err := parser.ParseAnsibleHosts(target.AnsibleInventory)
+		parsed, err := parser.ParseAnsibleHosts(inventoryPath)
 		if err != nil {
 			return nil, err
 		}
@@ -68,6 +71,7 @@ func ServicesForTarget(target config.PingTarget) ([]core.Service, error) {
 			ID:           hostServiceID(repository, name),
 			Name:         name,
 			Repository:   repository,
+			SourceCommit: commit,
 			SourcePath:   source,
 			Runtime:      "host",
 			Kind:         "Host",
