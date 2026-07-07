@@ -42,11 +42,33 @@ repositories:
   - name: repo
     url: https://example.invalid/repo.git
     scanInterval: no-such-duration
+runtime:
+  http:
+    - name: routes
+      timeout: 5s
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load succeeded with invalid scanInterval")
+	}
+}
+
+func TestLoadConfigRejectsInvalidHTTPTimeout(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  http:
+    - name: routes
+      timeout: no-such-duration
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load succeeded with invalid HTTP timeout")
 	}
 }
 

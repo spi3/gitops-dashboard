@@ -54,6 +54,7 @@ type RepositoryConfig struct {
 type RuntimeConfig struct {
 	Docker     []DockerTarget     `yaml:"docker"`
 	Kubernetes []KubernetesTarget `yaml:"kubernetes"`
+	HTTP       []HTTPRouteTarget  `yaml:"http"`
 }
 
 type DockerTarget struct {
@@ -69,6 +70,12 @@ type KubernetesTarget struct {
 	Kubeconfig string `yaml:"kubeconfig"`
 	Context    string `yaml:"context"`
 	Interval   string `yaml:"interval"`
+}
+
+type HTTPRouteTarget struct {
+	Name     string `yaml:"name"`
+	Interval string `yaml:"interval"`
+	Timeout  string `yaml:"timeout"`
 }
 
 type MonitoringConfig struct {
@@ -158,6 +165,14 @@ func (cfg Config) Validate() error {
 			return err
 		}
 	}
+	for _, target := range cfg.Runtime.HTTP {
+		if _, err := target.IntervalDuration(); err != nil {
+			return err
+		}
+		if _, err := target.TimeoutDuration(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -191,6 +206,22 @@ func (target KubernetesTarget) CheckInterval(defaultInterval time.Duration) time
 
 func (target KubernetesTarget) IntervalDuration() (time.Duration, error) {
 	return optionalPositiveDuration(target.Interval, "runtime.kubernetes.interval")
+}
+
+func (target HTTPRouteTarget) CheckInterval(defaultInterval time.Duration) time.Duration {
+	interval, err := target.IntervalDuration()
+	if err != nil || interval == 0 {
+		return defaultInterval
+	}
+	return interval
+}
+
+func (target HTTPRouteTarget) IntervalDuration() (time.Duration, error) {
+	return optionalPositiveDuration(target.Interval, "runtime.http.interval")
+}
+
+func (target HTTPRouteTarget) TimeoutDuration() (time.Duration, error) {
+	return optionalPositiveDuration(target.Timeout, "runtime.http.timeout")
 }
 
 func (cfg RepositoryConfig) ScanDuration() (time.Duration, error) {

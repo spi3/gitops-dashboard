@@ -6,7 +6,7 @@ Version 1 is a read-only, single-container dashboard for homelab and
 self-hosted GitOps repositories. It discovers Git repositories, analyzes Docker
 Compose and generic Kubernetes manifests, builds a service inventory from static
 repository state, and monitors live service health/status through configured
-Docker and Kubernetes targets.
+HTTP route, Docker, and Kubernetes targets.
 
 The dashboard must support:
 
@@ -19,6 +19,7 @@ The dashboard must support:
 - Remote Docker monitoring through a read-only daemon that connects outbound to
   the dashboard server.
 - Local and remote Kubernetes clusters.
+- HTTP route checks for discovered service URLs.
 - SQLite storage.
 - Basic authentication.
 - File-based configuration.
@@ -120,6 +121,8 @@ The dashboard must support:
 
 - Users must be able to configure Docker monitoring targets.
 - Users must be able to configure Kubernetes monitoring targets.
+- Users must be able to configure HTTP route monitoring targets for discovered
+  service URLs.
 - Docker targets must support both local and remote engines.
 - Remote Docker targets must use a read-only daemon/agent that runs near the
   Docker engine and connects outbound to the dashboard server.
@@ -129,6 +132,15 @@ The dashboard must support:
   with runtime targets.
 - Failed runtime checks must not block repository scanning.
 - Runtime target configuration must be file based for v1.
+
+### HTTP Route Monitoring
+
+- The system must be able to check discovered HTTP and HTTPS service URLs
+  without mutating the target service.
+- HTTP route monitoring must skip cluster-internal service references and
+  Docker network names.
+- HTTP route monitoring must record reachable, degraded, down, and request
+  error states in the shared status history.
 
 ### Docker Monitoring
 
@@ -260,6 +272,7 @@ The dashboard must support:
 - The dashboard shows scan errors without crashing.
 - The user can configure at least one Docker monitoring target.
 - The user can configure at least one Kubernetes monitoring target.
+- The user can configure at least one HTTP route monitoring target.
 - A remote Docker daemon can connect outbound to the dashboard server and report
   read-only status over WebSocket.
 - The same container image can be started in remote Docker agent mode.

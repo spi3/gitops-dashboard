@@ -45,6 +45,9 @@ func (monitor Monitor) Run(ctx context.Context) {
 	for _, target := range monitor.cfg.Runtime.Kubernetes {
 		go monitor.runKubernetesLoop(ctx, target, target.CheckInterval(defaultInterval))
 	}
+	for _, target := range monitor.cfg.Runtime.HTTP {
+		go monitor.runHTTPRouteLoop(ctx, target, target.CheckInterval(defaultInterval))
+	}
 }
 
 func (monitor Monitor) CheckAll(ctx context.Context) error {
@@ -68,6 +71,12 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 			combined = err
 		}
 	}
+	for _, target := range monitor.cfg.Runtime.HTTP {
+		if err := monitor.checkHTTPRoutes(ctx, target, services); err != nil {
+			monitor.logger.Error("http route monitoring failed", "target", target.Name, "error", err)
+			combined = err
+		}
+	}
 	return combined
 }
 
@@ -80,6 +89,12 @@ func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTa
 func (monitor Monitor) runKubernetesLoop(ctx context.Context, target config.KubernetesTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkKubernetes(checkCtx, target, services)
+	})
+}
+
+func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPRouteTarget, interval time.Duration) {
+	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
+		return monitor.checkHTTPRoutes(checkCtx, target, services)
 	})
 }
 

@@ -309,17 +309,45 @@ FROM status_results ORDER BY checked_at DESC
 }
 
 func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
-	latest := map[string]core.StatusResult{}
+	latestByTarget := map[string]map[string]core.StatusResult{}
 	for _, status := range statuses {
-		current, ok := latest[status.ServiceID]
-		if !ok || status.CheckedAt.After(current.CheckedAt) {
-			latest[status.ServiceID] = status
+		targets, ok := latestByTarget[status.ServiceID]
+		if !ok {
+			targets = map[string]core.StatusResult{}
+			latestByTarget[status.ServiceID] = targets
+		}
+		current, ok := targets[status.Target]
+		if !ok || status.CheckedAt.After(current.CheckedAt) || (status.CheckedAt.Equal(current.CheckedAt) && healthPriority(status.Health) < healthPriority(current.Health)) {
+			targets[status.Target] = status
 		}
 	}
 	for i := range services {
-		if status, ok := latest[services[i].ID]; ok {
-			services[i].Health = status.Health
+		targets, ok := latestByTarget[services[i].ID]
+		if !ok {
+			continue
 		}
+		health := core.HealthUnknown
+		for _, status := range targets {
+			if healthPriority(status.Health) < healthPriority(health) {
+				health = status.Health
+			}
+		}
+		services[i].Health = health
+	}
+}
+
+func healthPriority(health core.HealthState) int {
+	switch health {
+	case core.HealthError:
+		return 0
+	case core.HealthUnhealthy:
+		return 1
+	case core.HealthDegraded:
+		return 2
+	case core.HealthHealthy:
+		return 3
+	default:
+		return 4
 	}
 }
 

@@ -3,8 +3,8 @@
 Docker Monitor is a read-only GitOps-inspired dashboard for homelab and
 self-hosted repositories. It scans configured Git repositories, discovers Docker
 Compose and generic Kubernetes manifests, builds a normalized service inventory,
-and displays live health/status when Docker or Kubernetes monitoring targets are
-configured.
+and displays live health/status when HTTP route, Docker, or Kubernetes
+monitoring targets are configured.
 
 ## Current Capabilities
 
@@ -16,6 +16,7 @@ configured.
 - SQLite-backed repository, scan, inventory, and status storage.
 - Basic authentication with hashed passwords.
 - File-based configuration.
+- HTTP route checks for discovered service URLs.
 - Read-only Docker monitoring through local/remote Docker Engine HTTP API
   targets.
 - Remote Docker monitoring agent mode over WebSocket.

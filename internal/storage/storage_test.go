@@ -148,6 +148,21 @@ func TestUptimeTracksHistory(t *testing.T) {
 	}
 }
 
+func TestSummaryHealthPrefersActionableStatusAcrossTargets(t *testing.T) {
+	t.Parallel()
+	statusTime := time.Date(2026, 6, 27, 16, 0, 0, 0, time.UTC)
+	services := []core.Service{{ID: "svc", Health: core.HealthUnknown}}
+	statuses := []core.StatusResult{
+		{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime},
+		{ServiceID: "svc", Target: "routes", Health: core.HealthHealthy, CheckedAt: statusTime},
+		{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime.Add(time.Minute)},
+	}
+	applyLatestStatus(services, statuses)
+	if services[0].Health != core.HealthHealthy {
+		t.Fatalf("health = %s, want healthy", services[0].Health)
+	}
+}
+
 func TestUptimeHealthClassification(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -15,4 +15,8 @@ runtime:
     - name: compose-docker-agent
       kind: agent
       agentToken: replace-me-with-a-long-random-agent-token
+  http:
+    - name: routes
+      interval: 1m
+      timeout: 5s
   kubernetes: []

@@ -10,3 +10,4 @@ repositories: []
 runtime:
   docker: []
   kubernetes: []
+  http: []
