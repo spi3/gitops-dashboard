@@ -5,8 +5,7 @@ server:
 auth:
   mode: dev-no-auth
   agent:
-    tokens:
-      - replace-me-with-a-long-random-agent-token
+    tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
 monitoring:
   defaultInterval: 30s
 repositories: []
@@ -14,7 +13,7 @@ runtime:
   docker:
     - name: compose-docker-agent
       kind: agent
-      agentToken: replace-me-with-a-long-random-agent-token
+      agentTokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
   http:
     - name: routes
       interval: 1m

@@ -49,6 +49,7 @@ proxy instead of mounting the socket directly.
 
 ```sh
 docker build -t gitops-dashboard:latest .
+export GITOPS_DASHBOARD_AGENT_TOKEN="$(openssl rand -hex 32)"
 docker compose -f examples/docker-compose.yaml up -d
 docker compose -f examples/docker-compose.yaml ps
 docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
@@ -62,17 +63,20 @@ After tests pass, the workflow publishes the image to GitHub Container Registry:
 
 The Compose file mounts `examples/compose-config` into both containers:
 
-- `config.yaml`: dashboard server config with an accepted agent token.
+- `config.yaml`: dashboard server config that reads the accepted agent token
+  from `GITOPS_DASHBOARD_AGENT_TOKEN`.
 - `agent.yaml`: remote Docker agent config with the dashboard WebSocket URL,
-  target name, matching token, reporting interval, and Docker host.
+  target name, matching token environment reference, reporting interval, and
+  Docker host.
 
-Before using the example outside local testing, replace
-`replace-me-with-a-long-random-agent-token` in both files with the same secret
-token.
+Before using the example outside local testing, provide the same
+`GITOPS_DASHBOARD_AGENT_TOKEN` value to both containers through your container
+runtime, secret manager, or orchestrator.
 
 The dashboard accepts agent connections when the token matches either
-`auth.agent.tokens` or a Docker target `agentToken`. The agent sends the token in
-the `X-Agent-Token` header.
+`auth.agent.tokens`, `auth.agent.tokenEnv`, `auth.agent.tokenFile`, a Docker
+target `agentToken`, `agentTokenEnv`, or `agentTokenFile`. The agent sends the
+token in the `X-Agent-Token` header.
 
 The Docker target name and agent target must match. In the example, the server
 declares `runtime.docker[0].name: compose-docker-agent`, and the agent uses
@@ -81,26 +85,18 @@ declares `runtime.docker[0].name: compose-docker-agent`, and the agent uses
 Minimal agent config:
 
 ```yaml
-auth:
-  mode: dev-no-auth
-monitoring:
-  defaultInterval: 30s
-repositories: []
-runtime:
-  docker: []
-  kubernetes: []
 agent:
   serverUrl: ws://dashboard:8080/api/agents/connect
   target: compose-docker-agent
-  token: replace-me-with-a-long-random-agent-token
+  tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
   interval: 30s
   docker:
     host: unix:///var/run/docker.sock
 ```
 
-The `auth`, `monitoring`, `repositories`, and `runtime` sections are included
-because the same configuration loader is used for server and agent mode. Agent
-mode uses the `agent` section at runtime.
+Agent mode validates only the `agent` section, so server-only `auth`,
+`repositories`, `runtime`, and `monitoring` sections are not required in
+`agent.yaml`.
 
 Current agent limitation: the server accepts and stores agent reports, but
 `kind: agent` Docker targets do not yet feed per-service health or uptime rows.
@@ -129,6 +125,41 @@ process health even when basic auth protects the dashboard and API.
 
 Configuration is file based for v1. The UI may show effective configuration
 state, but it must not edit configuration.
+
+Mounted Git-managed config files can reference secrets without an entrypoint
+render step. Use literal fields for non-secret values and one of the matching
+`*Env` or `*File` fields for values supplied by the environment or mounted
+secret files:
+
+```yaml
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHashEnv: GITOPS_DASHBOARD_ADMIN_HASH
+  agent:
+    tokenFile: /run/secrets/gitops-dashboard-agent-token
+runtime:
+  docker:
+    - name: compose-docker-agent
+      kind: agent
+      agentTokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
+agent:
+  serverUrl: ws://dashboard:8080/api/agents/connect
+  target: compose-docker-agent
+  tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
+```
+
+Supported secret source fields:
+
+- `auth.users[].passwordHash`, `passwordHashEnv`, or `passwordHashFile`
+- `auth.agent.tokens[]`, `tokenEnv`, or `tokenFile`
+- `runtime.docker[].agentToken`, `agentTokenEnv`, or `agentTokenFile`
+- `agent.token`, `tokenEnv`, or `tokenFile`
+
+The loader also expands `${ENV_NAME}` placeholders before YAML parsing for
+simple mounted-config deployments, but the `*Env` and `*File` fields are safer
+for values that may contain YAML-sensitive characters or newlines.
 
 Runtime monitoring starts automatically for configured HTTP route, Docker,
 Kubernetes, and ping targets. The default cadence is
