@@ -64,8 +64,26 @@ Use:
   shape, backed by `examples/compose-config/config.yaml` and
   `examples/compose-config/agent.yaml`.
 
-Repository credentials should be mounted through files or environment variables.
-Secret values from repositories and manifests are not rendered back in the UI.
+Repository credentials and runtime/auth secrets can be sourced through mounted
+files or environment variables. Secret values from repositories and manifests
+are not rendered back in the UI.
+
+```yaml
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHashEnv: GITOPS_DASHBOARD_ADMIN_HASH
+  agent:
+    tokenFile: /run/secrets/gitops-dashboard-agent-token
+runtime:
+  docker:
+    - name: compose-docker-agent
+      kind: agent
+      agentTokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
+agent:
+  tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
+```
 
 Repositories can optionally narrow scanning with path filters. Plain entries
 match that file or directory subtree; glob entries support `*` and recursive
@@ -103,6 +121,7 @@ Docker socket and reports outbound to the dashboard:
 
 ```sh
 docker build -t gitops-dashboard:latest .
+export GITOPS_DASHBOARD_AGENT_TOKEN="$(openssl rand -hex 32)"
 docker compose -f examples/docker-compose.yaml up -d
 docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
@@ -112,8 +131,9 @@ Registry as `ghcr.io/spi3/gitops-dashboard:latest` and a short SHA tag.
 
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `X-Agent-Token` value. The server must accept the same token through
-`auth.agent.tokens` or a Docker target `agentToken`. Expected mounts, token
-configuration, and the full agent config shape are documented in
+`auth.agent.tokens`, `auth.agent.tokenEnv`, `auth.agent.tokenFile`, a Docker
+target `agentToken`, `agentTokenEnv`, or `agentTokenFile`. Expected mounts,
+token configuration, and the full agent config shape are documented in
 [docs/deployment.md](docs/deployment.md).
 
 Current limitation: agent reports are accepted and stored, but `kind: agent`

@@ -4,10 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+var configEnvPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 type Config struct {
 	Server       ServerConfig       `yaml:"server"`
@@ -17,6 +22,11 @@ type Config struct {
 	Monitoring   MonitoringConfig   `yaml:"monitoring"`
 	Agent        AgentConfig        `yaml:"agent"`
 }
+
+const (
+	ModeServer = "server"
+	ModeAgent  = "agent"
+)
 
 type ServerConfig struct {
 	Listen       string `yaml:"listen"`
@@ -31,12 +41,16 @@ type AuthConfig struct {
 }
 
 type AuthUser struct {
-	Username     string `yaml:"username"`
-	PasswordHash string `yaml:"passwordHash"`
+	Username         string `yaml:"username"`
+	PasswordHash     string `yaml:"passwordHash"`
+	PasswordHashFile string `yaml:"passwordHashFile"`
+	PasswordHashEnv  string `yaml:"passwordHashEnv"`
 }
 
 type AgentAuthCfg struct {
-	Tokens []string `yaml:"tokens"`
+	Tokens    []string `yaml:"tokens"`
+	TokenFile string   `yaml:"tokenFile"`
+	TokenEnv  string   `yaml:"tokenEnv"`
 }
 
 type RepositoryConfig struct {
@@ -61,11 +75,13 @@ type RuntimeConfig struct {
 }
 
 type DockerTarget struct {
-	Name       string `yaml:"name"`
-	Kind       string `yaml:"kind"`
-	Host       string `yaml:"host"`
-	AgentToken string `yaml:"agentToken"`
-	Interval   string `yaml:"interval"`
+	Name           string `yaml:"name"`
+	Kind           string `yaml:"kind"`
+	Host           string `yaml:"host"`
+	AgentToken     string `yaml:"agentToken"`
+	AgentTokenFile string `yaml:"agentTokenFile"`
+	AgentTokenEnv  string `yaml:"agentTokenEnv"`
+	Interval       string `yaml:"interval"`
 }
 
 type KubernetesTarget struct {
@@ -98,27 +114,75 @@ type AgentConfig struct {
 	ServerURL string       `yaml:"serverUrl"`
 	Target    string       `yaml:"target"`
 	Token     string       `yaml:"token"`
+	TokenFile string       `yaml:"tokenFile"`
+	TokenEnv  string       `yaml:"tokenEnv"`
 	Interval  string       `yaml:"interval"`
 	Docker    DockerTarget `yaml:"docker"`
 }
 
 func Load(path string) (Config, error) {
+	return LoadForMode(path, ModeServer)
+}
+
+func LoadForMode(path, mode string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+	data, err = expandConfigEnv(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand config %s: %w", path, err)
 	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	cfg.applyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return Config{}, err
+	switch mode {
+	case ModeServer:
+		cfg.applyServerDefaults()
+		if err := cfg.resolveServerSecrets(); err != nil {
+			return Config{}, err
+		}
+		if err := cfg.Validate(); err != nil {
+			return Config{}, err
+		}
+	case ModeAgent:
+		if err := cfg.resolveAgentSecrets(); err != nil {
+			return Config{}, err
+		}
+		if err := cfg.ValidateAgent(); err != nil {
+			return Config{}, err
+		}
+	default:
+		return Config{}, fmt.Errorf("mode must be server or agent")
 	}
 	return cfg, nil
 }
 
-func (cfg *Config) applyDefaults() {
+func expandConfigEnv(data []byte) ([]byte, error) {
+	missing := map[string]struct{}{}
+	expanded := configEnvPattern.ReplaceAllStringFunc(string(data), func(match string) string {
+		parts := configEnvPattern.FindStringSubmatch(match)
+		name := parts[1]
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			missing[name] = struct{}{}
+			return match
+		}
+		return value
+	})
+	if len(missing) > 0 {
+		names := make([]string, 0, len(missing))
+		for name := range missing {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("unset env vars: %s", strings.Join(names, ", "))
+	}
+	return []byte(expanded), nil
+}
+
+func (cfg *Config) applyServerDefaults() {
 	if cfg.Server.Listen == "" {
 		cfg.Server.Listen = ":8080"
 	}
@@ -139,6 +203,116 @@ func (cfg *Config) applyDefaults() {
 			cfg.Repositories[i].DefaultRef = "HEAD"
 		}
 	}
+}
+
+func (cfg *Config) resolveServerSecrets() error {
+	for i := range cfg.Auth.Users {
+		passwordHash, err := resolveSecret(
+			cfg.Auth.Users[i].PasswordHash,
+			cfg.Auth.Users[i].PasswordHashEnv,
+			cfg.Auth.Users[i].PasswordHashFile,
+			fmt.Sprintf("auth.users[%d].passwordHash", i),
+			fmt.Sprintf("auth.users[%d].passwordHashEnv", i),
+			fmt.Sprintf("auth.users[%d].passwordHashFile", i),
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Auth.Users[i].PasswordHash = passwordHash
+	}
+
+	tokens := make([]string, 0, len(cfg.Auth.Agent.Tokens)+2)
+	tokens = append(tokens, cfg.Auth.Agent.Tokens...)
+	if cfg.Auth.Agent.TokenEnv != "" {
+		token, err := resolveEnvSecret("auth.agent.tokenEnv", cfg.Auth.Agent.TokenEnv)
+		if err != nil {
+			return err
+		}
+		tokens = append(tokens, token)
+	}
+	if cfg.Auth.Agent.TokenFile != "" {
+		token, err := resolveFileSecret("auth.agent.tokenFile", cfg.Auth.Agent.TokenFile)
+		if err != nil {
+			return err
+		}
+		tokens = append(tokens, token)
+	}
+	cfg.Auth.Agent.Tokens = tokens
+
+	for i := range cfg.Runtime.Docker {
+		token, err := resolveSecret(
+			cfg.Runtime.Docker[i].AgentToken,
+			cfg.Runtime.Docker[i].AgentTokenEnv,
+			cfg.Runtime.Docker[i].AgentTokenFile,
+			fmt.Sprintf("runtime.docker[%d].agentToken", i),
+			fmt.Sprintf("runtime.docker[%d].agentTokenEnv", i),
+			fmt.Sprintf("runtime.docker[%d].agentTokenFile", i),
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Runtime.Docker[i].AgentToken = token
+	}
+	return nil
+}
+
+func (cfg *Config) resolveAgentSecrets() error {
+	token, err := resolveSecret(
+		cfg.Agent.Token,
+		cfg.Agent.TokenEnv,
+		cfg.Agent.TokenFile,
+		"agent.token",
+		"agent.tokenEnv",
+		"agent.tokenFile",
+	)
+	if err != nil {
+		return err
+	}
+	cfg.Agent.Token = token
+	return nil
+}
+
+func resolveSecret(value, envName, filePath, valueField, envField, fileField string) (string, error) {
+	sourceCount := 0
+	if value != "" {
+		sourceCount++
+	}
+	if envName != "" {
+		sourceCount++
+	}
+	if filePath != "" {
+		sourceCount++
+	}
+	if sourceCount > 1 {
+		return "", fmt.Errorf("%s must use only one of %s, %s, or %s", valueField, valueField, envField, fileField)
+	}
+	if envName != "" {
+		return resolveEnvSecret(envField, envName)
+	}
+	if filePath != "" {
+		return resolveFileSecret(fileField, filePath)
+	}
+	return value, nil
+}
+
+func resolveEnvSecret(field, envName string) (string, error) {
+	value, ok := os.LookupEnv(envName)
+	if !ok || value == "" {
+		return "", fmt.Errorf("%s references unset env %s", field, envName)
+	}
+	return value, nil
+}
+
+func resolveFileSecret(field, filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("read %s %s: %w", field, filePath, err)
+	}
+	value := string(bytesTrimSpace(data))
+	if value == "" {
+		return "", fmt.Errorf("%s %s is empty", field, filePath)
+	}
+	return value, nil
 }
 
 func (cfg Config) Validate() error {
@@ -195,6 +369,22 @@ func (cfg Config) Validate() error {
 		if _, err := target.TimeoutDuration(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (cfg Config) ValidateAgent() error {
+	if cfg.Agent.ServerURL == "" {
+		return fmt.Errorf("agent.serverUrl is required")
+	}
+	if cfg.Agent.Target == "" {
+		return fmt.Errorf("agent.target is required")
+	}
+	if cfg.Agent.Token == "" {
+		return fmt.Errorf("agent.token, agent.tokenEnv, or agent.tokenFile is required")
+	}
+	if _, err := cfg.Agent.IntervalDuration(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -277,6 +467,10 @@ func (target PingTarget) IntervalDuration() (time.Duration, error) {
 
 func (target PingTarget) TimeoutDuration() (time.Duration, error) {
 	return optionalPositiveDuration(target.Timeout, "runtime.ping.timeout")
+}
+
+func (cfg AgentConfig) IntervalDuration() (time.Duration, error) {
+	return optionalPositiveDuration(cfg.Interval, "agent.interval")
 }
 
 func (cfg RepositoryConfig) ScanDuration() (time.Duration, error) {

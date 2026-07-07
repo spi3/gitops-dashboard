@@ -24,7 +24,12 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	cfg, err := config.Load(*configPath)
+	if *mode != config.ModeServer && *mode != config.ModeAgent {
+		logger.Error("unknown mode", "mode", *mode)
+		os.Exit(2)
+	}
+
+	cfg, err := config.LoadForMode(*configPath, *mode)
 	if err != nil {
 		logger.Error("configuration failed", "error", err)
 		os.Exit(1)
@@ -34,19 +39,16 @@ func main() {
 	defer stop()
 
 	switch *mode {
-	case "server":
+	case config.ModeServer:
 		if err := runServer(ctx, cfg, logger); err != nil {
 			logger.Error("server failed", "error", err)
 			os.Exit(1)
 		}
-	case "agent":
+	case config.ModeAgent:
 		if err := agent.Run(ctx, cfg, logger); err != nil {
 			logger.Error("agent failed", "error", err)
 			os.Exit(1)
 		}
-	default:
-		logger.Error("unknown mode", "mode", *mode)
-		os.Exit(2)
 	}
 }
 
