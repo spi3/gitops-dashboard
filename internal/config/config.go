@@ -40,15 +40,17 @@ type AgentAuthCfg struct {
 }
 
 type RepositoryConfig struct {
-	Name         string `yaml:"name"`
-	URL          string `yaml:"url"`
-	DefaultRef   string `yaml:"defaultRef"`
-	Type         string `yaml:"type"`
-	TokenFile    string `yaml:"tokenFile"`
-	TokenEnv     string `yaml:"tokenEnv"`
-	SSHKeyPath   string `yaml:"sshKeyPath"`
-	KnownHosts   string `yaml:"knownHosts"`
-	ScanInterval string `yaml:"scanInterval"`
+	Name         string   `yaml:"name"`
+	URL          string   `yaml:"url"`
+	DefaultRef   string   `yaml:"defaultRef"`
+	Type         string   `yaml:"type"`
+	TokenFile    string   `yaml:"tokenFile"`
+	TokenEnv     string   `yaml:"tokenEnv"`
+	SSHKeyPath   string   `yaml:"sshKeyPath"`
+	KnownHosts   string   `yaml:"knownHosts"`
+	ScanInterval string   `yaml:"scanInterval"`
+	IncludePaths []string `yaml:"includePaths"`
+	ExcludePaths []string `yaml:"excludePaths"`
 }
 
 type RuntimeConfig struct {

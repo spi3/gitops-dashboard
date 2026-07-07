@@ -112,6 +112,93 @@ func TestScanAllUsesRelativeRepoCacheFromWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestScanAllHonorsRepositoryPathFilters(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	writeFile(t, filepath.Join(source, "dev", "compose.yaml"), `
+services:
+  dev:
+    image: example/dev:v1
+`)
+	writeFile(t, filepath.Join(source, "prod", "ignored", "compose.yaml"), `
+services:
+  ignored:
+    image: example/ignored:v1
+`)
+	runGit(t, source, "add", ".")
+	runGit(t, source, "commit", "-m", "add filtered services")
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:         "fixture",
+			URL:          "file://" + source,
+			DefaultRef:   "main",
+			IncludePaths: []string{"prod"},
+			ExcludePaths: []string{"prod/ignored", "prod/dynamic.yaml"},
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesByName := map[string][]string{}
+	for _, service := range summary.Services {
+		servicesByName[service.Name] = service.Exposure
+	}
+	if _, ok := servicesByName["dev"]; ok {
+		t.Fatalf("dev service was scanned despite includePaths: %#v", servicesByName)
+	}
+	if _, ok := servicesByName["ignored"]; ok {
+		t.Fatalf("ignored service was scanned despite excludePaths: %#v", servicesByName)
+	}
+	if !contains(servicesByName["web"], "https://web.example.test") {
+		t.Fatalf("web exposure = %v, want included compose route", servicesByName["web"])
+	}
+	if contains(servicesByName["api"], "https://api-alt.example.test") {
+		t.Fatalf("api exposure = %v, excluded traefik file still contributed route", servicesByName["api"])
+	}
+}
+
+func TestRepositoryPathFilters(t *testing.T) {
+	t.Parallel()
+	repo := config.RepositoryConfig{
+		IncludePaths: []string{"docker_files/serenity", "clusters/main/**/*.yaml"},
+		ExcludePaths: []string{"docker_files/serenity/retired", "**/gotk-components.yaml"},
+	}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{path: "docker_files/serenity/gt/docker-compose.yml", want: true},
+		{path: "docker_files/hd3-docker/gt/docker-compose.yml", want: false},
+		{path: "docker_files/serenity/retired/app/docker-compose.yml", want: false},
+		{path: "clusters/main/default/app.yaml", want: true},
+		{path: "clusters/main/flux-system/gotk-components.yaml", want: false},
+	}
+	for _, tc := range cases {
+		if got := shouldScanRepoPath(repo, tc.path); got != tc.want {
+			t.Fatalf("shouldScanRepoPath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestCloneURLInjectsTokenWithoutMutatingConfig(t *testing.T) {
 	t.Setenv("GITOPS_TEST_TOKEN", "secret-token")
 	cfg := config.Config{}

@@ -36,6 +36,8 @@ The dashboard must support:
 - Generic Git repositories must support SSH-key authentication.
 - Repository configuration must include a stable display name, URL, default
   branch or ref, authentication method, and scan settings.
+- Repository configuration may include scan `includePaths` and `excludePaths`
+  so large repositories can limit which directories or files are parsed.
 - Repository credentials must never be displayed back to the user after entry.
 - Repository configuration must be file based for v1.
 - The dashboard must not mutate repository configuration through the UI in v1.
@@ -130,6 +132,8 @@ The dashboard must support:
 - Runtime target configuration must be separate from repository configuration.
 - Users must be able to associate repositories, paths, environments, or services
   with runtime targets.
+- Users must be able to include or exclude repository paths from inventory
+  scans without changing repository contents.
 - Failed runtime checks must not block repository scanning.
 - Runtime target configuration must be file based for v1.
 

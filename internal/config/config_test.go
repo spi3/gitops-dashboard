@@ -15,6 +15,10 @@ auth:
 repositories:
   - name: repo
     url: https://example.invalid/repo.git
+    includePaths:
+      - clusters/main
+    excludePaths:
+      - clusters/retired
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -27,6 +31,12 @@ repositories:
 	}
 	if cfg.Repositories[0].DefaultRef != "HEAD" {
 		t.Fatalf("default ref = %q", cfg.Repositories[0].DefaultRef)
+	}
+	if len(cfg.Repositories[0].IncludePaths) != 1 || cfg.Repositories[0].IncludePaths[0] != "clusters/main" {
+		t.Fatalf("includePaths = %#v", cfg.Repositories[0].IncludePaths)
+	}
+	if len(cfg.Repositories[0].ExcludePaths) != 1 || cfg.Repositories[0].ExcludePaths[0] != "clusters/retired" {
+		t.Fatalf("excludePaths = %#v", cfg.Repositories[0].ExcludePaths)
 	}
 }
 

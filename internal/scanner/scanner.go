@@ -106,7 +106,7 @@ func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig
 		if err != nil {
 			return err
 		}
-		services, err = scanner.parseRepo(path, repo.Name, strings.TrimSpace(commit))
+		services, err = scanner.parseRepo(path, repo, strings.TrimSpace(commit))
 		return err
 	}()
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -182,7 +182,7 @@ func (scanner Scanner) cloneURL(repo config.RepositoryConfig) (string, error) {
 	return parsed.String(), nil
 }
 
-func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Service, error) {
+func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, commit string) ([]core.Service, error) {
 	var services []core.Service
 	var kubeResources []parser.KubernetesResource
 	var traefikRoutes []parser.TraefikRoute
@@ -196,10 +196,17 @@ func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Serv
 			if entry.Name() == ".git" {
 				return filepath.SkipDir
 			}
+			rel, err := filepath.Rel(repoPath, path)
+			if err == nil && shouldSkipRepoDir(repo, rel) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		rel, err := filepath.Rel(repoPath, path)
 		if err != nil {
+			return nil
+		}
+		if !shouldScanRepoPath(repo, rel) {
 			return nil
 		}
 		switch {
@@ -209,7 +216,7 @@ func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Serv
 				parseErrors = append(parseErrors, fmt.Sprintf("%s: %v", rel, err))
 				return nil
 			}
-			services = append(services, scanner.composeServices(repoName, commit, rel, parsed)...)
+			services = append(services, scanner.composeServices(repo.Name, commit, rel, parsed)...)
 		case parser.IsYAMLFile(rel):
 			parsed, err := parser.ParseKubernetes(path)
 			if err != nil {
@@ -236,7 +243,7 @@ func (scanner Scanner) parseRepo(repoPath, repoName, commit string) ([]core.Serv
 		sort.Strings(parseErrors)
 		return services, fmt.Errorf("parse errors: %s", strings.Join(parseErrors, "; "))
 	}
-	services = append(services, scanner.kubeServices(repoName, commit, enrichKubernetesExposure(kubeResources))...)
+	services = append(services, scanner.kubeServices(repo.Name, commit, enrichKubernetesExposure(kubeResources))...)
 	services = applyTraefikRoutes(services, traefikRoutes)
 	return services, nil
 }

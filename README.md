@@ -65,6 +65,22 @@ Use:
 Repository credentials should be mounted through files or environment variables.
 Secret values from repositories and manifests are not rendered back in the UI.
 
+Repositories can optionally narrow scanning with path filters. Plain entries
+match that file or directory subtree; glob entries support `*` and recursive
+`**` matching:
+
+```yaml
+repositories:
+  - name: kube
+    url: https://github.com/spi3/kube
+    includePaths:
+      - docker_files/serenity
+      - clusters/main
+    excludePaths:
+      - clusters/retired
+      - "**/gotk-components.yaml"
+```
+
 ## Container Modes
 
 Server mode is the default:

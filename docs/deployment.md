@@ -115,6 +115,10 @@ Repository scans are available on demand through the dashboard/API. A repository
 can also opt into scheduled scans by setting `scanInterval` in its file-based
 configuration.
 
+Repository scans can be narrowed with `includePaths` and `excludePaths` under a
+repository entry. Plain paths match that file or directory subtree, and glob
+paths support `*` plus recursive `**` patterns.
+
 Use `examples/config.dev.yaml` for a no-auth local development server.
 Use `examples/config.basic.yaml` for a basic-auth local server example.
 Use `examples/docker-compose.yaml` for server and remote-agent deployment
