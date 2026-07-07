@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,6 +108,89 @@ runtime:
 	}
 	if cfg.Runtime.Ping[0].EffectiveName() != "homelab" {
 		t.Fatalf("effective name = %q, want homelab", cfg.Runtime.Ping[0].EffectiveName())
+	}
+}
+
+func TestLoadConfigExpandsEnvVars(t *testing.T) {
+	t.Setenv("GITOPS_DASHBOARD_AGENT_TOKEN", "shared-agent-token")
+	t.Setenv("GITOPS_DASHBOARD_ADMIN_HASH", "$2a$10$env-provided-hash")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHash: "${GITOPS_DASHBOARD_ADMIN_HASH}"
+  agent:
+    tokens:
+      - "${GITOPS_DASHBOARD_AGENT_TOKEN}"
+runtime:
+  docker:
+    - name: host
+      kind: agent
+      agentToken: "${GITOPS_DASHBOARD_AGENT_TOKEN}"
+agent:
+  serverUrl: ws://dashboard.invalid/api/agents/connect
+  target: host
+  token: "${GITOPS_DASHBOARD_AGENT_TOKEN}"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.Users[0].PasswordHash != "$2a$10$env-provided-hash" {
+		t.Fatalf("passwordHash = %q", cfg.Auth.Users[0].PasswordHash)
+	}
+	if cfg.Auth.Agent.Tokens[0] != "shared-agent-token" {
+		t.Fatalf("auth agent token = %q", cfg.Auth.Agent.Tokens[0])
+	}
+	if cfg.Runtime.Docker[0].AgentToken != "shared-agent-token" {
+		t.Fatalf("runtime docker agent token = %q", cfg.Runtime.Docker[0].AgentToken)
+	}
+	if cfg.Agent.Token != "shared-agent-token" {
+		t.Fatalf("agent token = %q", cfg.Agent.Token)
+	}
+}
+
+func TestLoadConfigRejectsUnsetEnvVars(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHash: "${MISSING_GITOPS_DASHBOARD_HASH}"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with an unset env var")
+	}
+	if !strings.Contains(err.Error(), "MISSING_GITOPS_DASHBOARD_HASH") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadConfigLeavesLiteralDollarValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: basic
+  users:
+    - username: admin
+      passwordHash: "$2a$10$literal-hash"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.Users[0].PasswordHash != "$2a$10$literal-hash" {
+		t.Fatalf("passwordHash = %q", cfg.Auth.Users[0].PasswordHash)
 	}
 }
 

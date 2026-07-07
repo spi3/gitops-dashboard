@@ -4,10 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+var configEnvPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 type Config struct {
 	Server       ServerConfig       `yaml:"server"`
@@ -107,6 +112,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	}
+	data, err = expandConfigEnv(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand config %s: %w", path, err)
+	}
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
@@ -116,6 +125,29 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func expandConfigEnv(data []byte) ([]byte, error) {
+	missing := map[string]struct{}{}
+	expanded := configEnvPattern.ReplaceAllStringFunc(string(data), func(match string) string {
+		parts := configEnvPattern.FindStringSubmatch(match)
+		name := parts[1]
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			missing[name] = struct{}{}
+			return match
+		}
+		return value
+	})
+	if len(missing) > 0 {
+		names := make([]string, 0, len(missing))
+		for name := range missing {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("unset env vars: %s", strings.Join(names, ", "))
+	}
+	return []byte(expanded), nil
 }
 
 func (cfg *Config) applyDefaults() {
