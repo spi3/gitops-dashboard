@@ -1,6 +1,6 @@
-# Docker Monitor
+# GitOps Dashboard
 
-Docker Monitor is a read-only GitOps-inspired dashboard for homelab and
+GitOps Dashboard is a read-only dashboard for homelab and
 self-hosted repositories. It scans configured Git repositories, discovers Docker
 Compose and generic Kubernetes manifests, builds a normalized service inventory,
 and displays live health/status when HTTP route, Docker, or Kubernetes
@@ -19,7 +19,8 @@ monitoring targets are configured.
 - HTTP route checks for discovered service URLs.
 - Read-only Docker monitoring through local/remote Docker Engine HTTP API
   targets.
-- Remote Docker monitoring agent mode over WebSocket.
+- Remote Docker agent mode over WebSocket for collecting and storing Docker
+  reports.
 - Read-only Kubernetes monitoring with mounted kubeconfig files.
 - React dashboard with at-a-glance status, per-service uptime history from the
   monitors, clickable routes and DNS names discovered in Git, and a detail
@@ -58,7 +59,7 @@ Use:
 
 - `examples/config.dev.yaml` for local no-auth development.
 - `examples/config.basic.yaml` for basic-auth local testing.
-- `examples/docker-compose.yaml` for the server and remote-agent deployment
+- `examples/docker-compose.yaml` for the server and Docker agent deployment
   shape, backed by `examples/compose-config/config.yaml` and
   `examples/compose-config/agent.yaml`.
 
@@ -81,7 +82,7 @@ repositories:
       - "**/gotk-components.yaml"
 ```
 
-## Container Modes
+## Container Modes And Compose
 
 Server mode is the default:
 
@@ -89,17 +90,20 @@ Server mode is the default:
 gitops-dashboard -config /config/config.yaml
 ```
 
-Agent mode runs the remote Docker monitor:
+Agent mode runs the Docker reporter:
 
 ```sh
 gitops-dashboard -mode agent -config /config/agent.yaml
 ```
 
-In Compose, the same image can run both modes:
+In Docker Compose, the same image can run both modes. The dashboard container
+serves the UI/API and owns `/data`; the Docker agent container mounts the host
+Docker socket and reports outbound to the dashboard:
 
 ```sh
 docker build -t gitops-dashboard:latest .
-docker compose -f examples/docker-compose.yaml up
+docker compose -f examples/docker-compose.yaml up -d
+docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
 
 Pushes to `main` run tests and publish the container image to GitHub Container
@@ -110,6 +114,21 @@ The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `auth.agent.tokens` or a Docker target `agentToken`. Expected mounts, token
 configuration, and the full agent config shape are documented in
 [docs/deployment.md](docs/deployment.md).
+
+Current limitation: agent reports are accepted and stored, but `kind: agent`
+Docker targets do not yet feed per-service health or uptime rows. Today,
+dashboard health rows come from direct Docker Engine targets, HTTP route checks,
+and Kubernetes targets.
+
+To get per-service Docker health rows today, configure a direct Docker target on
+the dashboard server:
+
+```yaml
+runtime:
+  docker:
+    - name: local-docker
+      host: unix:///var/run/docker.sock
+```
 
 ## Development
 

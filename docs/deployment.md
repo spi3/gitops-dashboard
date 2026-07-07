@@ -5,8 +5,8 @@
 The project ships as one container image with two modes:
 
 - `server`: runs the dashboard server, API, scanner, storage, and frontend.
-- `agent`: runs a remote Docker monitoring agent that connects outbound to the
-  dashboard server over WebSocket.
+- `agent`: runs a Docker reporter that reads one Docker Engine and connects
+  outbound to the dashboard server over WebSocket.
 
 Server mode is the default.
 
@@ -21,8 +21,9 @@ gitops-dashboard -mode agent -config /config/agent.yaml
 ```
 
 In Docker Compose, run the same image twice: once as the dashboard server and
-once as the Docker agent. The agent does not expose a port. It opens an outbound
-WebSocket connection to the dashboard server at `/api/agents/connect`.
+once as the Docker agent. The dashboard exposes the UI/API and persists `/data`.
+The agent does not expose a port; it opens an outbound WebSocket connection to
+the dashboard server at `/api/agents/connect`.
 
 ## Required Server Mounts
 
@@ -47,7 +48,9 @@ proxy instead of mounting the socket directly.
 
 ```sh
 docker build -t gitops-dashboard:latest .
-docker compose -f examples/docker-compose.yaml up
+docker compose -f examples/docker-compose.yaml up -d
+docker compose -f examples/docker-compose.yaml ps
+docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
 
 Pushes to `main` run the GitHub Actions workflow in `.github/workflows/ci.yml`.
@@ -69,6 +72,10 @@ token.
 The dashboard accepts agent connections when the token matches either
 `auth.agent.tokens` or a Docker target `agentToken`. The agent sends the token in
 the `X-Agent-Token` header.
+
+The Docker target name and agent target must match. In the example, the server
+declares `runtime.docker[0].name: compose-docker-agent`, and the agent uses
+`agent.target: compose-docker-agent`.
 
 Minimal agent config:
 
@@ -93,6 +100,21 @@ agent:
 The `auth`, `monitoring`, `repositories`, and `runtime` sections are included
 because the same configuration loader is used for server and agent mode. Agent
 mode uses the `agent` section at runtime.
+
+Current agent limitation: the server accepts and stores agent reports, but
+`kind: agent` Docker targets do not yet feed per-service health or uptime rows.
+Per-service dashboard health is currently produced by direct Docker Engine
+targets, HTTP route checks, and Kubernetes targets.
+
+For per-service Docker health today, run the dashboard with a direct Docker
+target and mount or expose a Docker Engine API to the server:
+
+```yaml
+runtime:
+  docker:
+    - name: local-docker
+      host: unix:///var/run/docker.sock
+```
 
 ## Health Endpoints
 
