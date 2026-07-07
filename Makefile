@@ -17,12 +17,12 @@ format:
 	gofmt -w cmd internal
 	npm run format
 
-lint: ui-lint
+lint: ui-build ui-lint
 	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go vet ./cmd/... ./internal/...
 
 test: go-test ui-test
 
-go-test:
+go-test: ui-build
 	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go test ./cmd/... ./internal/...
 
 ui-build:
