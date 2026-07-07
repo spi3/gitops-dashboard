@@ -19,8 +19,8 @@ monitoring targets or host ping inventories are configured.
 - HTTP route checks for discovered service URLs.
 - Read-only Docker monitoring through local/remote Docker Engine HTTP API
   targets.
-- Remote Docker agent mode over WebSocket for collecting and storing Docker
-  reports.
+- Remote Docker agent mode over WebSocket for collecting Docker reports and
+  showing agent connection/container state.
 - Read-only Kubernetes monitoring with mounted kubeconfig files.
 - Host ping monitoring from configured Ansible `hosts.yml` inventories.
 - React dashboard with at-a-glance status, per-service uptime history from the
@@ -138,10 +138,11 @@ target `agentToken`, `agentTokenEnv`, or `agentTokenFile`. Expected mounts,
 token configuration, and the full agent config shape are documented in
 [docs/deployment.md](docs/deployment.md).
 
-Current limitation: agent reports are accepted and stored, but `kind: agent`
-Docker targets do not yet feed per-service health or uptime rows. Today,
-dashboard health rows come from direct Docker Engine targets, HTTP route checks,
-Kubernetes targets, and host ping targets.
+Agent reports appear on the dashboard's Agents tab with connection state and
+reported container state. Current limitation: `kind: agent` Docker targets do
+not yet feed per-service health or uptime rows. Today, dashboard health rows
+come from direct Docker Engine targets, HTTP route checks, Kubernetes targets,
+and host ping targets.
 
 To get per-service Docker health rows today, configure a direct Docker target on
 the dashboard server:

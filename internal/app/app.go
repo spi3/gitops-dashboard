@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/example/gitops-dashboard/internal/auth"
@@ -94,7 +95,50 @@ func (app *App) summary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	agents, err := app.store.Agents(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	summary.Agents = mergeAgents(agents, app.cfg.Runtime.Docker)
 	writeJSON(w, summary)
+}
+
+// mergeAgents combines reported agents with configured agent targets: reported
+// agents are marked Configured if their target matches a configured entry, and
+// configured targets that have never reported are appended with an empty
+// LastSeenAt/Containers. The result is sorted by target and always non-nil.
+func mergeAgents(reported []core.AgentInfo, docker []config.DockerTarget) []core.AgentInfo {
+	configuredTargets := map[string]struct{}{}
+	for _, target := range docker {
+		if target.Kind != "agent" {
+			continue
+		}
+		configuredTargets[target.Name] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	merged := make([]core.AgentInfo, 0, len(reported)+len(configuredTargets))
+	for _, agent := range reported {
+		_, agent.Configured = configuredTargets[agent.Target]
+		if agent.Containers == nil {
+			agent.Containers = []core.ContainerStatus{}
+		}
+		merged = append(merged, agent)
+		seen[agent.Target] = struct{}{}
+	}
+	for target := range configuredTargets {
+		if _, ok := seen[target]; ok {
+			continue
+		}
+		merged = append(merged, core.AgentInfo{
+			Target:     target,
+			LastSeenAt: "",
+			Configured: true,
+			Containers: []core.ContainerStatus{},
+		})
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Target < merged[j].Target })
+	return merged
 }
 
 func (app *App) scan(w http.ResponseWriter, r *http.Request) {

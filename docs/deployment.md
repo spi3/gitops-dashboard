@@ -102,10 +102,11 @@ Agent mode validates only the `agent` section, so server-only `auth`,
 `repositories`, `runtime`, and `monitoring` sections are not required in
 `agent.yaml`.
 
-Current agent limitation: the server accepts and stores agent reports, but
-`kind: agent` Docker targets do not yet feed per-service health or uptime rows.
-Per-service dashboard health is currently produced by direct Docker Engine
-targets, HTTP route checks, and Kubernetes targets.
+Agent reports appear on the dashboard's Agents tab with connection state and
+reported container state. Current agent limitation: `kind: agent` Docker targets
+do not yet feed per-service health or uptime rows. Per-service dashboard health
+is currently produced by direct Docker Engine targets, HTTP route checks, and
+Kubernetes targets.
 
 For per-service Docker health today, run the dashboard with a direct Docker
 target and mount or expose a Docker Engine API to the server:

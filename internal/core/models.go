@@ -81,7 +81,15 @@ type DashboardSummary struct {
 	Scans        []Scan         `json:"scans"`
 	Statuses     []StatusResult `json:"statuses"`
 	Uptime       []UptimeStat   `json:"uptime"`
+	Agents       []AgentInfo    `json:"agents"`
 	GeneratedAt  time.Time      `json:"generatedAt"`
+}
+
+type AgentInfo struct {
+	Target     string            `json:"target"`
+	LastSeenAt string            `json:"lastSeenAt"`
+	Configured bool              `json:"configured"`
+	Containers []ContainerStatus `json:"containers"`
 }
 
 type AgentMessage struct {

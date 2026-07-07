@@ -13,6 +13,59 @@ import (
 	"github.com/example/gitops-dashboard/internal/core"
 )
 
+func TestMergeAgentsCombinesReportedAndConfigured(t *testing.T) {
+	t.Parallel()
+	reported := []core.AgentInfo{
+		{Target: "serenity", LastSeenAt: "2026-07-07T16:00:00Z", Containers: []core.ContainerStatus{{Name: "web"}}},
+		{Target: "unmanaged", LastSeenAt: "2026-07-07T16:05:00Z", Containers: []core.ContainerStatus{}},
+	}
+	docker := []config.DockerTarget{
+		{Name: "serenity", Kind: "agent"},
+		{Name: "albert", Kind: "agent"},
+		{Name: "local", Kind: "socket"},
+	}
+	merged := mergeAgents(reported, docker)
+	if len(merged) != 3 {
+		t.Fatalf("merged = %#v, want 3 entries", merged)
+	}
+	byTarget := map[string]core.AgentInfo{}
+	for _, agent := range merged {
+		byTarget[agent.Target] = agent
+	}
+	if !byTarget["serenity"].Configured || byTarget["serenity"].LastSeenAt != "2026-07-07T16:00:00Z" {
+		t.Fatalf("serenity = %#v, want configured with reported lastSeenAt", byTarget["serenity"])
+	}
+	if len(byTarget["serenity"].Containers) != 1 {
+		t.Fatalf("serenity containers = %#v", byTarget["serenity"].Containers)
+	}
+	if byTarget["unmanaged"].Configured {
+		t.Fatalf("unmanaged = %#v, want unconfigured", byTarget["unmanaged"])
+	}
+	albert, ok := byTarget["albert"]
+	if !ok || !albert.Configured || albert.LastSeenAt != "" {
+		t.Fatalf("albert = %#v, want configured-never-reported", albert)
+	}
+	if albert.Containers == nil || len(albert.Containers) != 0 {
+		t.Fatalf("albert containers = %#v, want empty non-nil", albert.Containers)
+	}
+	for i := 1; i < len(merged); i++ {
+		if merged[i-1].Target >= merged[i].Target {
+			t.Fatalf("merged not sorted by target: %#v", merged)
+		}
+	}
+}
+
+func TestMergeAgentsAlwaysNonNil(t *testing.T) {
+	t.Parallel()
+	merged := mergeAgents(nil, nil)
+	if merged == nil {
+		t.Fatal("merged is nil, want empty slice")
+	}
+	if len(merged) != 0 {
+		t.Fatalf("merged = %#v, want empty", merged)
+	}
+}
+
 func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{

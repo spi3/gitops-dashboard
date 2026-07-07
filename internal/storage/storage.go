@@ -567,6 +567,30 @@ ON CONFLICT(target) DO UPDATE SET last_seen_at=excluded.last_seen_at, status_jso
 	return err
 }
 
+func (store *Store) Agents(ctx context.Context) ([]core.AgentInfo, error) {
+	rows, err := store.db.QueryContext(ctx, `
+SELECT target, last_seen_at, status_json FROM agents ORDER BY target
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var agents []core.AgentInfo
+	for rows.Next() {
+		var agent core.AgentInfo
+		var statusJSON string
+		if err := rows.Scan(&agent.Target, &agent.LastSeenAt, &statusJSON); err != nil {
+			return nil, err
+		}
+		fromJSON(statusJSON, &agent.Containers)
+		if agent.Containers == nil {
+			agent.Containers = []core.ContainerStatus{}
+		}
+		agents = append(agents, agent)
+	}
+	return agents, rows.Err()
+}
+
 func toJSON(value any) string {
 	data, err := json.Marshal(value)
 	if err != nil {

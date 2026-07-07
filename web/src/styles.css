@@ -156,6 +156,57 @@ a:focus-visible,
   color: var(--ink);
 }
 
+/* Tab bar */
+
+.tabBar {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  width: fit-content;
+}
+
+.tab {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  color: var(--ink-3);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  gap: 6px;
+  padding: 7px 16px;
+}
+
+.tab:hover {
+  color: var(--ink);
+}
+
+.tab.active {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.tabDot {
+  background: var(--degraded);
+  border-radius: 50%;
+  flex: none;
+  height: 6px;
+  width: 6px;
+}
+
+.tabPanel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 20px;
+}
+
 /* Hero */
 
 .hero {
@@ -762,6 +813,60 @@ main {
   font-family: "JetBrains Mono Variable", ui-monospace, monospace;
   font-size: 12px;
   padding: 4px 10px;
+}
+
+.containerList {
+  display: flex;
+  flex-direction: column;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.containerList li {
+  padding: 10px 0;
+}
+
+.containerList li + li {
+  border-top: 1px solid var(--line-soft);
+}
+
+.containerRow {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.containerName {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.containerName strong {
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.containerImage {
+  color: var(--ink-3);
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.containerRestarts {
+  color: var(--ink-3);
+  font-size: 12px;
+  margin: 4px 0 0;
 }
 
 .provenance {

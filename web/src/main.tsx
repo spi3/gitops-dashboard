@@ -59,12 +59,30 @@ type UptimeStat = {
   samples: UptimeSample[];
 };
 
+type ContainerStatus = {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string;
+  restartCount: number;
+};
+
+type AgentInfo = {
+  target: string;
+  lastSeenAt: string;
+  configured: boolean;
+  containers: ContainerStatus[];
+};
+
 type DashboardSummary = {
   repositories: Repository[];
   services: Service[];
   scans: Scan[];
   statuses: StatusResult[];
   uptime?: UptimeStat[];
+  agents?: AgentInfo[];
   generatedAt: string;
 };
 
@@ -73,6 +91,9 @@ type EnvironmentGroup = {
   services: Service[];
   upCount: number;
 };
+
+type Tab = "services" | "agents";
+type AgentConnection = "connected" | "stale" | "offline" | "never";
 
 const statusWord: Record<Health, string> = {
   healthy: "Up",
@@ -110,6 +131,24 @@ const environmentSortOrder: Record<string, number> = {
   unassigned: 6
 };
 
+const agentConnectionWord: Record<AgentConnection, string> = {
+  connected: "Connected",
+  stale: "Stale",
+  offline: "Offline",
+  never: "Never connected"
+};
+
+const agentConnectionTone: Record<AgentConnection, Health> = {
+  connected: "healthy",
+  stale: "degraded",
+  offline: "unhealthy",
+  never: "unknown"
+};
+
+const agentConnectedThresholdMs = 120_000;
+const agentStaleThresholdMs = 600_000;
+const agentsTabHash = "#/agents";
+
 const tileSlots = 28;
 const drawerSlots = 40;
 const refreshIntervalMs = 30_000;
@@ -123,6 +162,9 @@ function App() {
   const [selectedServiceId, setSelectedServiceId] = useState<string>("");
   const [busyAction, setBusyAction] = useState<string>("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [activeTab, setActiveTab] = useState<Tab>(tabFromHash);
+  const [selectedAgentTarget, setSelectedAgentTarget] = useState<string>("");
+  const isInitialTabSync = useRef(true);
 
   const load = useCallback(async () => {
     try {
@@ -177,8 +219,37 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    document.body.classList.toggle("drawerOpen", selectedServiceId !== "");
-  }, [selectedServiceId]);
+    document.body.classList.toggle("drawerOpen", selectedServiceId !== "" || selectedAgentTarget !== "");
+  }, [selectedAgentTarget, selectedServiceId]);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveTab(tabFromHash());
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    if (isInitialTabSync.current) {
+      isInitialTabSync.current = false;
+      return;
+    }
+    const desiredHash = activeTab === "agents" ? agentsTabHash : "#/";
+    if (window.location.hash !== desiredHash) {
+      window.location.hash = desiredHash;
+    }
+  }, [activeTab]);
+
+  const handleTabBarKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+      return;
+    }
+    event.preventDefault();
+    const nextTab: Tab = activeTab === "services" ? "agents" : "services";
+    setActiveTab(nextTab);
+    window.requestAnimationFrame(() => {
+      document.getElementById(nextTab === "services" ? "tab-services" : "tab-agents")?.focus();
+    });
+  }, [activeTab]);
 
   const services = useMemo(() => summary?.services ?? [], [summary]);
   const uptime = useMemo(() => summary?.uptime ?? [], [summary]);
@@ -192,6 +263,14 @@ function App() {
 
   const overall = useMemo(() => overallStatus(services), [services]);
   const lastChecked = useMemo(() => latestCheckTime(uptime, summary?.statuses ?? []), [summary, uptime]);
+
+  const agents = useMemo(() => summary?.agents ?? [], [summary]);
+  const agentOverall = useMemo(() => overallAgentStatus(agents), [agents]);
+  const latestAgentReport = useMemo(() => latestAgentReportTime(agents), [agents]);
+  const agentsNeedAttention = useMemo(
+    () => agents.some((agent) => agentConnection(agent) !== "connected"),
+    [agents]
+  );
 
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -213,6 +292,7 @@ function App() {
   );
 
   const selectedService = services.find((service) => service.id === selectedServiceId) ?? null;
+  const selectedAgent = agents.find((agent) => agent.target === selectedAgentTarget) ?? null;
   const latestScan = summary?.scans[0] ?? null;
   const repositoryCount = summary?.repositories.length ?? 0;
 
@@ -234,110 +314,170 @@ function App() {
         </button>
       </header>
 
-      <section aria-live="polite" className="hero">
-        <span aria-hidden="true" className={`beacon ${overall.tone}`} />
-        <div>
-          <p className="sentence">{overall.sentence}</p>
-          <p className="heroMeta">
-            {services.length} {plural(services.length, "service")}
-            {" · "}
-            {repositoryCount} {plural(repositoryCount, "repository", "repositories")}
-            {lastChecked ? ` · checked ${relativeTime(lastChecked)}` : ""}
-          </p>
-        </div>
-      </section>
-
-      {error ? (
-        <section className="errorBanner" role="alert">
-          <span>Couldn&apos;t reach the dashboard: {error}</span>
-          <button onClick={() => void load()} type="button">Retry</button>
-        </section>
-      ) : null}
-
-      <div className="toolbar">
-        <label className="searchField">
-          <span className="srOnly">Find a service</span>
-          <input
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Find a service"
-            type="search"
-            value={query}
-          />
-        </label>
+      <div aria-label="Dashboard views" className="tabBar" onKeyDown={handleTabBarKeyDown} role="tablist">
         <button
-          aria-pressed={attentionOnly}
-          className={`filterPill ${attentionOnly ? "on" : ""}`}
-          onClick={() => setAttentionOnly(!attentionOnly)}
+          aria-controls="servicesPanel"
+          aria-selected={activeTab === "services"}
+          className={`tab ${activeTab === "services" ? "active" : ""}`}
+          id="tab-services"
+          onClick={() => setActiveTab("services")}
+          role="tab"
+          tabIndex={activeTab === "services" ? 0 : -1}
           type="button"
         >
-          Needs attention{attentionCount > 0 ? ` (${attentionCount})` : ""}
-        </button>
-        <span className="toolbarGap" />
-        <button
-          className="action"
-          disabled={busyAction !== ""}
-          onClick={() => void trigger("scan")}
-          type="button"
-        >
-          {busyAction === "scan" ? "Syncing…" : "Sync repos"}
+          Services
         </button>
         <button
-          className="action primary"
-          disabled={busyAction !== ""}
-          onClick={() => void trigger("monitor")}
+          aria-controls="agentsPanel"
+          aria-selected={activeTab === "agents"}
+          className={`tab ${activeTab === "agents" ? "active" : ""}`}
+          id="tab-agents"
+          onClick={() => setActiveTab("agents")}
+          role="tab"
+          tabIndex={activeTab === "agents" ? 0 : -1}
           type="button"
         >
-          {busyAction === "monitor" ? "Checking…" : "Check now"}
+          Agents
+          {agentsNeedAttention ? <span aria-hidden="true" className="tabDot" /> : null}
         </button>
       </div>
 
-      <main>
-        {groups.map((group) => (
-          <section className="environment" key={group.environment}>
-            <div className="environmentHead">
-              <h2>{environmentLabel(group.environment)}</h2>
-              <span className="tally">{group.upCount} of {group.services.length} up</span>
-            </div>
-            <div className="tiles">
-              {group.services.map((service) => (
-                <ServiceTile
-                  key={service.id}
-                  onOpen={() => setSelectedServiceId(service.id)}
-                  service={service}
-                  uptime={uptimeByService.get(service.id) ?? []}
-                />
-              ))}
+      {activeTab === "services" ? (
+        <div aria-labelledby="tab-services" className="tabPanel" id="servicesPanel" role="tabpanel">
+          <section aria-live="polite" className="hero">
+            <span aria-hidden="true" className={`beacon ${overall.tone}`} />
+            <div>
+              <p className="sentence">{overall.sentence}</p>
+              <p className="heroMeta">
+                {services.length} {plural(services.length, "service")}
+                {" · "}
+                {repositoryCount} {plural(repositoryCount, "repository", "repositories")}
+                {lastChecked ? ` · checked ${relativeTime(lastChecked)}` : ""}
+              </p>
             </div>
           </section>
-        ))}
-        {services.length === 0 ? (
-          <div className="emptyState">
-            <p className="emptyLead">Nothing here yet</p>
-            <p>Sync repos to discover the services declared in Git.</p>
-          </div>
-        ) : null}
-        {services.length > 0 && filtered.length === 0 ? (
-          <div className="emptyState">
-            <p className="emptyLead">No services match</p>
+
+          {error ? (
+            <section className="errorBanner" role="alert">
+              <span>Couldn&apos;t reach the dashboard: {error}</span>
+              <button onClick={() => void load()} type="button">Retry</button>
+            </section>
+          ) : null}
+
+          <div className="toolbar">
+            <label className="searchField">
+              <span className="srOnly">Find a service</span>
+              <input
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Find a service"
+                type="search"
+                value={query}
+              />
+            </label>
             <button
-              className="action"
-              onClick={() => {
-                setQuery("");
-                setAttentionOnly(false);
-              }}
+              aria-pressed={attentionOnly}
+              className={`filterPill ${attentionOnly ? "on" : ""}`}
+              onClick={() => setAttentionOnly(!attentionOnly)}
               type="button"
             >
-              Clear filters
+              Needs attention{attentionCount > 0 ? ` (${attentionCount})` : ""}
+            </button>
+            <span className="toolbarGap" />
+            <button
+              className="action"
+              disabled={busyAction !== ""}
+              onClick={() => void trigger("scan")}
+              type="button"
+            >
+              {busyAction === "scan" ? "Syncing…" : "Sync repos"}
+            </button>
+            <button
+              className="action primary"
+              disabled={busyAction !== ""}
+              onClick={() => void trigger("monitor")}
+              type="button"
+            >
+              {busyAction === "monitor" ? "Checking…" : "Check now"}
             </button>
           </div>
-        ) : null}
-      </main>
 
-      <footer className="foot">
-        {latestScan
-          ? <span>Discovered from {repositoryCount} {plural(repositoryCount, "repository", "repositories")} · last sync <em className={latestScan.status === "ok" ? "ok" : "bad"}>{latestScan.status === "ok" ? "ok" : "failed"}</em>{latestScan.finishedAt ? ` · ${formatDate(latestScan.finishedAt)}` : ""}</span>
-          : <span>Not synced yet</span>}
-      </footer>
+          <main>
+            {groups.map((group) => (
+              <section className="environment" key={group.environment}>
+                <div className="environmentHead">
+                  <h2>{environmentLabel(group.environment)}</h2>
+                  <span className="tally">{group.upCount} of {group.services.length} up</span>
+                </div>
+                <div className="tiles">
+                  {group.services.map((service) => (
+                    <ServiceTile
+                      key={service.id}
+                      onOpen={() => setSelectedServiceId(service.id)}
+                      service={service}
+                      uptime={uptimeByService.get(service.id) ?? []}
+                    />
+                  ))}
+                </div>
+              </section>
+            ))}
+            {services.length === 0 ? (
+              <div className="emptyState">
+                <p className="emptyLead">Nothing here yet</p>
+                <p>Sync repos to discover the services declared in Git.</p>
+              </div>
+            ) : null}
+            {services.length > 0 && filtered.length === 0 ? (
+              <div className="emptyState">
+                <p className="emptyLead">No services match</p>
+                <button
+                  className="action"
+                  onClick={() => {
+                    setQuery("");
+                    setAttentionOnly(false);
+                  }}
+                  type="button"
+                >
+                  Clear filters
+                </button>
+              </div>
+            ) : null}
+          </main>
+
+          <footer className="foot">
+            {latestScan
+              ? <span>Discovered from {repositoryCount} {plural(repositoryCount, "repository", "repositories")} · last sync <em className={latestScan.status === "ok" ? "ok" : "bad"}>{latestScan.status === "ok" ? "ok" : "failed"}</em>{latestScan.finishedAt ? ` · ${formatDate(latestScan.finishedAt)}` : ""}</span>
+              : <span>Not synced yet</span>}
+          </footer>
+        </div>
+      ) : (
+        <div aria-labelledby="tab-agents" className="tabPanel" id="agentsPanel" role="tabpanel">
+          <section aria-live="polite" className="hero">
+            <span aria-hidden="true" className={`beacon ${agentOverall.tone}`} />
+            <div>
+              <p className="sentence">{agentOverall.sentence}</p>
+              <p className="heroMeta">
+                {agents.length} {plural(agents.length, "agent")}
+                {latestAgentReport ? ` · last report ${relativeTime(latestAgentReport)}` : ""}
+              </p>
+            </div>
+          </section>
+
+          <main>
+            {agents.length === 0 ? (
+              <div className="emptyState">
+                <p className="emptyLead">No agents yet</p>
+                <p>Agents connect once you run this binary with mode: agent pointed at this server.</p>
+              </div>
+            ) : (
+              <div className="tiles">
+                {agents.map((agent) => (
+                  <AgentCard agent={agent} key={agent.target} onOpen={() => setSelectedAgentTarget(agent.target)} />
+                ))}
+              </div>
+            )}
+          </main>
+        </div>
+      )}
 
       {selectedService ? (
         <ServiceDrawer
@@ -346,6 +486,10 @@ function App() {
           statuses={(summary?.statuses ?? []).filter((status) => status.serviceId === selectedService.id)}
           uptime={uptimeByService.get(selectedService.id) ?? []}
         />
+      ) : null}
+
+      {selectedAgent ? (
+        <AgentDrawer agent={selectedAgent} onClose={() => setSelectedAgentTarget("")} />
       ) : null}
     </div>
   );
@@ -536,6 +680,194 @@ function ServiceDrawer({ onClose, service, statuses, uptime }: {
       </aside>
     </>
   );
+}
+
+function AgentCard({ agent, onOpen }: { agent: AgentInfo; onOpen: () => void }) {
+  const connection = agentConnection(agent);
+  const tone = agentCardTone(connection, agent.containers);
+  const wordTone = agentConnectionTone[connection];
+
+  return (
+    <article
+      aria-label={`${agent.target}, ${agentConnectionWord[connection]}`}
+      className={`tile ${tone}`}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      role="button"
+      tabIndex={0}
+    >
+      <div className="tileTop">
+        <span aria-hidden="true" className={`dot ${wordTone}`} />
+        <h3>{agent.target}</h3>
+        <span className={`stateWord ${wordTone}`}>{agentConnectionWord[connection]}</span>
+      </div>
+      <div className="tileFoot">
+        <span>{agent.lastSeenAt ? `last report ${relativeTime(agent.lastSeenAt)}` : "no reports yet"}</span>
+        <span>{containerTally(agent.containers)}</span>
+      </div>
+    </article>
+  );
+}
+
+function AgentDrawer({ agent, onClose }: { agent: AgentInfo; onClose: () => void }) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const connection = agentConnection(agent);
+  const wordTone = agentConnectionTone[connection];
+  const containers = useMemo(() => sortContainers(agent.containers), [agent.containers]);
+
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <>
+      <div aria-hidden="true" className="scrim" onClick={onClose} />
+      <aside aria-labelledby="agentDrawerTitle" aria-modal="true" className="drawer" role="dialog">
+        <header className="drawerHead">
+          <span aria-hidden="true" className={`dot big ${wordTone}`} />
+          <div className="drawerTitleBlock">
+            <h2 id="agentDrawerTitle">{agent.target}</h2>
+            <p className="drawerSub">
+              {agentConnectionWord[connection]} {"·"} {agent.lastSeenAt ? `last report ${relativeTime(agent.lastSeenAt)}` : "no reports yet"}
+            </p>
+          </div>
+          <button aria-label="Close details" className="drawerClose" onClick={onClose} ref={closeRef} type="button">
+            <span aria-hidden="true">{"✕"}</span>
+          </button>
+        </header>
+
+        <section className="drawerSection">
+          <h3>Containers</h3>
+          {containers.length ? (
+            <ul className="containerList">
+              {containers.map((container) => (
+                <li key={container.id || container.name}>
+                  <div className="containerRow">
+                    <div className="containerName">
+                      <strong>{container.name}</strong>
+                      <span className="containerImage">{container.image}</span>
+                    </div>
+                    <span className={`stateWord ${containerTone(container)}`}>{containerWord(container)}</span>
+                  </div>
+                  {container.restartCount > 0 ? (
+                    <p className="containerRestarts">{container.restartCount} {plural(container.restartCount, "restart")}</p>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="quiet">No containers reported.</p>
+          )}
+        </section>
+      </aside>
+    </>
+  );
+}
+
+function tabFromHash(): Tab {
+  return window.location.hash === agentsTabHash ? "agents" : "services";
+}
+
+function agentConnection(agent: AgentInfo): AgentConnection {
+  if (!agent.lastSeenAt) {
+    return "never";
+  }
+  const seenAt = new Date(agent.lastSeenAt).getTime();
+  if (Number.isNaN(seenAt)) {
+    return "never";
+  }
+  const elapsedMs = Date.now() - seenAt;
+  if (elapsedMs < agentConnectedThresholdMs) {
+    return "connected";
+  }
+  if (elapsedMs < agentStaleThresholdMs) {
+    return "stale";
+  }
+  return "offline";
+}
+
+function isContainerRunning(container: ContainerStatus): boolean {
+  return container.state === "running" && container.health !== "unhealthy";
+}
+
+function agentCardTone(connection: AgentConnection, containers: ContainerStatus[]): Health {
+  if (connection === "connected") {
+    return containers.some((container) => !isContainerRunning(container)) ? "degraded" : "healthy";
+  }
+  return agentConnectionTone[connection];
+}
+
+function overallAgentStatus(agents: AgentInfo[]): { tone: Tone; sentence: string } {
+  if (agents.length === 0) {
+    return { tone: "pending", sentence: "No agents connected yet" };
+  }
+  const connections = agents.map(agentConnection);
+  const attention = connections.filter((connection) => connection !== "connected").length;
+  if (attention === 0) {
+    return { tone: "steady", sentence: `All ${agents.length} ${plural(agents.length, "agent")} connected` };
+  }
+  const tone: Tone = connections.some((connection) => connection === "offline" || connection === "never")
+    ? "alert"
+    : "watch";
+  return { tone, sentence: `${attention} ${plural(attention, "agent needs", "agents need")} attention` };
+}
+
+function latestAgentReportTime(agents: AgentInfo[]): string {
+  let latest = "";
+  for (const agent of agents) {
+    if (agent.lastSeenAt && agent.lastSeenAt > latest) {
+      latest = agent.lastSeenAt;
+    }
+  }
+  return latest;
+}
+
+function containerTally(containers: ContainerStatus[]): string {
+  if (containers.length === 0) {
+    return "no containers reported";
+  }
+  const running = containers.filter(isContainerRunning).length;
+  return `${running} of ${containers.length} running`;
+}
+
+function containerTone(container: ContainerStatus): Health {
+  if (!isContainerRunning(container)) {
+    return "unhealthy";
+  }
+  return container.health === "starting" ? "degraded" : "healthy";
+}
+
+function containerWord(container: ContainerStatus): string {
+  if (container.state !== "running") {
+    return titleize(container.state || "unknown");
+  }
+  if (container.health === "unhealthy") {
+    return "Unhealthy";
+  }
+  if (container.health === "starting") {
+    return "Starting";
+  }
+  return "Running";
+}
+
+function sortContainers(containers: ContainerStatus[]): ContainerStatus[] {
+  return [...containers].sort((left, right) => {
+    const leftRunning = isContainerRunning(left) ? 1 : 0;
+    const rightRunning = isContainerRunning(right) ? 1 : 0;
+    return leftRunning - rightRunning || left.name.localeCompare(right.name);
+  });
 }
 
 function overallStatus(services: Service[]): { tone: Tone; sentence: string } {

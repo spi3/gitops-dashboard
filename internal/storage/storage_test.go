@@ -337,6 +337,56 @@ VALUES('svc', 'local', 'healthy', 'up', ?)`, checkedAt); err != nil {
 	}
 }
 
+func TestUpsertAgentThenAgentsRoundtrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertAgent(ctx, core.AgentMessage{
+		Target: "serenity",
+		Containers: []core.ContainerStatus{{
+			ID:    "abc123",
+			Name:  "/stack-web-1",
+			Image: "example/web:v1",
+			State: "running",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAgent(ctx, core.AgentMessage{Target: "albert"}); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.Agents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("agents = %#v, want 2", agents)
+	}
+	if agents[0].Target != "albert" || agents[1].Target != "serenity" {
+		t.Fatalf("agents not sorted by target: %#v", agents)
+	}
+	if agents[0].Containers == nil {
+		t.Fatal("albert containers is nil, want empty slice")
+	}
+	if len(agents[0].Containers) != 0 {
+		t.Fatalf("albert containers = %#v, want empty", agents[0].Containers)
+	}
+	if agents[0].LastSeenAt == "" {
+		t.Fatal("albert last_seen_at is empty, want set")
+	}
+	serenity := agents[1]
+	if len(serenity.Containers) != 1 || serenity.Containers[0].Name != "/stack-web-1" {
+		t.Fatalf("serenity containers = %#v", serenity.Containers)
+	}
+	if serenity.LastSeenAt == "" {
+		t.Fatal("serenity last_seen_at is empty, want set")
+	}
+}
+
 func TestUptimeEmptyIsSlice(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
