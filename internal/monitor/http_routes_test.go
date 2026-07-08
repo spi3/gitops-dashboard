@@ -61,34 +61,74 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byServiceTarget := map[string]core.StatusResult{}
+	byService := map[string]core.StatusResult{}
 	for _, status := range statuses {
-		byServiceTarget[status.ServiceID+"\x00"+status.Target] = status
-	}
-	if byServiceTarget["up\x00routes: https://up.example.test"].Health != core.HealthHealthy {
-		t.Fatalf("up status = %#v, want healthy", byServiceTarget["up\x00routes: https://up.example.test"])
-	}
-	if byServiceTarget["down\x00routes: https://down.example.test"].Health != core.HealthUnhealthy {
-		t.Fatalf("down status = %#v, want unhealthy", byServiceTarget["down\x00routes: https://down.example.test"])
-	}
-	if byServiceTarget["missing\x00routes: https://missing.example.test"].Health != core.HealthUnhealthy {
-		t.Fatalf("missing status = %#v, want unhealthy", byServiceTarget["missing\x00routes: https://missing.example.test"])
-	}
-	if byServiceTarget["get-only\x00routes: https://get-only.example.test"].Health != core.HealthHealthy {
-		t.Fatalf("get-only status = %#v, want healthy", byServiceTarget["get-only\x00routes: https://get-only.example.test"])
-	}
-	badFallback := byServiceTarget["fallback\x00routes: https://bad.example.test"]
-	goodFallback := byServiceTarget["fallback\x00routes: https://good.example.test"]
-	if badFallback.Health != core.HealthError || !strings.Contains(badFallback.Message, "bad.example.test") {
-		t.Fatalf("bad fallback status = %#v, want error route check", badFallback)
-	}
-	if goodFallback.Health != core.HealthHealthy || !strings.Contains(goodFallback.Message, "good.example.test") {
-		t.Fatalf("good fallback status = %#v, want healthy route check", goodFallback)
-	}
-	for _, status := range byServiceTarget {
-		if status.ServiceID == "internal" {
-			t.Fatalf("internal service produced status: %#v", status)
+		if strings.HasPrefix(status.Target, "routes: ") {
+			t.Fatalf("route-specific status was not pruned: %#v", status)
 		}
+		byService[status.ServiceID] = status
+	}
+	if byService["up"].Health != core.HealthHealthy || byService["up"].Target != "routes" {
+		t.Fatalf("up status = %#v, want healthy routes target", byService["up"])
+	}
+	if byService["down"].Health != core.HealthUnhealthy {
+		t.Fatalf("down health = %s, want unhealthy", byService["down"].Health)
+	}
+	if byService["missing"].Health != core.HealthUnhealthy {
+		t.Fatalf("missing health = %s, want unhealthy", byService["missing"].Health)
+	}
+	if byService["get-only"].Health != core.HealthHealthy {
+		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
+	}
+	if byService["fallback"].Health != core.HealthDegraded ||
+		!strings.Contains(byService["fallback"].Message, "1/2 route checks passing") ||
+		!strings.Contains(byService["fallback"].Message, "bad.example.test") {
+		t.Fatalf("fallback status = %#v, want degraded mixed route checks", byService["fallback"])
+	}
+	if _, ok := byService["internal"]; ok {
+		t.Fatalf("internal service produced status: %#v", byService["internal"])
+	}
+}
+
+func TestHTTPRouteCheckPrunesStaleRouteSpecificStatuses(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	staleTarget := "routes: https://old.example.test"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    staleTarget,
+		Health:    core.HealthError,
+		Message:   "old failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		return routeResponse(req, http.StatusOK), nil
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, []core.Service{
+		{ID: "app", Exposure: []string{"https://app.example.test"}},
+	}, client); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %#v, want one combined route target", statuses)
+	}
+	if statuses[0].Target != "routes" || statuses[0].Health != core.HealthHealthy {
+		t.Fatalf("status = %#v, want healthy routes target", statuses[0])
 	}
 }
 
