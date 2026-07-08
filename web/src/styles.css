@@ -54,12 +54,51 @@
   color-scheme: dark;
 }
 
+:root[data-theme="vim"] {
+  --page: #06110a;
+  --card: #0a190f;
+  --card-hover: #102517;
+  --ink: #dcf7d2;
+  --ink-2: #9bd88e;
+  --ink-3: #5f9f65;
+  --line: #23582e;
+  --line-soft: #17391f;
+  --accent: #8cff66;
+  --accent-ink: #06110a;
+  --accent-soft: #123d1a;
+  --up: #00ff5f;
+  --degraded: #ffd75f;
+  --down: #ff5f5f;
+  --failed: #ff875f;
+  --nodata: #5f875f;
+  --up-text: #63ff7f;
+  --degraded-text: #ffd75f;
+  --down-text: #ff8080;
+  --failed-text: #ff9f6f;
+  --nodata-text: #8fbc8f;
+  --tick-ring: rgba(140, 255, 102, 0.16);
+  --scrim: rgba(0, 8, 3, 0.72);
+  --shadow: 0 0 0 1px rgba(140, 255, 102, 0.04);
+  --shadow-lift: 0 0 24px rgba(0, 255, 95, 0.12);
+  color-scheme: dark;
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+}
+
 * {
   box-sizing: border-box;
 }
 
 body {
+  background: var(--page);
+  color: var(--ink);
   margin: 0;
+}
+
+:root[data-theme="vim"] body {
+  background-image:
+    linear-gradient(rgba(140, 255, 102, 0.035) 1px, transparent 1px),
+    radial-gradient(circle at 30% 0%, rgba(140, 255, 102, 0.08), transparent 34rem);
+  background-size: 100% 4px, 100% 100%;
 }
 
 body.drawerOpen {
@@ -137,23 +176,79 @@ a:focus-visible,
 .mark i:nth-child(4) { height: 16px; }
 .mark i:nth-child(5) { height: 12px; }
 
-.themeButton {
+.themeSelector {
   align-items: center;
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink-2);
-  cursor: pointer;
+  border-radius: 8px;
   display: inline-flex;
-  font-size: 15px;
-  height: 34px;
-  justify-content: center;
-  width: 34px;
+  position: relative;
 }
 
-.themeButton:hover {
+.themeSelector::before {
+  color: var(--accent);
+  content: ":";
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 14px;
+  left: 10px;
+  pointer-events: none;
+  position: absolute;
+}
+
+.themeSelector select {
+  appearance: none;
+  background: var(--card);
+  border: 0;
+  border-radius: 8px;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 12.5px;
+  height: 34px;
+  min-width: 126px;
+  padding: 0 28px 0 24px;
+}
+
+.themeSelector::after {
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--ink-3);
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  right: 10px;
+}
+
+.themeSelector:hover {
   border-color: var(--ink-3);
+}
+
+.themeSelector select:hover {
   color: var(--ink);
+}
+
+.themeSelector select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+:root[data-theme="vim"] .themeSelector,
+:root[data-theme="vim"] .themeSelector select {
+  background: #041007;
+}
+
+:root[data-theme="vim"] .wordmark h1,
+:root[data-theme="vim"] .sentence,
+:root[data-theme="vim"] .environmentHead h2,
+:root[data-theme="vim"] .emptyLead,
+:root[data-theme="vim"] .drawerHead h2 {
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+}
+
+:root[data-theme="vim"] .wordmark h1::before {
+  color: var(--accent);
+  content: ":";
 }
 
 /* Tab bar */

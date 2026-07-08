@@ -5,7 +5,7 @@ import "@fontsource-variable/jetbrains-mono/index.css";
 import "./styles.css";
 
 type Health = "healthy" | "degraded" | "unhealthy" | "unknown" | "error";
-type Theme = "light" | "dark";
+type Theme = "light" | "dark" | "vim";
 type Tone = "steady" | "pending" | "watch" | "alert";
 
 type Repository = {
@@ -153,6 +153,11 @@ const tileSlots = 28;
 const drawerSlots = 40;
 const refreshIntervalMs = 30_000;
 const themeStorageKey = "gitops-dashboard-theme";
+const themeOptions: Array<{ label: string; value: Theme }> = [
+  { label: "Light", value: "light" },
+  { label: "Dark", value: "dark" },
+  { label: "Classic Vim", value: "vim" }
+];
 
 function App() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -303,15 +308,18 @@ function App() {
           <span className="mark" aria-hidden="true"><i /><i /><i /><i /><i /></span>
           <h1>GitOps Dashboard</h1>
         </div>
-        <button
-          aria-label="Use dark theme"
-          aria-pressed={theme === "dark"}
-          className="themeButton"
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-          type="button"
-        >
-          <span aria-hidden="true">{theme === "dark" ? "☾" : "☀"}</span>
-        </button>
+        <label className="themeSelector">
+          <span className="srOnly">Theme</span>
+          <select
+            aria-label="Theme"
+            onChange={(event) => setTheme(event.target.value as Theme)}
+            value={theme}
+          >
+            {themeOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+        </label>
       </header>
 
       <div aria-label="Dashboard views" className="tabBar" onKeyDown={handleTabBarKeyDown} role="tablist">
@@ -980,10 +988,14 @@ function stripLabel(samples: UptimeSample[]): string {
 
 function initialTheme(): Theme {
   const savedTheme = window.localStorage.getItem(themeStorageKey);
-  if (savedTheme === "light" || savedTheme === "dark") {
+  if (isTheme(savedTheme)) {
     return savedTheme;
   }
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function isTheme(value: string | null): value is Theme {
+  return value === "light" || value === "dark" || value === "vim";
 }
 
 function searchableServiceText(service: Service) {
