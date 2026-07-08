@@ -366,18 +366,55 @@ func TestUptimeTracksHistory(t *testing.T) {
 	}
 }
 
-func TestSummaryHealthPrefersActionableStatusAcrossTargets(t *testing.T) {
+func TestSummaryHealthAggregatesAcrossTargets(t *testing.T) {
 	t.Parallel()
 	statusTime := time.Date(2026, 6, 27, 16, 0, 0, 0, time.UTC)
-	services := []core.Service{{ID: "svc", Health: core.HealthUnknown}}
-	statuses := []core.StatusResult{
-		{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime},
-		{ServiceID: "svc", Target: "routes", Health: core.HealthHealthy, CheckedAt: statusTime},
-		{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime.Add(time.Minute)},
+	tests := []struct {
+		name     string
+		statuses []core.StatusResult
+		want     core.HealthState
+	}{
+		{
+			name: "mixed target results degrade",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "routes", Health: core.HealthHealthy, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "docker", Health: core.HealthUnknown, CheckedAt: statusTime.Add(time.Minute)},
+			},
+			want: core.HealthDegraded,
+		},
+		{
+			name: "all target results healthy",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "docker", Health: core.HealthHealthy, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "routes", Health: core.HealthHealthy, CheckedAt: statusTime},
+			},
+			want: core.HealthHealthy,
+		},
+		{
+			name: "single failed target stays failed",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "routes", Health: core.HealthError, CheckedAt: statusTime},
+			},
+			want: core.HealthError,
+		},
+		{
+			name: "all non-passing targets use worst status",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "docker", Health: core.HealthUnhealthy, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "routes", Health: core.HealthError, CheckedAt: statusTime},
+			},
+			want: core.HealthError,
+		},
 	}
-	applyLatestStatus(services, statuses)
-	if services[0].Health != core.HealthHealthy {
-		t.Fatalf("health = %s, want healthy", services[0].Health)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			services := []core.Service{{ID: "svc", Health: core.HealthUnknown}}
+			applyLatestStatus(services, tc.statuses)
+			if services[0].Health != tc.want {
+				t.Fatalf("health = %s, want %s", services[0].Health, tc.want)
+			}
+		})
 	}
 }
 

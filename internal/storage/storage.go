@@ -521,14 +521,48 @@ func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
 		if !ok {
 			continue
 		}
-		health := core.HealthUnknown
+		statuses := make([]core.StatusResult, 0, len(targets))
 		for _, status := range targets {
-			if healthPriority(status.Health) < healthPriority(health) {
-				health = status.Health
-			}
+			statuses = append(statuses, status)
 		}
-		services[i].Health = health
+		services[i].Health = aggregateTargetHealth(statuses)
 	}
+}
+
+func aggregateTargetHealth(statuses []core.StatusResult) core.HealthState {
+	if len(statuses) == 0 {
+		return core.HealthUnknown
+	}
+	if len(statuses) == 1 {
+		return statuses[0].Health
+	}
+	allHealthy := true
+	anyHealthy := false
+	allUnknown := true
+	worst := core.HealthUnknown
+	for _, status := range statuses {
+		if status.Health == core.HealthHealthy {
+			anyHealthy = true
+		} else {
+			allHealthy = false
+		}
+		if status.Health != core.HealthUnknown {
+			allUnknown = false
+		}
+		if healthPriority(status.Health) < healthPriority(worst) {
+			worst = status.Health
+		}
+	}
+	if allHealthy {
+		return core.HealthHealthy
+	}
+	if anyHealthy {
+		return core.HealthDegraded
+	}
+	if allUnknown {
+		return core.HealthUnknown
+	}
+	return worst
 }
 
 func healthPriority(health core.HealthState) int {

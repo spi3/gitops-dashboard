@@ -59,6 +59,11 @@ type UptimeStat = {
   samples: UptimeSample[];
 };
 
+type TargetSample = {
+  target: string;
+  sample: UptimeSample;
+};
+
 type ContainerStatus = {
   id: string;
   name: string;
@@ -502,9 +507,9 @@ function ServiceTile({ onOpen, service, uptime }: {
 }) {
   const routes = accessTargets(service);
   const door = routes[0] ?? null;
-  const primary = primaryUptime(uptime);
+  const samples = aggregateUptimeSamples(uptime);
   const percent = worstPercent(uptime);
-  const lastSample = primary?.samples[primary.samples.length - 1] ?? null;
+  const lastSample = samples[samples.length - 1] ?? null;
 
   return (
     <article
@@ -541,7 +546,7 @@ function ServiceTile({ onOpen, service, uptime }: {
       ) : (
         <span className="doorRow doorNone">no route in Git</span>
       )}
-      <PulseStrip samples={primary?.samples ?? []} slots={tileSlots} />
+      <PulseStrip samples={samples} slots={tileSlots} />
       <div className="tileFoot">
         <span>{percent === null ? "no checks yet" : `${percent}% · 24h`}</span>
         <span>{lastSample ? relativeTime(lastSample.checkedAt) : ""}</span>
@@ -928,18 +933,76 @@ function groupByEnvironment(services: Service[]): EnvironmentGroup[] {
     });
 }
 
-function primaryUptime(stats: UptimeStat[]): UptimeStat | null {
-  let primary: UptimeStat | null = null;
-  let primaryTime = "";
-  for (const stat of stats) {
-    const last = stat.samples[stat.samples.length - 1];
-    const time = last ? last.checkedAt : "";
-    if (!primary || time > primaryTime) {
-      primary = stat;
-      primaryTime = time;
+function aggregateUptimeSamples(stats: UptimeStat[]): UptimeSample[] {
+  const measured = stats.filter((stat) => stat.samples.length > 0);
+  if (measured.length === 0) {
+    return [];
+  }
+  if (measured.length === 1) {
+    return measured[0].samples;
+  }
+  const sampleCount = Math.max(...measured.map((stat) => stat.samples.length));
+  const samples: UptimeSample[] = [];
+  for (let offsetFromEnd = sampleCount - 1; offsetFromEnd >= 0; offsetFromEnd -= 1) {
+    const targetSamples: TargetSample[] = [];
+    for (const stat of measured) {
+      const index = stat.samples.length - 1 - offsetFromEnd;
+      if (index >= 0) {
+        targetSamples.push({ target: stat.target, sample: stat.samples[index] });
+      }
+    }
+    if (targetSamples.length > 0) {
+      samples.push({
+        health: aggregateSampleHealth(targetSamples.map(({ sample }) => sample.health)),
+        checkedAt: latestSampleTime(targetSamples),
+        message: aggregateSampleMessage(targetSamples)
+      });
     }
   }
-  return primary;
+  return samples;
+}
+
+function aggregateSampleHealth(healths: Health[]): Health {
+  if (healths.length === 0) {
+    return "unknown";
+  }
+  if (healths.length === 1) {
+    return healths[0];
+  }
+  const allHealthy = healths.every((health) => health === "healthy");
+  if (allHealthy) {
+    return "healthy";
+  }
+  const anyHealthy = healths.some((health) => health === "healthy");
+  if (anyHealthy) {
+    return "degraded";
+  }
+  const allUnknown = healths.every((health) => health === "unknown");
+  if (allUnknown) {
+    return "unknown";
+  }
+  return healths.reduce((worst, health) => (
+    serviceSortOrder[health] < serviceSortOrder[worst] ? health : worst
+  ), "unknown");
+}
+
+function latestSampleTime(samples: TargetSample[]): string {
+  return samples.reduce((latest, { sample }) => (
+    sample.checkedAt > latest ? sample.checkedAt : latest
+  ), "");
+}
+
+function aggregateSampleMessage(samples: TargetSample[]): string {
+  const failing = samples.filter(({ sample }) => sample.health !== "healthy");
+  if (failing.length === 0) {
+    return samples.length > 1 ? "All checks passed" : samples[0]?.sample.message ?? "";
+  }
+  if (samples.length === 1) {
+    return failing[0]?.sample.message ?? "";
+  }
+  return failing
+    .map(({ target, sample }) => `${target}: ${sample.message || statusWord[sample.health]}`)
+    .join("; ");
 }
 
 function worstPercent(stats: UptimeStat[]): number | null {

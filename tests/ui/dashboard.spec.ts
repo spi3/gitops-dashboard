@@ -221,6 +221,24 @@ test("renders uptime history and drawer details from the summary", async ({ page
   await expect(drawer).toBeHidden();
 });
 
+test("aggregates multi-target uptime on service tiles", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithMixedTargetUptime())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "mixed-monitor", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Degraded");
+  await expect(tile.locator(".tick.healthy")).toHaveCount(2);
+  await expect(tile.locator(".tick.degraded")).toHaveCount(1);
+  await expect(tile.locator(".tick.error")).toHaveCount(0);
+  await expect(tile.locator(".tick.empty")).toHaveCount(25);
+  await expect(tile.locator(".pulseStrip")).toHaveAttribute("aria-label", /1 degraded/);
+});
+
 function createFixtureRepo(dir: string) {
   mkdirSync(path.join(dir, "prod"), { recursive: true });
   writeFileSync(path.join(dir, "prod", "compose.yaml"), [
@@ -435,6 +453,35 @@ function summaryWithUptimeHistory() {
     checkCount: 6,
     samples
   }]);
+}
+
+function summaryWithMixedTargetUptime() {
+  const service = {
+    ...baseService("svc-mixed", "mixed-monitor", "degraded"),
+    exposure: ["mixed.example.test"]
+  };
+  const now = Date.now();
+  const samplesFor = (healths: string[], target: string) => healths.map((health, index) => ({
+    health,
+    checkedAt: new Date(now - (healths.length - index) * 60_000).toISOString(),
+    message: health === "healthy" ? `${target} ok` : `${target} failed`
+  }));
+  return summaryShell([service], [
+    {
+      serviceId: "svc-mixed",
+      target: "route",
+      uptimePercent: 100,
+      checkCount: 3,
+      samples: samplesFor(["healthy", "healthy", "healthy"], "route")
+    },
+    {
+      serviceId: "svc-mixed",
+      target: "docker",
+      uptimePercent: 66.7,
+      checkCount: 3,
+      samples: samplesFor(["healthy", "error", "healthy"], "docker")
+    }
+  ]);
 }
 
 async function waitForServer(url: string) {
