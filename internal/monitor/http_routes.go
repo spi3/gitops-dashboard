@@ -82,19 +82,32 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 }
 
 func checkHTTPRouteCandidates(ctx context.Context, client *http.Client, routes []string) (core.HealthState, string) {
-	bestHealth := core.HealthUnknown
-	bestMessage := ""
+	if len(routes) == 0 {
+		return core.HealthUnknown, ""
+	}
+	if len(routes) == 1 {
+		return checkHTTPRoute(ctx, client, routes[0])
+	}
+	results := make([]routeCheckResult, 0, len(routes))
+	healthyCount := 0
+	allHealthy := true
 	for _, route := range routes {
 		health, message := checkHTTPRoute(ctx, client, route)
+		results = append(results, routeCheckResult{health: health, message: message})
 		if health == core.HealthHealthy {
-			return health, message
+			healthyCount++
+			continue
 		}
-		if bestMessage == "" || routeResultPriority(health) > routeResultPriority(bestHealth) {
-			bestHealth = health
-			bestMessage = message
-		}
+		allHealthy = false
 	}
-	return bestHealth, bestMessage
+	if allHealthy {
+		return core.HealthHealthy, routeChecksMessage(healthyCount, results, results[0])
+	}
+	worst := worstRouteResult(results)
+	if healthyCount > 0 {
+		return core.HealthDegraded, routeChecksMessage(healthyCount, results, worst)
+	}
+	return worst.health, routeChecksMessage(healthyCount, results, worst)
 }
 
 func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (core.HealthState, string) {
@@ -254,15 +267,34 @@ func preferRoute(candidate, current string) bool {
 
 func routeResultPriority(health core.HealthState) int {
 	switch health {
-	case core.HealthHealthy:
-		return 4
-	case core.HealthDegraded:
-		return 3
-	case core.HealthUnhealthy:
-		return 2
 	case core.HealthError:
-		return 1
-	default:
 		return 0
+	case core.HealthUnhealthy:
+		return 1
+	case core.HealthDegraded:
+		return 2
+	case core.HealthHealthy:
+		return 3
+	default:
+		return 4
 	}
+}
+
+type routeCheckResult struct {
+	health  core.HealthState
+	message string
+}
+
+func worstRouteResult(results []routeCheckResult) routeCheckResult {
+	worst := results[0]
+	for _, result := range results[1:] {
+		if routeResultPriority(result.health) < routeResultPriority(worst.health) {
+			worst = result
+		}
+	}
+	return worst
+}
+
+func routeChecksMessage(healthyCount int, results []routeCheckResult, detail routeCheckResult) string {
+	return fmt.Sprintf("%d/%d route checks passing; %s", healthyCount, len(results), detail.message)
 }

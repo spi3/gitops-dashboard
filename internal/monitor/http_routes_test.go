@@ -71,8 +71,10 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	if byService["get-only"].Health != core.HealthHealthy {
 		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
 	}
-	if byService["fallback"].Health != core.HealthHealthy || !strings.Contains(byService["fallback"].Message, "good.example.test") {
-		t.Fatalf("fallback status = %#v, want healthy good route", byService["fallback"])
+	if byService["fallback"].Health != core.HealthDegraded ||
+		!strings.Contains(byService["fallback"].Message, "1/2 route checks passing") ||
+		!strings.Contains(byService["fallback"].Message, "bad.example.test") {
+		t.Fatalf("fallback status = %#v, want degraded mixed route checks", byService["fallback"])
 	}
 	if _, ok := byService["internal"]; ok {
 		t.Fatalf("internal service produced status: %#v", byService["internal"])
