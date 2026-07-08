@@ -91,6 +91,95 @@ all:
 	}
 }
 
+func TestSyncPingTargetsPrunesStaleInventorySource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	source := t.TempDir()
+	writeFile(t, filepath.Join(source, "inventory", "hosts.yml"), `
+all:
+  hosts:
+    serenity:
+      ansible_host: 10.0.0.15
+`)
+	runGit(t, source, "init", "-b", "main")
+	runGit(t, source, "config", "user.name", "Test")
+	runGit(t, source, "config", "user.email", "test@example.invalid")
+	runGit(t, source, "add", ".")
+	runGit(t, source, "commit", "-m", "fixture")
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	staleHost := core.Service{
+		ID:         "host-stale",
+		Name:       "serenity",
+		Repository: "ping/ansible-hosts",
+		SourcePath: "/ansible/hosts.yml",
+		Runtime:    "host",
+		Kind:       "Host",
+		Health:     core.HealthUnknown,
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "ping/ansible-hosts", "/ansible/hosts.yml", "host", []core.Service{staleHost}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "host-stale",
+		Target:    "ansible-hosts",
+		Health:    core.HealthHealthy,
+		Message:   "pong",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor := New(config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Runtime: config.RuntimeConfig{
+			Ping: []config.PingTarget{{
+				Name:             "ansible-hosts",
+				Repository:       "fixture",
+				AnsibleInventory: "inventory/hosts.yml",
+			}},
+		},
+	}, store, slog.Default())
+	if err := monitor.SyncPingTargets(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hostServices []core.Service
+	for _, service := range summary.Services {
+		if service.Runtime == "host" {
+			hostServices = append(hostServices, service)
+		}
+	}
+	if len(hostServices) != 1 || hostServices[0].Repository != "fixture" || hostServices[0].SourcePath != "inventory/hosts.yml" {
+		t.Fatalf("host services = %#v, want only current repo-backed host", hostServices)
+	}
+	for _, repo := range summary.Repositories {
+		if repo.Name == "ping/ansible-hosts" {
+			t.Fatalf("stale configured repository still present: %#v", summary.Repositories)
+		}
+	}
+	if len(summary.Statuses) != 0 {
+		t.Fatalf("statuses = %#v, want stale status pruned", summary.Statuses)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/scanner"
+	"github.com/example/gitops-dashboard/internal/storage"
 )
 
 const (
@@ -29,6 +30,12 @@ func (monitor Monitor) SyncPingTargets(ctx context.Context) error {
 	for _, target := range monitor.cfg.Runtime.Ping {
 		if _, err := monitor.syncPingTarget(ctx, target); err != nil {
 			monitor.logger.Error("ping inventory sync failed", "target", target.EffectiveName(), "error", err)
+			combined = err
+		}
+	}
+	if combined == nil {
+		if err := monitor.store.PruneRuntimeServices(ctx, "host", pingRuntimeSources(monitor.cfg.Runtime.Ping)); err != nil {
+			monitor.logger.Error("ping inventory prune failed", "error", err)
 			combined = err
 		}
 	}
@@ -48,6 +55,17 @@ func (monitor Monitor) syncPingTarget(ctx context.Context, target config.PingTar
 		return nil, err
 	}
 	return services, nil
+}
+
+func pingRuntimeSources(targets []config.PingTarget) []storage.RuntimeServiceSource {
+	sources := make([]storage.RuntimeServiceSource, 0, len(targets))
+	for _, target := range targets {
+		sources = append(sources, storage.RuntimeServiceSource{
+			Repository: hostinventory.RepositoryName(target),
+			SourcePath: hostinventory.Source(target),
+		})
+	}
+	return sources
 }
 
 func (monitor Monitor) resolvePingInventory(ctx context.Context, target config.PingTarget) (string, string, error) {
