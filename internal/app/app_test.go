@@ -171,6 +171,21 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	}
 
 	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes: http://10.10.10.20","notApplicable":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("enable override status = %d, body=%q", res.Code, res.Body.String())
+	}
+	summary, err = app.store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Statuses[0].Health != core.HealthUnknown {
+		t.Fatalf("re-enabled status health = %s, want unknown", summary.Statuses[0].Health)
+	}
+
+	res = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"missing","notApplicable":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(res, req)

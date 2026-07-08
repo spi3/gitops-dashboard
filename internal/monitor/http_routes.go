@@ -40,24 +40,69 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	}
 
 	targetPrefix := targetName + ": "
-	results := make(chan core.StatusResult, len(services))
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, httpRouteConcurrency)
-
+	checks := []httpRouteCheck{}
+	overriddenStatuses := []core.StatusResult{}
 	for _, service := range services {
 		routes := httpRoutes(service.Exposure)
-		keepTargets := []string(nil)
-		if len(routes) > 0 {
-			keepTargets = []string{targetName}
+		parentNotApplicable, err := monitor.store.MonitorNotApplicable(ctx, service.ID, targetName)
+		if err != nil {
+			return err
 		}
+		if parentNotApplicable {
+			if err := monitor.store.PruneStatusTargets(ctx, service.ID, "", targetPrefix, nil); err != nil {
+				return err
+			}
+			overriddenStatuses = append(overriddenStatuses, core.StatusResult{
+				ServiceID: service.ID,
+				Target:    targetName,
+				Health:    core.HealthNotApplicable,
+				Message:   "not applicable",
+				CheckedAt: time.Now().UTC(),
+			})
+			continue
+		}
+
+		keepTargets := routeStatusTargets(targetPrefix, routes)
 		if err := monitor.store.PruneStatusTargets(ctx, service.ID, targetName, targetPrefix, keepTargets); err != nil {
 			return err
 		}
-		if len(routes) == 0 {
-			continue
+		for _, route := range routes {
+			statusTarget := targetPrefix + route
+			routeNotApplicable, err := monitor.store.MonitorNotApplicable(ctx, service.ID, statusTarget)
+			if err != nil {
+				return err
+			}
+			if routeNotApplicable {
+				overriddenStatuses = append(overriddenStatuses, core.StatusResult{
+					ServiceID: service.ID,
+					Target:    statusTarget,
+					Health:    core.HealthNotApplicable,
+					Message:   "not applicable",
+					CheckedAt: time.Now().UTC(),
+				})
+				continue
+			}
+			checks = append(checks, httpRouteCheck{
+				serviceID: service.ID,
+				target:    statusTarget,
+				route:     route,
+			})
 		}
+	}
+
+	for _, status := range overriddenStatuses {
+		if err := monitor.store.UpsertStatus(ctx, status); err != nil {
+			return err
+		}
+	}
+
+	results := make(chan core.StatusResult, len(checks))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, httpRouteConcurrency)
+
+	for _, check := range checks {
 		wg.Add(1)
-		go func(service core.Service, routes []string) {
+		go func(check httpRouteCheck) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -65,15 +110,15 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 			case <-ctx.Done():
 				return
 			}
-			health, message := checkHTTPRouteCandidates(ctx, client, routes)
+			health, message := checkHTTPRoute(ctx, client, check.route)
 			results <- core.StatusResult{
-				ServiceID: service.ID,
-				Target:    targetName,
+				ServiceID: check.serviceID,
+				Target:    check.target,
 				Health:    health,
 				Message:   message,
 				CheckedAt: time.Now().UTC(),
 			}
-		}(service, routes)
+		}(check)
 	}
 
 	go func() {
@@ -87,35 +132,6 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 		}
 	}
 	return nil
-}
-
-func checkHTTPRouteCandidates(ctx context.Context, client *http.Client, routes []string) (core.HealthState, string) {
-	if len(routes) == 0 {
-		return core.HealthUnknown, ""
-	}
-	if len(routes) == 1 {
-		return checkHTTPRoute(ctx, client, routes[0])
-	}
-	results := make([]routeCheckResult, 0, len(routes))
-	healthyCount := 0
-	allHealthy := true
-	for _, route := range routes {
-		health, message := checkHTTPRoute(ctx, client, route)
-		results = append(results, routeCheckResult{health: health, message: message})
-		if health == core.HealthHealthy {
-			healthyCount++
-			continue
-		}
-		allHealthy = false
-	}
-	if allHealthy {
-		return core.HealthHealthy, routeChecksMessage(healthyCount, results, results[0])
-	}
-	worst := worstRouteResult(results)
-	if healthyCount > 0 {
-		return core.HealthDegraded, routeChecksMessage(healthyCount, results, worst)
-	}
-	return worst.health, routeChecksMessage(healthyCount, results, worst)
 }
 
 func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (core.HealthState, string) {
@@ -162,6 +178,20 @@ func firstHTTPRoute(exposure []string) (string, bool) {
 		return "", false
 	}
 	return routes[0], true
+}
+
+type httpRouteCheck struct {
+	serviceID string
+	target    string
+	route     string
+}
+
+func routeStatusTargets(prefix string, routes []string) []string {
+	targets := make([]string, 0, len(routes))
+	for _, route := range routes {
+		targets = append(targets, prefix+route)
+	}
+	return targets
 }
 
 func httpRoutes(exposure []string) []string {
@@ -273,38 +303,4 @@ func preferRoute(candidate, current string) bool {
 		return len(candidate) < len(current)
 	}
 	return candidate < current
-}
-
-func routeResultPriority(health core.HealthState) int {
-	switch health {
-	case core.HealthError:
-		return 0
-	case core.HealthUnhealthy:
-		return 1
-	case core.HealthDegraded:
-		return 2
-	case core.HealthHealthy:
-		return 3
-	default:
-		return 4
-	}
-}
-
-type routeCheckResult struct {
-	health  core.HealthState
-	message string
-}
-
-func worstRouteResult(results []routeCheckResult) routeCheckResult {
-	worst := results[0]
-	for _, result := range results[1:] {
-		if routeResultPriority(result.health) < routeResultPriority(worst.health) {
-			worst = result
-		}
-	}
-	return worst
-}
-
-func routeChecksMessage(healthyCount int, results []routeCheckResult, detail routeCheckResult) string {
-	return fmt.Sprintf("%d/%d route checks passing; %s", healthyCount, len(results), detail.message)
 }

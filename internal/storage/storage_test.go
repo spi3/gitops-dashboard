@@ -421,6 +421,15 @@ func TestSummaryHealthAggregatesAcrossTargets(t *testing.T) {
 			},
 			want: core.HealthUnknown,
 		},
+		{
+			name: "all routes not applicable use other monitor targets",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "routes: http://10.10.10.20", Health: core.HealthNotApplicable, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "routes: https://app.example.test", Health: core.HealthNotApplicable, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "docker", Health: core.HealthUnhealthy, CheckedAt: statusTime},
+			},
+			want: core.HealthUnhealthy,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

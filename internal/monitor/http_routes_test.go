@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,36 +62,43 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byService := map[string]core.StatusResult{}
+	if len(statuses) != 6 {
+		t.Fatalf("statuses = %#v, want one status per checkable route", statuses)
+	}
+	byTarget := map[string]core.StatusResult{}
 	for _, status := range statuses {
-		if strings.HasPrefix(status.Target, "routes: ") {
-			t.Fatalf("route-specific status was not pruned: %#v", status)
+		if status.Target == "routes" {
+			t.Fatalf("aggregate route status was persisted: %#v", status)
 		}
-		byService[status.ServiceID] = status
+		byTarget[status.Target] = status
 	}
-	if byService["up"].Health != core.HealthHealthy || byService["up"].Target != "routes" {
-		t.Fatalf("up status = %#v, want healthy routes target", byService["up"])
+	if byTarget["routes: https://up.example.test"].Health != core.HealthHealthy {
+		t.Fatalf("up status = %#v, want healthy route target", byTarget["routes: https://up.example.test"])
 	}
-	if byService["down"].Health != core.HealthUnhealthy {
-		t.Fatalf("down health = %s, want unhealthy", byService["down"].Health)
+	if byTarget["routes: https://down.example.test"].Health != core.HealthUnhealthy {
+		t.Fatalf("down health = %s, want unhealthy", byTarget["routes: https://down.example.test"].Health)
 	}
-	if byService["missing"].Health != core.HealthUnhealthy {
-		t.Fatalf("missing health = %s, want unhealthy", byService["missing"].Health)
+	if byTarget["routes: https://missing.example.test"].Health != core.HealthUnhealthy {
+		t.Fatalf("missing health = %s, want unhealthy", byTarget["routes: https://missing.example.test"].Health)
 	}
-	if byService["get-only"].Health != core.HealthHealthy {
-		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
+	if byTarget["routes: https://get-only.example.test"].Health != core.HealthHealthy ||
+		!strings.HasPrefix(byTarget["routes: https://get-only.example.test"].Message, "GET ") {
+		t.Fatalf("get-only status = %#v, want healthy GET fallback", byTarget["routes: https://get-only.example.test"])
 	}
-	if byService["fallback"].Health != core.HealthDegraded ||
-		!strings.Contains(byService["fallback"].Message, "1/2 route checks passing") ||
-		!strings.Contains(byService["fallback"].Message, "bad.example.test") {
-		t.Fatalf("fallback status = %#v, want degraded mixed route checks", byService["fallback"])
+	if byTarget["routes: https://bad.example.test"].Health != core.HealthError {
+		t.Fatalf("bad fallback status = %#v, want error", byTarget["routes: https://bad.example.test"])
 	}
-	if _, ok := byService["internal"]; ok {
-		t.Fatalf("internal service produced status: %#v", byService["internal"])
+	if byTarget["routes: https://good.example.test"].Health != core.HealthHealthy {
+		t.Fatalf("good fallback status = %#v, want healthy", byTarget["routes: https://good.example.test"])
+	}
+	for _, status := range statuses {
+		if status.ServiceID == "internal" {
+			t.Fatalf("internal service produced status: %#v", status)
+		}
 	}
 }
 
-func TestHTTPRouteCheckPrunesStaleRouteSpecificStatuses(t *testing.T) {
+func TestHTTPRouteCheckPrunesStaleRouteSpecificStatusesButKeepsOverrides(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	store, err := storage.Open(t.TempDir() + "/dashboard.db")
@@ -100,11 +108,33 @@ func TestHTTPRouteCheckPrunesStaleRouteSpecificStatuses(t *testing.T) {
 	defer store.Close()
 
 	staleTarget := "routes: https://old.example.test"
+	staleHistoryTarget := "routes: https://gone.example.test"
 	if err := store.UpsertStatus(ctx, core.StatusResult{
 		ServiceID: "app",
 		Target:    staleTarget,
 		Health:    core.HealthError,
 		Message:   "old failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "app", staleTarget, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    staleHistoryTarget,
+		Health:    core.HealthError,
+		Message:   "gone failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    "routes",
+		Health:    core.HealthHealthy,
+		Message:   "legacy aggregate status",
 		CheckedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -125,10 +155,135 @@ func TestHTTPRouteCheckPrunesStaleRouteSpecificStatuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(statuses) != 1 {
-		t.Fatalf("statuses = %#v, want one combined route target", statuses)
+		t.Fatalf("statuses = %#v, want one current route target", statuses)
 	}
-	if statuses[0].Target != "routes" || statuses[0].Health != core.HealthHealthy {
-		t.Fatalf("status = %#v, want healthy routes target", statuses[0])
+	if statuses[0].Target != "routes: https://app.example.test" || statuses[0].Health != core.HealthHealthy {
+		t.Fatalf("status = %#v, want healthy current route target", statuses[0])
+	}
+	ignored, err := store.MonitorNotApplicable(ctx, "app", staleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ignored {
+		t.Fatal("stale route override was pruned, want override to persist")
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Uptime) != 1 || summary.Uptime[0].Target != "routes: https://app.example.test" {
+		t.Fatalf("uptime = %#v, want only current route history", summary.Uptime)
+	}
+}
+
+func TestHTTPRouteCheckParentOverrideSuppressesRouteProbing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    "routes",
+		Health:    core.HealthHealthy,
+		Message:   "legacy route status",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "app", "routes", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var requests atomic.Int64
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return routeResponse(req, http.StatusOK), nil
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, []core.Service{
+		{ID: "app", Exposure: []string{"https://app.example.test", "https://other.example.test"}},
+	}, client); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("HTTP requests = %d, want 0", requests.Load())
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Target != "routes" || statuses[0].Health != core.HealthNotApplicable {
+		t.Fatalf("statuses = %#v, want only parent not_applicable status", statuses)
+	}
+}
+
+func TestHTTPRouteCheckPerRouteOverrideSkipsOnlyThatRoute(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	localTarget := "routes: http://10.10.10.20"
+	publicTarget := "routes: https://app.example.test"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    localTarget,
+		Health:    core.HealthError,
+		Message:   "dial failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "app", localTarget, true); err != nil {
+		t.Fatal(err)
+	}
+
+	var localRequests atomic.Int64
+	var publicRequests atomic.Int64
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case "10.10.10.20":
+			localRequests.Add(1)
+			return nil, errors.New("local route should not be probed")
+		case "app.example.test":
+			publicRequests.Add(1)
+			return routeResponse(req, http.StatusOK), nil
+		default:
+			return nil, errors.New("unexpected host: " + req.URL.Host)
+		}
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, []core.Service{
+		{ID: "app", Exposure: []string{"http://10.10.10.20", "https://app.example.test"}},
+	}, client); err != nil {
+		t.Fatal(err)
+	}
+	if localRequests.Load() != 0 {
+		t.Fatalf("local route requests = %d, want 0", localRequests.Load())
+	}
+	if publicRequests.Load() != 1 {
+		t.Fatalf("public route requests = %d, want 1", publicRequests.Load())
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTarget := map[string]core.StatusResult{}
+	for _, status := range statuses {
+		byTarget[status.Target] = status
+	}
+	if byTarget[localTarget].Health != core.HealthNotApplicable {
+		t.Fatalf("local status = %#v, want not_applicable", byTarget[localTarget])
+	}
+	if byTarget[publicTarget].Health != core.HealthHealthy {
+		t.Fatalf("public status = %#v, want healthy", byTarget[publicTarget])
 	}
 }
 

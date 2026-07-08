@@ -560,6 +560,27 @@ WHERE service_id=? AND target=? AND health=?
 	return tx.Commit()
 }
 
+func (store *Store) MonitorNotApplicable(ctx context.Context, serviceID, target string) (bool, error) {
+	serviceID = strings.TrimSpace(serviceID)
+	target = strings.TrimSpace(target)
+	if serviceID == "" || target == "" {
+		return false, nil
+	}
+	var ignored int
+	err := store.db.QueryRowContext(ctx, `
+SELECT COALESCE(not_applicable, 0)
+FROM monitor_overrides
+WHERE service_id=? AND target=?
+`, serviceID, target).Scan(&ignored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return ignored == 1, nil
+}
+
 func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarget, prefix string, keep []string) error {
 	keepTargets := map[string]struct{}{}
 	for _, target := range keep {
