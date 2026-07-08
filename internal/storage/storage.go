@@ -14,11 +14,28 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/hostinventory"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
 	db *sql.DB
+}
+
+type ReconcileStats struct {
+	RepositoriesRemoved  int64
+	ServicesRemoved      int64
+	StatusResultsRemoved int64
+	StatusHistoryRemoved int64
+	AgentsRemoved        int64
+}
+
+func (stats ReconcileStats) Changed() bool {
+	return stats.RepositoriesRemoved > 0 ||
+		stats.ServicesRemoved > 0 ||
+		stats.StatusResultsRemoved > 0 ||
+		stats.StatusHistoryRemoved > 0 ||
+		stats.AgentsRemoved > 0
 }
 
 func Open(path string) (*Store, error) {
@@ -92,6 +109,130 @@ ON CONFLICT(name) DO UPDATE SET url=excluded.url, default_ref=excluded.default_r
 	return nil
 }
 
+func (store *Store) ReconcileConfiguration(ctx context.Context, cfg config.Config) (ReconcileStats, error) {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, repo := range cfg.Repositories {
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO repositories(name, url, default_ref, status)
+VALUES(?, ?, ?, 'configured')
+ON CONFLICT(name) DO UPDATE SET url=excluded.url, default_ref=excluded.default_ref
+`, repo.Name, repo.URL, repo.DefaultRef)
+		if err != nil {
+			return ReconcileStats{}, fmt.Errorf("upsert repository %s: %w", repo.Name, err)
+		}
+	}
+
+	stats := ReconcileStats{}
+	allowedRepositories := configuredRepositories(cfg)
+	pingSources := configuredPingSources(cfg.Runtime.Ping)
+	for source := range pingSources {
+		allowedRepositories[source.repository] = struct{}{}
+	}
+
+	services, err := tx.QueryContext(ctx, `SELECT id, repository, runtime, source_path FROM services`)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	var staleServiceIDs []string
+	for services.Next() {
+		var id, repository, runtime, sourcePath string
+		if err := services.Scan(&id, &repository, &runtime, &sourcePath); err != nil {
+			_ = services.Close()
+			return ReconcileStats{}, err
+		}
+		_, repositoryAllowed := allowedRepositories[repository]
+		stale := !repositoryAllowed
+		if !stale && runtime == "host" {
+			_, configured := pingSources[serviceSourceKey{repository: repository, runtime: runtime, sourcePath: sourcePath}]
+			stale = !configured
+		}
+		if stale {
+			staleServiceIDs = append(staleServiceIDs, id)
+		}
+	}
+	if err := services.Close(); err != nil {
+		return ReconcileStats{}, err
+	}
+	for _, id := range staleServiceIDs {
+		statusResults, statusHistory, err := deleteStatusForService(ctx, tx, id)
+		if err != nil {
+			return ReconcileStats{}, err
+		}
+		stats.StatusResultsRemoved += statusResults
+		stats.StatusHistoryRemoved += statusHistory
+		result, err := tx.ExecContext(ctx, `DELETE FROM services WHERE id=?`, id)
+		if err != nil {
+			return ReconcileStats{}, err
+		}
+		stats.ServicesRemoved += affectedRows(result)
+	}
+
+	repositories, err := tx.QueryContext(ctx, `SELECT name FROM repositories`)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	var staleRepositories []string
+	for repositories.Next() {
+		var name string
+		if err := repositories.Scan(&name); err != nil {
+			_ = repositories.Close()
+			return ReconcileStats{}, err
+		}
+		if _, ok := allowedRepositories[name]; !ok {
+			staleRepositories = append(staleRepositories, name)
+		}
+	}
+	if err := repositories.Close(); err != nil {
+		return ReconcileStats{}, err
+	}
+	for _, name := range staleRepositories {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM scans WHERE repository=?`, name); err != nil {
+			return ReconcileStats{}, err
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM repositories WHERE name=?`, name)
+		if err != nil {
+			return ReconcileStats{}, err
+		}
+		stats.RepositoriesRemoved += affectedRows(result)
+	}
+
+	statusResults, err := deleteOrphanedStatusResults(ctx, tx)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	stats.StatusResultsRemoved += statusResults
+	statusHistory, err := deleteOrphanedStatusHistory(ctx, tx)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	stats.StatusHistoryRemoved += statusHistory
+
+	statusTargets := configuredStatusTargets(cfg)
+	removedResults, err := deleteUnconfiguredStatusResults(ctx, tx, statusTargets)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	stats.StatusResultsRemoved += removedResults
+	removedHistory, err := deleteUnconfiguredStatusHistory(ctx, tx, statusTargets)
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	stats.StatusHistoryRemoved += removedHistory
+
+	removedAgents, err := deleteUnconfiguredAgents(ctx, tx, configuredAgentTargets(cfg.Runtime.Docker))
+	if err != nil {
+		return ReconcileStats{}, err
+	}
+	stats.AgentsRemoved += removedAgents
+
+	return stats, tx.Commit()
+}
+
 func (store *Store) ReplaceConfiguredServices(ctx context.Context, repositoryName, source string, services []core.Service) error {
 	if source == "" {
 		source = repositoryName
@@ -117,36 +258,12 @@ ON CONFLICT(name) DO UPDATE SET
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id FROM services WHERE repository=?`, repositoryName)
+	currentIDs, err := currentServiceIDs(ctx, tx, `SELECT id FROM services WHERE repository=?`, repositoryName)
 	if err != nil {
 		return err
 	}
-	currentIDs := map[string]struct{}{}
-	for currentRows.Next() {
-		var id string
-		if err := currentRows.Scan(&id); err != nil {
-			_ = currentRows.Close()
-			return err
-		}
-		currentIDs[id] = struct{}{}
-	}
-	if err := currentRows.Close(); err != nil {
+	if err := deleteRemovedServiceStatuses(ctx, tx, currentIDs, services); err != nil {
 		return err
-	}
-	newIDs := map[string]struct{}{}
-	for _, service := range services {
-		newIDs[service.ID] = struct{}{}
-	}
-	for id := range currentIDs {
-		if _, ok := newIDs[id]; ok {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
-			return err
-		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repositoryName); err != nil {
 		return err
@@ -179,36 +296,12 @@ ON CONFLICT(name) DO NOTHING
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
+	currentIDs, err := currentServiceIDs(ctx, tx, `SELECT id FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
 	if err != nil {
 		return err
 	}
-	currentIDs := map[string]struct{}{}
-	for currentRows.Next() {
-		var id string
-		if err := currentRows.Scan(&id); err != nil {
-			_ = currentRows.Close()
-			return err
-		}
-		currentIDs[id] = struct{}{}
-	}
-	if err := currentRows.Close(); err != nil {
+	if err := deleteRemovedServiceStatuses(ctx, tx, currentIDs, services); err != nil {
 		return err
-	}
-	newIDs := map[string]struct{}{}
-	for _, service := range services {
-		newIDs[service.ID] = struct{}{}
-	}
-	for id := range currentIDs {
-		if _, ok := newIDs[id]; ok {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
-			return err
-		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source); err != nil {
 		return err
@@ -256,6 +349,13 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 		return err
 	}
 	if scanErr == nil {
+		currentIDs, err := currentServiceIDs(ctx, tx, `SELECT id FROM services WHERE repository=?`, repoName)
+		if err != nil {
+			return err
+		}
+		if err := deleteRemovedServiceStatuses(ctx, tx, currentIDs, services); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repoName); err != nil {
 			return err
 		}
@@ -284,6 +384,283 @@ INSERT INTO services(
 		return fmt.Errorf("insert service %s: %w", service.ID, err)
 	}
 	return nil
+}
+
+func currentServiceIDs(ctx context.Context, tx *sql.Tx, query string, args ...any) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := map[string]struct{}{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, rows.Err()
+}
+
+func deleteRemovedServiceStatuses(ctx context.Context, tx *sql.Tx, currentIDs map[string]struct{}, services []core.Service) error {
+	newIDs := map[string]struct{}{}
+	for _, service := range services {
+		newIDs[service.ID] = struct{}{}
+	}
+	for id := range currentIDs {
+		if _, ok := newIDs[id]; ok {
+			continue
+		}
+		if _, _, err := deleteStatusForService(ctx, tx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteStatusForService(ctx context.Context, tx *sql.Tx, serviceID string) (int64, int64, error) {
+	result, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, serviceID)
+	if err != nil {
+		return 0, 0, err
+	}
+	statusResults := affectedRows(result)
+	result, err = tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, serviceID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return statusResults, affectedRows(result), nil
+}
+
+func deleteOrphanedStatusResults(ctx context.Context, tx *sql.Tx) (int64, error) {
+	result, err := tx.ExecContext(ctx, `
+DELETE FROM status_results
+WHERE NOT EXISTS (
+  SELECT 1 FROM services WHERE services.id=status_results.service_id
+)
+`)
+	if err != nil {
+		return 0, err
+	}
+	return affectedRows(result), nil
+}
+
+func deleteOrphanedStatusHistory(ctx context.Context, tx *sql.Tx) (int64, error) {
+	result, err := tx.ExecContext(ctx, `
+DELETE FROM status_history
+WHERE NOT EXISTS (
+  SELECT 1 FROM services WHERE services.id=status_history.service_id
+)
+`)
+	if err != nil {
+		return 0, err
+	}
+	return affectedRows(result), nil
+}
+
+func deleteUnconfiguredStatusResults(ctx context.Context, tx *sql.Tx, targets statusTargetConfig) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT status_results.service_id, status_results.target, services.runtime
+FROM status_results
+JOIN services ON services.id=status_results.service_id
+`)
+	if err != nil {
+		return 0, err
+	}
+	type statusRow struct {
+		serviceID string
+		target    string
+		runtime   string
+	}
+	var stale []statusRow
+	for rows.Next() {
+		var row statusRow
+		if err := rows.Scan(&row.serviceID, &row.target, &row.runtime); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if !targets.allows(row.runtime, row.target) {
+			stale = append(stale, row)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var removed int64
+	for _, row := range stale {
+		result, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target=?`, row.serviceID, row.target)
+		if err != nil {
+			return 0, err
+		}
+		removed += affectedRows(result)
+	}
+	return removed, nil
+}
+
+func deleteUnconfiguredStatusHistory(ctx context.Context, tx *sql.Tx, targets statusTargetConfig) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT status_history.id, status_history.target, services.runtime
+FROM status_history
+JOIN services ON services.id=status_history.service_id
+`)
+	if err != nil {
+		return 0, err
+	}
+	type historyRow struct {
+		id      int64
+		target  string
+		runtime string
+	}
+	var stale []historyRow
+	for rows.Next() {
+		var row historyRow
+		if err := rows.Scan(&row.id, &row.target, &row.runtime); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if !targets.allows(row.runtime, row.target) {
+			stale = append(stale, row)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var removed int64
+	for _, row := range stale {
+		result, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE id=?`, row.id)
+		if err != nil {
+			return 0, err
+		}
+		removed += affectedRows(result)
+	}
+	return removed, nil
+}
+
+func deleteUnconfiguredAgents(ctx context.Context, tx *sql.Tx, allowed map[string]struct{}) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT target FROM agents`)
+	if err != nil {
+		return 0, err
+	}
+	var stale []string
+	for rows.Next() {
+		var target string
+		if err := rows.Scan(&target); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if _, ok := allowed[target]; !ok {
+			stale = append(stale, target)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	var removed int64
+	for _, target := range stale {
+		result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE target=?`, target)
+		if err != nil {
+			return 0, err
+		}
+		removed += affectedRows(result)
+	}
+	return removed, nil
+}
+
+type serviceSourceKey struct {
+	repository string
+	runtime    string
+	sourcePath string
+}
+
+type statusTargetConfig struct {
+	docker     map[string]struct{}
+	kubernetes map[string]struct{}
+	http       map[string]struct{}
+	ping       map[string]struct{}
+}
+
+func (targets statusTargetConfig) allows(runtime, target string) bool {
+	if _, ok := targets.http[target]; ok {
+		return true
+	}
+	switch runtime {
+	case "compose":
+		_, ok := targets.docker[target]
+		return ok
+	case "kubernetes":
+		_, ok := targets.kubernetes[target]
+		return ok
+	case "host":
+		_, ok := targets.ping[target]
+		return ok
+	default:
+		return false
+	}
+}
+
+func configuredRepositories(cfg config.Config) map[string]struct{} {
+	repositories := map[string]struct{}{}
+	for _, repo := range cfg.Repositories {
+		repositories[repo.Name] = struct{}{}
+	}
+	return repositories
+}
+
+func configuredPingSources(targets []config.PingTarget) map[serviceSourceKey]struct{} {
+	sources := map[serviceSourceKey]struct{}{}
+	for _, target := range targets {
+		sources[serviceSourceKey{
+			repository: hostinventory.RepositoryName(target),
+			runtime:    "host",
+			sourcePath: hostinventory.Source(target),
+		}] = struct{}{}
+	}
+	return sources
+}
+
+func configuredStatusTargets(cfg config.Config) statusTargetConfig {
+	targets := statusTargetConfig{
+		docker:     map[string]struct{}{},
+		kubernetes: map[string]struct{}{},
+		http:       map[string]struct{}{},
+		ping:       map[string]struct{}{},
+	}
+	for _, target := range cfg.Runtime.Docker {
+		targets.docker[target.Name] = struct{}{}
+	}
+	for _, target := range cfg.Runtime.Kubernetes {
+		targets.kubernetes[target.Name] = struct{}{}
+	}
+	for _, target := range cfg.Runtime.HTTP {
+		name := target.Name
+		if name == "" {
+			name = "routes"
+		}
+		targets.http[name] = struct{}{}
+	}
+	for _, target := range cfg.Runtime.Ping {
+		targets.ping[target.EffectiveName()] = struct{}{}
+	}
+	return targets
+}
+
+func configuredAgentTargets(targets []config.DockerTarget) map[string]struct{} {
+	agents := map[string]struct{}{}
+	for _, target := range targets {
+		if target.Kind == "agent" {
+			agents[target.Name] = struct{}{}
+		}
+	}
+	return agents
+}
+
+func affectedRows(result sql.Result) int64 {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0
+	}
+	return rows
 }
 
 func (store *Store) Summary(ctx context.Context) (core.DashboardSummary, error) {

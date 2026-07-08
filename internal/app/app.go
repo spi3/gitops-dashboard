@@ -36,9 +36,20 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := store.EnsureRepositories(context.Background(), cfg.Repositories); err != nil {
+	reconcileStats, err := store.ReconcileConfiguration(context.Background(), cfg)
+	if err != nil {
 		_ = store.Close()
 		return nil, err
+	}
+	if reconcileStats.Changed() {
+		logger.Info(
+			"database state reconciled with configuration",
+			"repositories_removed", reconcileStats.RepositoriesRemoved,
+			"services_removed", reconcileStats.ServicesRemoved,
+			"status_results_removed", reconcileStats.StatusResultsRemoved,
+			"status_history_removed", reconcileStats.StatusHistoryRemoved,
+			"agents_removed", reconcileStats.AgentsRemoved,
+		)
 	}
 	app := &App{
 		cfg:    cfg,

@@ -199,6 +199,296 @@ func TestReplaceRuntimeServicesPreservesOtherRepositoryServices(t *testing.T) {
 	}
 }
 
+func TestFinishScanRemovesStatusForRemovedServices(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	firstScan, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable := core.Service{
+		ID:           "stable",
+		Name:         "stable",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "compose.yaml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	removed := core.Service{
+		ID:           "removed",
+		Name:         "removed",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "compose.yaml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.FinishScan(ctx, firstScan, "repo", "abc123", []core.Service{stable, removed}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, serviceID := range []string{"stable", "removed"} {
+		if err := store.UpsertStatus(ctx, core.StatusResult{
+			ServiceID: serviceID,
+			Target:    "docker",
+			Health:    core.HealthHealthy,
+			Message:   "running",
+			CheckedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secondScan, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable.SourceCommit = "def456"
+	if err := store.FinishScan(ctx, secondScan, "repo", "def456", []core.Service{stable}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE service_id='removed'"); got != 0 {
+		t.Fatalf("removed service status_results rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='removed'"); got != 0 {
+		t.Fatalf("removed service status_history rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE service_id='stable'"); got != 1 {
+		t.Fatalf("stable service status_results rows = %d, want 1", got)
+	}
+}
+
+func TestReconcileConfigurationPurgesStaleConfiguredState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	composeKeep := core.Service{
+		ID:           "compose-keep",
+		Name:         "web",
+		Repository:   "keep",
+		SourceCommit: "abc123",
+		SourcePath:   "compose.yaml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	kubeKeep := core.Service{
+		ID:           "kube-keep",
+		Name:         "api",
+		Repository:   "keep",
+		SourceCommit: "abc123",
+		SourcePath:   "deployment.yaml",
+		Runtime:      "kubernetes",
+		Kind:         "Deployment",
+		Health:       core.HealthUnknown,
+	}
+	hostKeep := core.Service{
+		ID:           "host-keep",
+		Name:         "serenity",
+		Repository:   "keep",
+		SourceCommit: "abc123",
+		SourcePath:   "hosts.yml",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	hostStale := core.Service{
+		ID:           "host-stale",
+		Name:         "albert",
+		Repository:   "keep",
+		SourceCommit: "abc123",
+		SourcePath:   "old-hosts.yml",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "keep", "https://example.invalid/keep.git", []core.Service{composeKeep, kubeKeep, hostKeep, hostStale}); err != nil {
+		t.Fatal(err)
+	}
+	oldService := core.Service{
+		ID:           "old-service",
+		Name:         "old",
+		Repository:   "old",
+		SourceCommit: "abc123",
+		SourcePath:   "compose.yaml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "old", "https://example.invalid/old.git", []core.Service{oldService}); err != nil {
+		t.Fatal(err)
+	}
+	directKeep := core.Service{
+		ID:           "host-direct-keep",
+		Name:         "keep",
+		Repository:   "ping/keep",
+		SourceCommit: "",
+		SourcePath:   "keep.lan",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "ping/keep", "keep.lan", "host", []core.Service{directKeep}); err != nil {
+		t.Fatal(err)
+	}
+	directOld := core.Service{
+		ID:           "host-direct-old",
+		Name:         "old",
+		Repository:   "ping/old",
+		SourceCommit: "",
+		SourcePath:   "old.lan",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "ping/old", "old.lan", "host", []core.Service{directOld}); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := []core.StatusResult{
+		{ServiceID: "compose-keep", Target: "new-docker", Health: core.HealthHealthy, Message: "running"},
+		{ServiceID: "compose-keep", Target: "old-docker", Health: core.HealthHealthy, Message: "running"},
+		{ServiceID: "compose-keep", Target: "routes", Health: core.HealthHealthy, Message: "reachable"},
+		{ServiceID: "kube-keep", Target: "cluster", Health: core.HealthHealthy, Message: "found"},
+		{ServiceID: "kube-keep", Target: "old-cluster", Health: core.HealthHealthy, Message: "found"},
+		{ServiceID: "host-keep", Target: "homelab", Health: core.HealthHealthy, Message: "pong"},
+		{ServiceID: "host-keep", Target: "old-ping", Health: core.HealthHealthy, Message: "pong"},
+		{ServiceID: "host-direct-keep", Target: "keep", Health: core.HealthHealthy, Message: "pong"},
+		{ServiceID: "host-direct-old", Target: "old", Health: core.HealthHealthy, Message: "pong"},
+		{ServiceID: "old-service", Target: "old-docker", Health: core.HealthHealthy, Message: "running"},
+		{ServiceID: "missing-service", Target: "routes", Health: core.HealthHealthy, Message: "orphan"},
+	}
+	for i, status := range statuses {
+		status.CheckedAt = time.Now().UTC().Add(time.Duration(i) * time.Second)
+		if err := store.UpsertStatus(ctx, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertAgent(ctx, core.AgentMessage{Target: "agent-keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAgent(ctx, core.AgentMessage{Target: "agent-old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := store.ReconcileConfiguration(ctx, config.Config{
+		Repositories: []config.RepositoryConfig{{
+			Name:       "keep",
+			URL:        "https://example.invalid/keep.git",
+			DefaultRef: "main",
+		}},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{
+				{Name: "new-docker"},
+				{Name: "agent-keep", Kind: "agent"},
+			},
+			Kubernetes: []config.KubernetesTarget{{Name: "cluster"}},
+			HTTP:       []config.HTTPRouteTarget{{}},
+			Ping: []config.PingTarget{
+				{Name: "homelab", Repository: "keep", AnsibleInventory: "hosts.yml"},
+				{Name: "keep", Host: "keep.lan"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stats.Changed() {
+		t.Fatal("reconcile stats did not report any removed rows")
+	}
+
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceIDs := map[string]struct{}{}
+	for _, service := range summary.Services {
+		serviceIDs[service.ID] = struct{}{}
+	}
+	for _, serviceID := range []string{"compose-keep", "kube-keep", "host-keep", "host-direct-keep"} {
+		if _, ok := serviceIDs[serviceID]; !ok {
+			t.Fatalf("service %s missing after reconcile: %#v", serviceID, summary.Services)
+		}
+	}
+	for _, serviceID := range []string{"host-stale", "old-service", "host-direct-old"} {
+		if _, ok := serviceIDs[serviceID]; ok {
+			t.Fatalf("stale service %s remained after reconcile: %#v", serviceID, summary.Services)
+		}
+	}
+	repositories := map[string]struct{}{}
+	for _, repo := range summary.Repositories {
+		repositories[repo.Name] = struct{}{}
+	}
+	for _, repoName := range []string{"keep", "ping/keep"} {
+		if _, ok := repositories[repoName]; !ok {
+			t.Fatalf("repository %s missing after reconcile: %#v", repoName, summary.Repositories)
+		}
+	}
+	for _, repoName := range []string{"old", "ping/old"} {
+		if _, ok := repositories[repoName]; ok {
+			t.Fatalf("stale repository %s remained after reconcile: %#v", repoName, summary.Repositories)
+		}
+	}
+
+	statusTargets := map[string]map[string]struct{}{}
+	for _, status := range summary.Statuses {
+		if _, ok := statusTargets[status.ServiceID]; !ok {
+			statusTargets[status.ServiceID] = map[string]struct{}{}
+		}
+		statusTargets[status.ServiceID][status.Target] = struct{}{}
+	}
+	wantTargets := map[string][]string{
+		"compose-keep":     {"new-docker", "routes"},
+		"kube-keep":        {"cluster"},
+		"host-keep":        {"homelab"},
+		"host-direct-keep": {"keep"},
+	}
+	for serviceID, targets := range wantTargets {
+		for _, target := range targets {
+			if _, ok := statusTargets[serviceID][target]; !ok {
+				t.Fatalf("status %s/%s missing after reconcile: %#v", serviceID, target, summary.Statuses)
+			}
+		}
+	}
+	for _, target := range []string{"old-docker", "old-cluster", "old-ping", "old"} {
+		if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target='"+target+"'"); got != 0 {
+			t.Fatalf("stale status_results target %s rows = %d, want 0", target, got)
+		}
+		if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='"+target+"'"); got != 0 {
+			t.Fatalf("stale status_history target %s rows = %d, want 0", target, got)
+		}
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE service_id='missing-service'"); got != 0 {
+		t.Fatalf("orphan status_results rows = %d, want 0", got)
+	}
+	agents, err := store.Agents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Target != "agent-keep" {
+		t.Fatalf("agents = %#v, want only agent-keep", agents)
+	}
+}
+
 func countRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var count int
