@@ -76,14 +76,20 @@ Before using the example outside local testing, provide the same
 `GITOPS_DASHBOARD_AGENT_TOKEN` value to both containers through your container
 runtime, secret manager, or orchestrator.
 
-The dashboard accepts agent connections when the token matches either
-`auth.agent.tokens`, `auth.agent.tokenEnv`, `auth.agent.tokenFile`, a Docker
-target `agentToken`, `agentTokenEnv`, or `agentTokenFile`. The agent sends the
-token in the `X-Agent-Token` header.
+The dashboard accepts agent connections only when the token is sent in the
+`X-Agent-Token` header. Query-string tokens are rejected. Shared
+`auth.agent.tokens`, `auth.agent.tokenEnv`, and `auth.agent.tokenFile` values
+are authorized for the configured `kind: agent` Docker targets; per-target
+`agentToken`, `agentTokenEnv`, and `agentTokenFile` values are authorized only
+for that Docker target's name.
 
 The Docker target name and agent target must match. In the example, the server
 declares `runtime.docker[0].name: compose-docker-agent`, and the agent uses
 `agent.target: compose-docker-agent`.
+
+Browser WebSocket upgrades must come from the same host as the dashboard
+request, unless an origin is listed in `auth.agent.allowedOrigins`.
+Non-browser agents that omit the `Origin` header keep working unchanged.
 
 Minimal agent config:
 
@@ -102,13 +108,14 @@ Agent mode validates only the `agent` section, so server-only `auth`,
 `agent.yaml`.
 
 Agent reports appear on the dashboard's Agents tab with connection state and
-reported container state. Current agent limitation: `kind: agent` Docker targets
-do not yet feed per-service health or uptime rows. Per-service dashboard health
-is currently produced by direct Docker Engine targets, HTTP route checks, and
-Kubernetes targets.
+reported container state. Reports from configured `kind: agent` Docker targets
+also feed per-service health and uptime rows for matching Compose services.
+Per-service dashboard health can also be produced by direct Docker Engine
+targets, HTTP route checks, Kubernetes targets, and host ping targets.
 
-For per-service Docker health today, run the dashboard with a direct Docker
-target and mount or expose a Docker Engine API to the server:
+To have the dashboard server check a Docker Engine directly instead of using
+agent reports, configure a direct Docker target and mount or expose a Docker
+Engine API to the server:
 
 ```yaml
 runtime:

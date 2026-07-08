@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -129,6 +131,9 @@ func TestAgentEndpointRejectsInvalidToken(t *testing.T) {
 			Agent: config.AgentAuthCfg{Tokens: []string{"valid"}},
 		},
 		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{{Name: "serenity", Kind: "agent"}},
+		},
 	}
 	app, err := New(cfg, slog.Default())
 	if err != nil {
@@ -136,8 +141,231 @@ func TestAgentEndpointRejectsInvalidToken(t *testing.T) {
 	}
 	defer app.Close()
 	res := httptest.NewRecorder()
-	app.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/agents/connect?token=invalid", nil))
+	req := httptest.NewRequest(http.MethodGet, "/api/agents/connect", nil)
+	req.Header.Set(agentTokenHeader, "invalid")
+	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", res.Code)
 	}
+}
+
+func TestAgentEndpointRejectsQueryStringToken(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth: config.AuthConfig{
+			Mode:  "dev-no-auth",
+			Agent: config.AgentAuthCfg{Tokens: []string{"valid"}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{{Name: "serenity", Kind: "agent"}},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	res := httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/agents/connect?token=valid", nil))
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", res.Code)
+	}
+}
+
+func TestAgentEndpointRejectsCrossOriginUpgrade(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth: config.AuthConfig{
+			Mode:  "dev-no-auth",
+			Agent: config.AgentAuthCfg{Tokens: []string{"valid"}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{{Name: "serenity", Kind: "agent"}},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/agents/connect"
+	header := http.Header{
+		"Origin":         []string{"https://evil.example"},
+		agentTokenHeader: []string{"valid"},
+	}
+	conn, res, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err == nil {
+		conn.Close()
+		t.Fatal("cross-origin websocket upgrade succeeded, want rejection")
+	}
+	if res == nil || res.StatusCode != http.StatusForbidden {
+		status := 0
+		if res != nil {
+			status = res.StatusCode
+		}
+		t.Fatalf("status = %d, want 403", status)
+	}
+}
+
+func TestAgentEndpointRejectsMismatchedTargetReport(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{
+				{Name: "serenity", Kind: "agent", AgentToken: "serenity-token"},
+				{Name: "albert", Kind: "agent", AgentToken: "albert-token"},
+			},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/agents/connect"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{agentTokenHeader: []string{"serenity-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(core.AgentMessage{Target: "albert"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("mismatched target report left websocket open")
+	}
+	if closeErr, ok := err.(*websocket.CloseError); !ok || closeErr.Code != websocket.ClosePolicyViolation {
+		t.Fatalf("read error = %v, want close policy violation", err)
+	}
+	agents, err := app.store.Agents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("agents = %#v, want rejected report to remain unpersisted", agents)
+	}
+}
+
+func TestAgentWebSocketReadLimitClosesOversizedMessage(t *testing.T) {
+	oldReadLimit := agentWSReadLimit
+	agentWSReadLimit = 64
+	defer func() { agentWSReadLimit = oldReadLimit }()
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth: config.AuthConfig{
+			Mode:  "dev-no-auth",
+			Agent: config.AgentAuthCfg{Tokens: []string{"valid"}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{{Name: "serenity", Kind: "agent"}},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/agents/connect"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{agentTokenHeader: []string{"valid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"target":"serenity","containers":"`+strings.Repeat("x", 128)+`"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("oversized message left websocket open")
+	}
+	if isNetTimeout(err) {
+		t.Fatalf("read timed out waiting for close after oversized message: %v", err)
+	}
+}
+
+func TestAgentWebSocketReadDeadlineClosesIdleConnection(t *testing.T) {
+	oldPongWait := agentWSPongWait
+	oldPingPeriod := agentWSPingPeriod
+	agentWSPongWait = 100 * time.Millisecond
+	agentWSPingPeriod = 50 * time.Millisecond
+	defer func() {
+		agentWSPongWait = oldPongWait
+		agentWSPingPeriod = oldPingPeriod
+	}()
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth: config.AuthConfig{
+			Mode:  "dev-no-auth",
+			Agent: config.AgentAuthCfg{Tokens: []string{"valid"}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{{Name: "serenity", Kind: "agent"}},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/agents/connect"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{agentTokenHeader: []string{"valid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(250 * time.Millisecond)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("idle websocket remained open past read deadline")
+	}
+	if isNetTimeout(err) {
+		t.Fatalf("read timed out waiting for idle close: %v", err)
+	}
+}
+
+func isNetTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }

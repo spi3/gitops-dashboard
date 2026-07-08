@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,6 +20,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+var ErrAgentTargetUnauthorized = errors.New("agent target is not authorized for token")
 
 type Monitor struct {
 	cfg    config.Config
@@ -89,17 +92,18 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 	return combined
 }
 
-func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentMessage) error {
+func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentMessage, authorizedTargets []string) error {
+	target := strings.TrimSpace(message.Target)
+	if !agentTargetAllowed(target, authorizedTargets) {
+		return fmt.Errorf("%w: %q", ErrAgentTargetUnauthorized, target)
+	}
+	message.Target = target
 	if err := monitor.store.UpsertAgent(ctx, message); err != nil {
 		return err
 	}
 	services, err := monitor.store.Services(ctx)
 	if err != nil {
 		return err
-	}
-	target := strings.TrimSpace(message.Target)
-	if target == "" {
-		return nil
 	}
 	checkedAt := message.CheckedAt.UTC()
 	if checkedAt.IsZero() {
@@ -122,6 +126,18 @@ func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentM
 		}
 	}
 	return nil
+}
+
+func agentTargetAllowed(target string, authorizedTargets []string) bool {
+	if target == "" {
+		return false
+	}
+	for _, authorizedTarget := range authorizedTargets {
+		if target == strings.TrimSpace(authorizedTarget) {
+			return true
+		}
+	}
+	return false
 }
 
 func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTarget, interval time.Duration) {

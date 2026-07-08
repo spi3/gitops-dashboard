@@ -48,9 +48,10 @@ type AuthUser struct {
 }
 
 type AgentAuthCfg struct {
-	Tokens    []string `yaml:"tokens"`
-	TokenFile string   `yaml:"tokenFile"`
-	TokenEnv  string   `yaml:"tokenEnv"`
+	Tokens         []string `yaml:"tokens"`
+	TokenFile      string   `yaml:"tokenFile"`
+	TokenEnv       string   `yaml:"tokenEnv"`
+	AllowedOrigins []string `yaml:"allowedOrigins"`
 }
 
 type RepositoryConfig struct {

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -113,7 +114,7 @@ func TestApplyAgentReportPersistsMatchingComposeStatuses(t *testing.T) {
 			State:  "running",
 			Status: "Up 1 minute",
 		}},
-	})
+	}, []string{"serenity"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,6 +134,35 @@ func TestApplyAgentReportPersistsMatchingComposeStatuses(t *testing.T) {
 	}
 	if _, ok := byService["albert-web"]; ok {
 		t.Fatalf("albert-web should not be updated by serenity agent: %#v", byService["albert-web"])
+	}
+}
+
+func TestApplyAgentReportRejectsUnauthorizedTarget(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor := New(config.Config{}, store, slog.Default())
+	err = monitor.ApplyAgentReport(ctx, core.AgentMessage{
+		Target: "albert",
+		Containers: []core.ContainerStatus{{
+			Name:  "/stack-web-1",
+			Image: "example/web:v1",
+			State: "running",
+		}},
+	}, []string{"serenity"})
+	if !errors.Is(err, ErrAgentTargetUnauthorized) {
+		t.Fatalf("err = %v, want ErrAgentTargetUnauthorized", err)
+	}
+	agents, err := store.Agents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("agents = %#v, want no persisted report", agents)
 	}
 }
 

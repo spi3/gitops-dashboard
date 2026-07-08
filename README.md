@@ -133,20 +133,19 @@ The versioning policy for release tags, immutable image pins, and service
 version inventory is documented in [docs/versioning.md](docs/versioning.md).
 
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
-`X-Agent-Token` value. The server must accept the same token through
-`auth.agent.tokens`, `auth.agent.tokenEnv`, `auth.agent.tokenFile`, a Docker
-target `agentToken`, `agentTokenEnv`, or `agentTokenFile`. Expected mounts,
-token configuration, and the full agent config shape are documented in
+`X-Agent-Token` value. Tokens are sent only by header and are authorized against
+configured `kind: agent` Docker target names. Expected mounts, token
+configuration, target binding, and the full agent config shape are documented in
 [docs/deployment.md](docs/deployment.md).
 
 Agent reports appear on the dashboard's Agents tab with connection state and
-reported container state. Current limitation: `kind: agent` Docker targets do
-not yet feed per-service health or uptime rows. Today, dashboard health rows
-come from direct Docker Engine targets, HTTP route checks, Kubernetes targets,
-and host ping targets.
+reported container state. Reports from configured `kind: agent` Docker targets
+also feed per-service health and uptime rows for matching Compose services.
+Dashboard health rows can also come from direct Docker Engine targets, HTTP
+route checks, Kubernetes targets, and host ping targets.
 
-To get per-service Docker health rows today, configure a direct Docker target on
-the dashboard server:
+To check a Docker Engine directly from the dashboard server instead of through
+an agent, configure a direct Docker target:
 
 ```yaml
 runtime:

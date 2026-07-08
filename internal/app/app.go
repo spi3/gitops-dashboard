@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/example/gitops-dashboard/internal/auth"
 	"github.com/example/gitops-dashboard/internal/config"
@@ -23,14 +26,27 @@ import (
 )
 
 type App struct {
-	cfg      config.Config
-	store    *storage.Store
-	scanner  scanner.Scanner
-	monitor  monitor.Monitor
-	auth     auth.BasicAuth
-	logger   *slog.Logger
-	upgrader websocket.Upgrader
+	cfg       config.Config
+	store     *storage.Store
+	scanner   scanner.Scanner
+	monitor   monitor.Monitor
+	auth      auth.BasicAuth
+	agentAuth auth.AgentTokenAuthenticator
+	logger    *slog.Logger
+	upgrader  websocket.Upgrader
 }
+
+const (
+	agentTokenHeader = "X-Agent-Token"
+	agentTokenQuery  = "token"
+)
+
+var (
+	agentWSReadLimit  int64 = 1 << 20
+	agentWSPongWait         = 60 * time.Second
+	agentWSPingPeriod       = 54 * time.Second
+	agentWSWriteWait        = 10 * time.Second
+)
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	dbPath := filepath.Join(cfg.Server.DataDir, "gitops-dashboard.db")
@@ -48,14 +64,13 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	app := &App{
-		cfg:    cfg,
-		store:  store,
-		auth:   auth.New(cfg.Auth),
-		logger: logger,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
+		cfg:       cfg,
+		store:     store,
+		auth:      auth.New(cfg.Auth),
+		agentAuth: auth.NewAgentTokenAuthenticator(cfg),
+		logger:    logger,
 	}
+	app.upgrader.CheckOrigin = app.checkAgentOrigin
 	app.scanner = scanner.New(cfg, store, logger)
 	app.monitor = monitor.New(cfg, store, logger)
 	if err := app.monitor.SyncPingTargets(context.Background()); err != nil {
@@ -205,11 +220,13 @@ func (app *App) monitorOverride(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("X-Agent-Token")
-	if token == "" {
-		token = r.URL.Query().Get("token")
+	if r.URL.Query().Has(agentTokenQuery) {
+		app.logger.Warn("agent authentication rejected query-string token")
+		http.Error(w, "agent token must be supplied in X-Agent-Token", http.StatusUnauthorized)
+		return
 	}
-	if !app.validAgentToken(token) {
+	binding, ok := app.agentAuth.Authenticate(r.Header.Get(agentTokenHeader))
+	if !ok {
 		http.Error(w, "agent authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -218,34 +235,117 @@ func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(agentWSReadLimit)
+	_ = conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
+	})
+	stopPings := make(chan struct{})
+	defer close(stopPings)
+	go pingAgentConnection(conn, stopPings)
+
+	authorizedTargets := binding.Targets()
 	for {
 		var message core.AgentMessage
 		if err := conn.ReadJSON(&message); err != nil {
 			app.logger.Info("agent disconnected", "error", err)
 			return
 		}
-		if err := app.monitor.ApplyAgentReport(r.Context(), message); err != nil {
+		if err := app.monitor.ApplyAgentReport(r.Context(), message, authorizedTargets); err != nil {
+			if errors.Is(err, monitor.ErrAgentTargetUnauthorized) {
+				app.logger.Warn("agent report rejected unauthorized target", "target", message.Target, "authorizedTargets", authorizedTargets)
+				closeAgentConnection(conn, websocket.ClosePolicyViolation, "agent target is not authorized")
+				return
+			}
 			app.logger.Error("agent status persist failed", "error", err)
 			return
 		}
 	}
 }
 
-func (app *App) validAgentToken(token string) bool {
-	if token == "" {
+func pingAgentConnection(conn *websocket.Conn, done <-chan struct{}) {
+	ticker := time.NewTicker(agentWSPingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentWSWriteWait)); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func closeAgentConnection(conn *websocket.Conn, code int, text string) {
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, text), time.Now().Add(agentWSWriteWait))
+}
+
+func (app *App) checkAgentOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, ok := parseHTTPOrigin(origin)
+	if !ok {
+		app.logger.Warn("agent websocket origin rejected", "origin", origin, "host", r.Host)
 		return false
 	}
-	for _, candidate := range app.cfg.Auth.Agent.Tokens {
-		if candidate == token {
+	if originMatchesRequestHost(parsed, r.Host) {
+		return true
+	}
+	for _, allowedOrigin := range app.cfg.Auth.Agent.AllowedOrigins {
+		allowed, ok := parseHTTPOrigin(allowedOrigin)
+		if !ok {
+			continue
+		}
+		if sameOrigin(parsed, allowed) {
 			return true
 		}
 	}
-	for _, target := range app.cfg.Runtime.Docker {
-		if target.AgentToken == token {
-			return true
-		}
-	}
+	app.logger.Warn("agent websocket origin rejected", "origin", origin, "host", r.Host)
 	return false
+}
+
+func parseHTTPOrigin(value string) (*url.URL, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" {
+		return nil, false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, false
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return nil, false
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, false
+	}
+	return parsed, true
+}
+
+func originMatchesRequestHost(origin *url.URL, requestHost string) bool {
+	originHost := canonicalOriginHost(origin.Scheme, origin.Host)
+	return originHost == canonicalOriginHost("http", requestHost) || originHost == canonicalOriginHost("https", requestHost)
+}
+
+func sameOrigin(left, right *url.URL) bool {
+	return strings.EqualFold(left.Scheme, right.Scheme) && canonicalOriginHost(left.Scheme, left.Host) == canonicalOriginHost(right.Scheme, right.Host)
+}
+
+func canonicalOriginHost(scheme, host string) string {
+	hostname, port, err := net.SplitHostPort(host)
+	if err != nil {
+		hostname = strings.Trim(host, "[]")
+		port = ""
+	}
+	hostname = strings.ToLower(strings.Trim(hostname, "[]"))
+	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return hostname
+	}
+	return hostname + ":" + port
 }
 
 func (app *App) staticHandler() http.Handler {
