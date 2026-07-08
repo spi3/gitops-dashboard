@@ -124,6 +124,8 @@ func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (cor
 		return core.HealthHealthy, message
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		return core.HealthHealthy, message
+	case statusCode == http.StatusNotFound || statusCode == http.StatusGone:
+		return core.HealthUnhealthy, message
 	case statusCode >= 400 && statusCode < 500:
 		return core.HealthDegraded, message
 	default:

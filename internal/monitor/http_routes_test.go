@@ -27,6 +27,7 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	services := []core.Service{
 		{ID: "up", Exposure: []string{"https://up.example.test"}},
 		{ID: "down", Exposure: []string{"https://down.example.test"}},
+		{ID: "missing", Exposure: []string{"https://missing.example.test"}},
 		{ID: "get-only", Exposure: []string{"https://get-only.example.test"}},
 		{ID: "fallback", Exposure: []string{"https://bad.example.test", "https://good.example.test"}},
 		{ID: "internal", Exposure: []string{"service/api", "http://api"}},
@@ -40,6 +41,8 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 			status = http.StatusOK
 		case "down.example.test":
 			status = http.StatusServiceUnavailable
+		case "missing.example.test":
+			status = http.StatusNotFound
 		case "get-only.example.test":
 			if req.Method == http.MethodHead {
 				status = http.StatusMethodNotAllowed
@@ -67,6 +70,9 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	}
 	if byService["down"].Health != core.HealthUnhealthy {
 		t.Fatalf("down health = %s, want unhealthy", byService["down"].Health)
+	}
+	if byService["missing"].Health != core.HealthUnhealthy {
+		t.Fatalf("missing health = %s, want unhealthy", byService["missing"].Health)
 	}
 	if byService["get-only"].Health != core.HealthHealthy {
 		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
