@@ -15,11 +15,13 @@
   --down: #d03b3b;
   --failed: #ec835a;
   --nodata: #898781;
+  --na: #68746f;
   --up-text: #006300;
   --degraded-text: #845d00;
   --down-text: #b52f2f;
   --failed-text: #a04a26;
   --nodata-text: #5f6a65;
+  --na-text: #56635e;
   --tick-ring: rgba(19, 26, 23, 0.14);
   --scrim: rgba(15, 24, 21, 0.4);
   --shadow: 0 1px 2px rgba(15, 24, 21, 0.05);
@@ -47,6 +49,7 @@
   --down-text: #e05f5f;
   --failed-text: #ec835a;
   --nodata-text: #93a09a;
+  --na-text: #9ba8a2;
   --tick-ring: rgba(238, 244, 241, 0.08);
   --scrim: rgba(2, 6, 5, 0.6);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
@@ -479,6 +482,7 @@ main {
 .dot.unhealthy { background: var(--down); }
 .dot.error { background: var(--failed); }
 .dot.unknown { background: var(--nodata); }
+.dot.not_applicable { background: var(--na); }
 
 .stateWord {
   font-size: 12px;
@@ -491,6 +495,7 @@ main {
 .stateWord.unhealthy { color: var(--down-text); }
 .stateWord.error { color: var(--failed-text); }
 .stateWord.unknown { color: var(--nodata-text); }
+.stateWord.not_applicable { color: var(--na-text); }
 
 .doorRow {
   align-items: center;
@@ -562,6 +567,7 @@ main {
 .tick.unhealthy { background: var(--down); }
 .tick.error { background: var(--failed); }
 .tick.unknown { background: var(--nodata); }
+.tick.not_applicable { background: var(--na); }
 
 .tick.empty {
   background: transparent;
@@ -766,6 +772,10 @@ main {
   padding-top: 14px;
 }
 
+.targetBlock.notApplicable {
+  color: var(--ink-3);
+}
+
 .targetHead {
   align-items: baseline;
   display: flex;
@@ -787,6 +797,28 @@ main {
   color: var(--ink-2);
   font-size: 13px;
   margin: 0;
+}
+
+.targetToggle {
+  align-self: flex-start;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 10px;
+}
+
+.targetToggle:hover {
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+
+.targetToggle:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .statusFallback {

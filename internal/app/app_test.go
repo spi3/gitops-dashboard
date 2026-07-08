@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
@@ -111,6 +112,70 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("frontend status = %d", res.Code)
+	}
+}
+
+func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if err := app.store.ReplaceConfiguredServices(context.Background(), "repo", "prod/compose.yaml", []core.Service{{
+		ID:          "svc",
+		Name:        "api",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	target := "routes: http://10.10.10.20"
+	if err := app.store.UpsertStatus(context.Background(), core.StatusResult{
+		ServiceID: "svc",
+		Target:    target,
+		Health:    core.HealthError,
+		Message:   "dial failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes: http://10.10.10.20","notApplicable":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("override status = %d, body=%q", res.Code, res.Body.String())
+	}
+	summary, err := app.store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Statuses[0].Health != core.HealthNotApplicable {
+		t.Fatalf("status health = %s, want not_applicable", summary.Statuses[0].Health)
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"missing","notApplicable":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("missing override status = %d, want 404", res.Code)
 	}
 }
 

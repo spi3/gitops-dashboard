@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -76,6 +77,7 @@ func (app *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/summary", app.summary)
 	mux.HandleFunc("POST /api/scan", app.scan)
 	mux.HandleFunc("POST /api/monitor", app.checkMonitor)
+	mux.HandleFunc("POST /api/monitor-overrides", app.monitorOverride)
 	mux.HandleFunc("GET /api/agents/connect", app.agentConnect)
 	mux.Handle("GET /", app.staticHandler())
 	return app.auth.Middleware(mux)
@@ -151,6 +153,33 @@ func (app *App) scan(w http.ResponseWriter, r *http.Request) {
 
 func (app *App) checkMonitor(w http.ResponseWriter, r *http.Request) {
 	if err := app.monitor.CheckAll(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+type monitorOverrideRequest struct {
+	ServiceID     string `json:"serviceId"`
+	Target        string `json:"target"`
+	NotApplicable bool   `json:"notApplicable"`
+}
+
+func (app *App) monitorOverride(w http.ResponseWriter, r *http.Request) {
+	var request monitorOverrideRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if request.ServiceID == "" || request.Target == "" {
+		http.Error(w, "serviceId and target are required", http.StatusBadRequest)
+		return
+	}
+	if err := app.store.SetMonitorNotApplicable(r.Context(), request.ServiceID, request.Target, request.NotApplicable); err != nil {
+		if errors.Is(err, storage.ErrStatusNotFound) {
+			http.Error(w, "monitor target not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

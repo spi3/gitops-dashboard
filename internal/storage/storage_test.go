@@ -406,6 +406,21 @@ func TestSummaryHealthAggregatesAcrossTargets(t *testing.T) {
 			},
 			want: core.HealthError,
 		},
+		{
+			name: "not applicable targets are ignored",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "routes: http://10.10.10.20", Health: core.HealthNotApplicable, CheckedAt: statusTime},
+				{ServiceID: "svc", Target: "routes: https://app.example.test", Health: core.HealthHealthy, CheckedAt: statusTime},
+			},
+			want: core.HealthHealthy,
+		},
+		{
+			name: "only not applicable targets leave health unknown",
+			statuses: []core.StatusResult{
+				{ServiceID: "svc", Target: "routes: http://10.10.10.20", Health: core.HealthNotApplicable, CheckedAt: statusTime},
+			},
+			want: core.HealthUnknown,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -415,6 +430,96 @@ func TestSummaryHealthAggregatesAcrossTargets(t *testing.T) {
 				t.Fatalf("health = %s, want %s", services[0].Health, tc.want)
 			}
 		})
+	}
+}
+
+func TestSetMonitorNotApplicableRemovesTargetFromHealthAndUptime(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "svc-app",
+		Name:        "app",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	goodTarget := "routes: https://app.example.test"
+	badTarget := "routes: http://10.10.10.20"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-app", Target: goodTarget, Health: core.HealthHealthy, Message: "ok", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-app", Target: badTarget, Health: core.HealthError, Message: "dial failed", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Services[0].Health != core.HealthDegraded {
+		t.Fatalf("pre-override service health = %s, want degraded", summary.Services[0].Health)
+	}
+	if len(summary.Uptime) != 2 {
+		t.Fatalf("pre-override uptime = %#v, want two targets", summary.Uptime)
+	}
+
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", badTarget, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-app", Target: badTarget, Health: core.HealthError, Message: "dial failed again", CheckedAt: base.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Services[0].Health != core.HealthHealthy {
+		t.Fatalf("post-override service health = %s, want healthy", summary.Services[0].Health)
+	}
+	statusByTarget := map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		statusByTarget[status.Target] = status
+	}
+	if statusByTarget[badTarget].Health != core.HealthNotApplicable {
+		t.Fatalf("ignored status = %#v, want not_applicable", statusByTarget[badTarget])
+	}
+	if len(summary.Uptime) != 1 || summary.Uptime[0].Target != goodTarget {
+		t.Fatalf("post-override uptime = %#v, want only good target", summary.Uptime)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-app' AND target='routes: http://10.10.10.20'"); got != 0 {
+		t.Fatalf("ignored status history rows = %d, want 0", got)
+	}
+
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", badTarget, false); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusByTarget = map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		statusByTarget[status.Target] = status
+	}
+	if statusByTarget[badTarget].Health != core.HealthUnknown {
+		t.Fatalf("re-enabled status = %#v, want unknown until next check", statusByTarget[badTarget])
 	}
 }
 

@@ -61,29 +61,34 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	byService := map[string]core.StatusResult{}
+	byServiceTarget := map[string]core.StatusResult{}
 	for _, status := range statuses {
-		byService[status.ServiceID] = status
+		byServiceTarget[status.ServiceID+"\x00"+status.Target] = status
 	}
-	if byService["up"].Health != core.HealthHealthy {
-		t.Fatalf("up health = %s, want healthy", byService["up"].Health)
+	if byServiceTarget["up\x00routes: https://up.example.test"].Health != core.HealthHealthy {
+		t.Fatalf("up status = %#v, want healthy", byServiceTarget["up\x00routes: https://up.example.test"])
 	}
-	if byService["down"].Health != core.HealthUnhealthy {
-		t.Fatalf("down health = %s, want unhealthy", byService["down"].Health)
+	if byServiceTarget["down\x00routes: https://down.example.test"].Health != core.HealthUnhealthy {
+		t.Fatalf("down status = %#v, want unhealthy", byServiceTarget["down\x00routes: https://down.example.test"])
 	}
-	if byService["missing"].Health != core.HealthUnhealthy {
-		t.Fatalf("missing health = %s, want unhealthy", byService["missing"].Health)
+	if byServiceTarget["missing\x00routes: https://missing.example.test"].Health != core.HealthUnhealthy {
+		t.Fatalf("missing status = %#v, want unhealthy", byServiceTarget["missing\x00routes: https://missing.example.test"])
 	}
-	if byService["get-only"].Health != core.HealthHealthy {
-		t.Fatalf("get-only health = %s, want healthy", byService["get-only"].Health)
+	if byServiceTarget["get-only\x00routes: https://get-only.example.test"].Health != core.HealthHealthy {
+		t.Fatalf("get-only status = %#v, want healthy", byServiceTarget["get-only\x00routes: https://get-only.example.test"])
 	}
-	if byService["fallback"].Health != core.HealthDegraded ||
-		!strings.Contains(byService["fallback"].Message, "1/2 route checks passing") ||
-		!strings.Contains(byService["fallback"].Message, "bad.example.test") {
-		t.Fatalf("fallback status = %#v, want degraded mixed route checks", byService["fallback"])
+	badFallback := byServiceTarget["fallback\x00routes: https://bad.example.test"]
+	goodFallback := byServiceTarget["fallback\x00routes: https://good.example.test"]
+	if badFallback.Health != core.HealthError || !strings.Contains(badFallback.Message, "bad.example.test") {
+		t.Fatalf("bad fallback status = %#v, want error route check", badFallback)
 	}
-	if _, ok := byService["internal"]; ok {
-		t.Fatalf("internal service produced status: %#v", byService["internal"])
+	if goodFallback.Health != core.HealthHealthy || !strings.Contains(goodFallback.Message, "good.example.test") {
+		t.Fatalf("good fallback status = %#v, want healthy route check", goodFallback)
+	}
+	for _, status := range byServiceTarget {
+		if status.ServiceID == "internal" {
+			t.Fatalf("internal service produced status: %#v", status)
+		}
 	}
 }
 

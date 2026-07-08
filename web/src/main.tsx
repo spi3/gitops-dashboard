@@ -4,7 +4,7 @@ import "@fontsource-variable/bricolage-grotesque/index.css";
 import "@fontsource-variable/jetbrains-mono/index.css";
 import "./styles.css";
 
-type Health = "healthy" | "degraded" | "unhealthy" | "unknown" | "error";
+type Health = "healthy" | "degraded" | "unhealthy" | "unknown" | "error" | "not_applicable";
 type Theme = "light" | "dark";
 type Tone = "steady" | "pending" | "watch" | "alert";
 
@@ -64,6 +64,12 @@ type TargetSample = {
   sample: UptimeSample;
 };
 
+type MonitorTargetDetail = {
+  target: string;
+  status: StatusResult | null;
+  uptime: UptimeStat | null;
+};
+
 type ContainerStatus = {
   id: string;
   name: string;
@@ -105,7 +111,8 @@ const statusWord: Record<Health, string> = {
   degraded: "Degraded",
   unhealthy: "Down",
   unknown: "No data",
-  error: "Check failed"
+  error: "Check failed",
+  not_applicable: "Not applicable"
 };
 
 const tallyWord: Record<Health, string> = {
@@ -113,7 +120,8 @@ const tallyWord: Record<Health, string> = {
   degraded: "degraded",
   unhealthy: "down",
   unknown: "unchecked",
-  error: "failed"
+  error: "failed",
+  not_applicable: "not applicable"
 };
 
 const attentionStates: Health[] = ["degraded", "unhealthy", "error"];
@@ -123,7 +131,8 @@ const serviceSortOrder: Record<Health, number> = {
   unhealthy: 1,
   degraded: 2,
   healthy: 3,
-  unknown: 4
+  unknown: 4,
+  not_applicable: 5
 };
 
 const environmentSortOrder: Record<string, number> = {
@@ -166,6 +175,7 @@ function App() {
   const [attentionOnly, setAttentionOnly] = useState<boolean>(false);
   const [selectedServiceId, setSelectedServiceId] = useState<string>("");
   const [busyAction, setBusyAction] = useState<string>("");
+  const [busyMonitorOverride, setBusyMonitorOverride] = useState<string>("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [activeTab, setActiveTab] = useState<Tab>(tabFromHash);
   const [selectedAgentTarget, setSelectedAgentTarget] = useState<string>("");
@@ -196,6 +206,26 @@ function App() {
       setError(err instanceof Error ? err.message : `/api/${action} failed`);
     } finally {
       setBusyAction("");
+    }
+  }, [load]);
+
+  const setMonitorNotApplicable = useCallback(async (serviceId: string, target: string, notApplicable: boolean) => {
+    const key = monitorOverrideKey(serviceId, target);
+    setBusyMonitorOverride(key);
+    try {
+      const response = await fetch("/api/monitor-overrides", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ serviceId, target, notApplicable })
+      });
+      if (!response.ok) {
+        throw new Error(`/api/monitor-overrides failed: ${response.status}`);
+      }
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "monitor override failed");
+    } finally {
+      setBusyMonitorOverride("");
     }
   }, [load]);
 
@@ -486,7 +516,9 @@ function App() {
 
       {selectedService ? (
         <ServiceDrawer
+          busyMonitorOverride={busyMonitorOverride}
           onClose={() => setSelectedServiceId("")}
+          onSetMonitorNotApplicable={setMonitorNotApplicable}
           service={selectedService}
           statuses={(summary?.statuses ?? []).filter((status) => status.serviceId === selectedService.id)}
           uptime={uptimeByService.get(selectedService.id) ?? []}
@@ -575,8 +607,10 @@ function PulseStrip({ samples, slots, wide }: { samples: UptimeSample[]; slots: 
   );
 }
 
-function ServiceDrawer({ onClose, service, statuses, uptime }: {
+function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable, service, statuses, uptime }: {
+  busyMonitorOverride: string;
   onClose: () => void;
+  onSetMonitorNotApplicable: (serviceId: string, target: string, notApplicable: boolean) => void;
   service: Service;
   statuses: StatusResult[];
   uptime: UptimeStat[];
@@ -584,6 +618,7 @@ function ServiceDrawer({ onClose, service, statuses, uptime }: {
   const closeRef = useRef<HTMLButtonElement>(null);
   const routes = accessTargets(service);
   const commit = service.sourceCommit ? service.sourceCommit.slice(0, 7) : "";
+  const targets = monitorTargetDetails(statuses, uptime);
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -635,31 +670,41 @@ function ServiceDrawer({ onClose, service, statuses, uptime }: {
 
         <section className="drawerSection">
           <h3>Uptime</h3>
-          {uptime.length ? uptime.map((stat) => {
-            const last = stat.samples[stat.samples.length - 1] ?? null;
+          {targets.length ? targets.map((target) => {
+            const last = target.uptime?.samples[target.uptime.samples.length - 1] ?? null;
+            const ignored = target.status?.health === "not_applicable";
+            const busy = busyMonitorOverride === monitorOverrideKey(service.id, target.target);
             return (
-              <div className="targetBlock" key={stat.target}>
+              <div className={`targetBlock ${ignored ? "notApplicable" : ""}`} key={target.target}>
                 <div className="targetHead">
-                  <strong>{stat.target}</strong>
-                  <span>{stat.checkCount > 0 ? `${stat.uptimePercent}% · ${stat.checkCount} ${plural(stat.checkCount, "check")} · 24h` : "no checks yet"}</span>
+                  <strong>{target.target}</strong>
+                  <span>{targetDetailMeta(target)}</span>
                 </div>
-                <PulseStrip samples={stat.samples} slots={drawerSlots} wide />
-                {last ? (
+                {target.uptime ? <PulseStrip samples={target.uptime.samples} slots={drawerSlots} wide /> : null}
+                {ignored ? (
+                  <p className="targetNote">
+                    {statusWord.not_applicable}{target.status?.message ? ` — ${target.status.message}` : ""}
+                  </p>
+                ) : last ? (
                   <p className="targetNote">
                     {statusWord[last.health]}{last.message ? ` — ${last.message}` : ""} {"·"} {relativeTime(last.checkedAt)}
                   </p>
+                ) : target.status ? (
+                  <p className="targetNote">
+                    {statusWord[target.status.health]}{target.status.message ? ` — ${target.status.message}` : ""} {"·"} {relativeTime(target.status.checkedAt)}
+                  </p>
                 ) : null}
+                <button
+                  className="targetToggle"
+                  disabled={busy}
+                  onClick={() => onSetMonitorNotApplicable(service.id, target.target, !ignored)}
+                  type="button"
+                >
+                  {busy ? "Saving..." : ignored ? "Enable monitor" : "Mark not applicable"}
+                </button>
               </div>
             );
-          }) : statuses.length ? (
-            <ul className="statusFallback">
-              {statuses.map((status) => (
-                <li key={`${status.serviceId}-${status.target}`}>
-                  <strong>{status.target}</strong> {statusWord[status.health]}{status.message ? ` — ${status.message}` : ""}
-                </li>
-              ))}
-            </ul>
-          ) : (
+          }) : (
             <p className="quiet">No checks yet. Check now to see live status.</p>
           )}
         </section>
@@ -900,7 +945,8 @@ function countByHealth(services: Service[]) {
     degraded: 0,
     unhealthy: 0,
     unknown: 0,
-    error: 0
+    error: 0,
+    not_applicable: 0
   };
   for (const service of services) {
     counts[service.health] += 1;
@@ -963,6 +1009,7 @@ function aggregateUptimeSamples(stats: UptimeStat[]): UptimeSample[] {
 }
 
 function aggregateSampleHealth(healths: Health[]): Health {
+  healths = healths.filter((health) => health !== "not_applicable");
   if (healths.length === 0) {
     return "unknown";
   }
@@ -993,6 +1040,7 @@ function latestSampleTime(samples: TargetSample[]): string {
 }
 
 function aggregateSampleMessage(samples: TargetSample[]): string {
+  samples = samples.filter(({ sample }) => sample.health !== "not_applicable");
   const failing = samples.filter(({ sample }) => sample.health !== "healthy");
   if (failing.length === 0) {
     return samples.length > 1 ? "All checks passed" : samples[0]?.sample.message ?? "";
@@ -1022,11 +1070,47 @@ function latestCheckTime(uptime: UptimeStat[], statuses: StatusResult[]): string
     }
   }
   for (const status of statuses) {
+    if (status.health === "not_applicable") {
+      continue;
+    }
     if (status.checkedAt && status.checkedAt > latest) {
       latest = status.checkedAt;
     }
   }
   return latest;
+}
+
+function monitorTargetDetails(statuses: StatusResult[], uptime: UptimeStat[]): MonitorTargetDetail[] {
+  const byTarget = new Map<string, MonitorTargetDetail>();
+  for (const stat of uptime) {
+    byTarget.set(stat.target, { target: stat.target, status: null, uptime: stat });
+  }
+  for (const status of statuses) {
+    const detail = byTarget.get(status.target);
+    if (detail) {
+      detail.status = status;
+    } else {
+      byTarget.set(status.target, { target: status.target, status, uptime: null });
+    }
+  }
+  return Array.from(byTarget.values()).sort((left, right) => left.target.localeCompare(right.target));
+}
+
+function targetDetailMeta(target: MonitorTargetDetail): string {
+  if (target.status?.health === "not_applicable") {
+    return "not applicable";
+  }
+  if (target.uptime && target.uptime.checkCount > 0) {
+    return `${target.uptime.uptimePercent}% · ${target.uptime.checkCount} ${plural(target.uptime.checkCount, "check")} · 24h`;
+  }
+  if (target.status) {
+    return statusWord[target.status.health];
+  }
+  return "no checks yet";
+}
+
+function monitorOverrideKey(serviceId: string, target: string): string {
+  return `${serviceId}\u0000${target}`;
 }
 
 function stripLabel(samples: UptimeSample[]): string {

@@ -5,11 +5,12 @@ import "time"
 type HealthState string
 
 const (
-	HealthHealthy   HealthState = "healthy"
-	HealthDegraded  HealthState = "degraded"
-	HealthUnhealthy HealthState = "unhealthy"
-	HealthUnknown   HealthState = "unknown"
-	HealthError     HealthState = "error"
+	HealthHealthy       HealthState = "healthy"
+	HealthDegraded      HealthState = "degraded"
+	HealthUnhealthy     HealthState = "unhealthy"
+	HealthUnknown       HealthState = "unknown"
+	HealthError         HealthState = "error"
+	HealthNotApplicable HealthState = "not_applicable"
 )
 
 type Repository struct {

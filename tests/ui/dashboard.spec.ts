@@ -185,7 +185,8 @@ test("renders every supported health state in the browser", async ({ page }) => 
     ["degraded-service", "Degraded"],
     ["unhealthy-service", "Down"],
     ["unknown-service", "No data"],
-    ["error-service", "Check failed"]
+    ["error-service", "Check failed"],
+    ["not_applicable-service", "Not applicable"]
   ];
   for (const [name, word] of expectations) {
     const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name, exact: true }) });
@@ -237,6 +238,47 @@ test("aggregates multi-target uptime on service tiles", async ({ page }) => {
   await expect(tile.locator(".tick.error")).toHaveCount(0);
   await expect(tile.locator(".tick.empty")).toHaveCount(25);
   await expect(tile.locator(".pulseStrip")).toHaveAttribute("aria-label", /1 degraded/);
+});
+
+test("can mark individual monitor targets not applicable from the drawer", async ({ page }) => {
+  const overrideRequests: unknown[] = [];
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithNotApplicableMonitor())
+    });
+  });
+  await page.route("**/api/monitor-overrides", async (route) => {
+    overrideRequests.push(route.request().postDataJSON());
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok" })
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "routed-app", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Up");
+  await expect(tile.getByText("100% · 24h")).toBeVisible();
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  const directTarget = drawer.locator(".targetBlock").filter({ hasText: "routes: http://10.10.10.20" });
+  await expect(directTarget.locator(".targetHead span")).toHaveText("not applicable");
+  await directTarget.getByRole("button", { name: "Enable monitor" }).click();
+  expect(overrideRequests[0]).toEqual({
+    serviceId: "svc-routed",
+    target: "routes: http://10.10.10.20",
+    notApplicable: false
+  });
+
+  const routedTarget = drawer.locator(".targetBlock").filter({ hasText: "routes: https://app.example.test" });
+  await routedTarget.getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[1]).toEqual({
+    serviceId: "svc-routed",
+    target: "routes: https://app.example.test",
+    notApplicable: true
+  });
 });
 
 function createFixtureRepo(dir: string) {
@@ -399,7 +441,7 @@ function baseService(id: string, name: string, health: string) {
   };
 }
 
-function summaryShell(services: unknown[], uptime: unknown[]) {
+function summaryShell(services: unknown[], uptime: unknown[], statuses: unknown[] = []) {
   const now = new Date().toISOString();
   return {
     repositories: [{
@@ -421,14 +463,14 @@ function summaryShell(services: unknown[], uptime: unknown[]) {
       error: ""
     }],
     services,
-    statuses: [],
+    statuses,
     uptime,
     generatedAt: now
   };
 }
 
 function summaryWithEveryHealthState() {
-  const healthStates = ["healthy", "degraded", "unhealthy", "unknown", "error"];
+  const healthStates = ["healthy", "degraded", "unhealthy", "unknown", "error", "not_applicable"];
   return summaryShell(
     healthStates.map((health) => baseService(`svc-${health}`, `${health}-service`, health)),
     []
@@ -480,6 +522,45 @@ function summaryWithMixedTargetUptime() {
       uptimePercent: 66.7,
       checkCount: 3,
       samples: samplesFor(["healthy", "error", "healthy"], "docker")
+    }
+  ]);
+}
+
+function summaryWithNotApplicableMonitor() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-routed", "routed-app", "healthy"),
+    exposure: ["https://app.example.test", "http://10.10.10.20"]
+  };
+  const goodTarget = "routes: https://app.example.test";
+  const directTarget = "routes: http://10.10.10.20";
+  const samples = ["healthy", "healthy", "healthy"].map((health, index) => ({
+    health,
+    checkedAt: new Date(now - (3 - index) * 60_000).toISOString(),
+    message: "route ok"
+  }));
+  return summaryShell([service], [
+    {
+      serviceId: "svc-routed",
+      target: goodTarget,
+      uptimePercent: 100,
+      checkCount: 3,
+      samples
+    }
+  ], [
+    {
+      serviceId: "svc-routed",
+      target: goodTarget,
+      health: "healthy",
+      message: "route ok",
+      checkedAt: new Date(now).toISOString()
+    },
+    {
+      serviceId: "svc-routed",
+      target: directTarget,
+      health: "not_applicable",
+      message: "not applicable",
+      checkedAt: new Date(now).toISOString()
     }
   ]);
 }
