@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +86,139 @@ func TestStorePersistsSummary(t *testing.T) {
 		if values == nil {
 			t.Fatalf("%s field is nil, want empty slice", name)
 		}
+	}
+}
+
+func TestStoreRedactsKnownTokensWhenPersistingScanAndStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	token := "storage-secret-token-t008"
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.AddRedactionValues(token)
+	repos := []config.RepositoryConfig{{Name: "repo", URL: "https://deploy:" + token + "@example.com/repo.git", DefaultRef: "main"}}
+	if err := store.EnsureRepositories(ctx, repos); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanErr := errors.New("git clone https://x-access-token:" + token + "@example.com/org/repo.git failed with " + token)
+	if err := store.FinishScan(ctx, scanID, "repo", "", nil, scanErr); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc",
+		Target:    "local",
+		Health:    core.HealthError,
+		Message:   "git fetch https://user:" + token + "@example.com/org/repo.git failed with " + token,
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`SELECT COALESCE(url, '') FROM repositories`,
+		`SELECT COALESCE(error, '') FROM scans`,
+		`SELECT COALESCE(error, '') FROM repositories`,
+		`SELECT COALESCE(message, '') FROM status_results`,
+		`SELECT COALESCE(message, '') FROM status_history`,
+	} {
+		rows, err := store.db.QueryContext(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			assertRedacted(t, value, token)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range summary.Repositories {
+		assertRedacted(t, repo.URL, token)
+		assertRedacted(t, repo.Error, token)
+	}
+	for _, scan := range summary.Scans {
+		assertRedacted(t, scan.Error, token)
+	}
+	for _, status := range summary.Statuses {
+		assertRedacted(t, status.Message, token)
+	}
+}
+
+func TestStoreAddRedactionValuesDedupesRawValues(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	token := "storage/secret-token"
+	store.AddRedactionValues(token)
+	firstSize := len(store.redactionTokens)
+	if firstSize == 0 {
+		t.Fatal("redaction token set is empty")
+	}
+	store.AddRedactionValues(token)
+	if len(store.redactionTokens) != firstSize {
+		t.Fatalf("redaction token set size = %d, want %d after duplicate add", len(store.redactionTokens), firstSize)
+	}
+	for _, value := range store.redactionTokens {
+		if strings.Contains(value, "%252F") {
+			t.Fatalf("redaction token was re-escaped: %#v", store.redactionTokens)
+		}
+	}
+}
+
+func TestRedactPersistedSensitiveValuesCompactsDatabaseFiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	token := "physical-secret-token-t008"
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.AddRedactionValues(token)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO repositories(name, url, default_ref, status, error)
+VALUES(?, ?, 'main', 'error', ?)
+`, "repo", "https://deploy:"+token+"@example.com/repo.git", "clone failed: "+token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO scans(repository, status, started_at, error)
+VALUES(?, 'error', ?, ?)
+`, "repo", time.Now().UTC().Format(time.RFC3339), "scan failed: "+token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if !sqliteFilesContainToken(t, dbPath, token) {
+		t.Fatal("test setup did not write token bytes into sqlite files")
+	}
+	if err := store.RedactPersistedSensitiveValues(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if sqliteFilesContainToken(t, dbPath, token) {
+		t.Fatal("sqlite files still contain token bytes after persisted redaction cleanup")
 	}
 }
 
@@ -1171,4 +1306,31 @@ func TestUptimeEmptyIsSlice(t *testing.T) {
 	if len(summary.Uptime) != 0 {
 		t.Fatalf("uptime = %#v, want empty", summary.Uptime)
 	}
+}
+
+func assertRedacted(t *testing.T, value, token string) {
+	t.Helper()
+	if strings.Contains(value, token) {
+		t.Fatalf("value contains token %q: %q", token, value)
+	}
+	if strings.Contains(value, "@example.com") {
+		t.Fatalf("value contains URL userinfo: %q", value)
+	}
+}
+
+func sqliteFilesContainToken(t *testing.T, dbPath, token string) bool {
+	t.Helper()
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), token) {
+			return true
+		}
+	}
+	return false
 }

@@ -11,16 +11,22 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/routetarget"
+	"github.com/example/gitops-dashboard/internal/sanitizer"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type Store struct {
-	db *sql.DB
+	db                 *sql.DB
+	redactionMu        sync.RWMutex
+	redactionRawValues []string
+	redactionTokenSet  map[string]struct{}
+	redactionTokens    []string
 }
 
 var ErrStatusNotFound = errors.New("status result not found")
@@ -48,11 +54,128 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.RedactPersistedSensitiveValues(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
 func (store *Store) Close() error {
 	return store.db.Close()
+}
+
+func (store *Store) AddRedactionValues(values ...string) {
+	store.redactionMu.Lock()
+	defer store.redactionMu.Unlock()
+	if store.redactionTokenSet == nil {
+		store.redactionTokenSet = map[string]struct{}{}
+		for _, value := range store.redactionRawValues {
+			store.redactionTokenSet[value] = struct{}{}
+		}
+	}
+	changed := false
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := store.redactionTokenSet[value]; ok {
+			continue
+		}
+		store.redactionTokenSet[value] = struct{}{}
+		store.redactionRawValues = append(store.redactionRawValues, value)
+		changed = true
+	}
+	if changed {
+		store.redactionTokens = sanitizer.New(store.redactionRawValues...).Values()
+	}
+}
+
+func (store *Store) redactionValues() []string {
+	store.redactionMu.RLock()
+	defer store.redactionMu.RUnlock()
+	values := make([]string, len(store.redactionTokens))
+	copy(values, store.redactionTokens)
+	return values
+}
+
+func (store *Store) redact(value string) string {
+	return sanitizer.Redact(value, store.redactionValues()...)
+}
+
+func (store *Store) RedactPersistedSensitiveValues(ctx context.Context) error {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	changed := false
+	for _, target := range []struct {
+		table  string
+		column string
+	}{
+		{table: "repositories", column: "url"},
+		{table: "repositories", column: "error"},
+		{table: "scans", column: "error"},
+		{table: "status_results", column: "message"},
+		{table: "status_history", column: "message"},
+	} {
+		columnChanged, err := store.redactColumn(ctx, tx, target.table, target.column)
+		if err != nil {
+			return err
+		}
+		changed = changed || columnChanged
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return store.compactRedactedPages(ctx)
+}
+
+func (store *Store) redactColumn(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT rowid, COALESCE(%s, '') FROM %s", column, table))
+	if err != nil {
+		return false, fmt.Errorf("query redaction target %s.%s: %w", table, column, err)
+	}
+	type rowValue struct {
+		rowID int64
+		value string
+	}
+	var updates []rowValue
+	for rows.Next() {
+		var current rowValue
+		if err := rows.Scan(&current.rowID, &current.value); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		redacted := store.redact(current.value)
+		if redacted != current.value {
+			updates = append(updates, rowValue{rowID: current.rowID, value: redacted})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET %s=? WHERE rowid=?", table, column), update.value, update.rowID); err != nil {
+			return false, fmt.Errorf("redact %s.%s: %w", table, column, err)
+		}
+	}
+	return len(updates) > 0, nil
+}
+
+func (store *Store) compactRedactedPages(ctx context.Context) error {
+	if _, err := store.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("checkpoint redacted sqlite pages: %w", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("vacuum redacted sqlite pages: %w", err)
+	}
+	return nil
 }
 
 func (store *Store) migrate(ctx context.Context) error {
@@ -372,11 +495,12 @@ func (store *Store) ensureColumn(ctx context.Context, table, column, definition 
 
 func (store *Store) EnsureRepositories(ctx context.Context, repos []config.RepositoryConfig) error {
 	for _, repo := range repos {
+		repoURL := store.redact(repo.URL)
 		_, err := store.db.ExecContext(ctx, `
 INSERT INTO repositories(name, url, default_ref, status)
 VALUES(?, ?, ?, 'configured')
 ON CONFLICT(name) DO UPDATE SET url=excluded.url, default_ref=excluded.default_ref
-`, repo.Name, repo.URL, repo.DefaultRef)
+`, repo.Name, repoURL, repo.DefaultRef)
 		if err != nil {
 			return fmt.Errorf("upsert repository %s: %w", repo.Name, err)
 		}
@@ -589,7 +713,7 @@ func (store *Store) FinishScan(ctx context.Context, scanID int64, repoName, comm
 	errText := ""
 	if scanErr != nil {
 		status = "error"
-		errText = redact(scanErr.Error())
+		errText = store.redact(scanErr.Error())
 	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -701,7 +825,8 @@ FROM repositories ORDER BY name
 		if err := rows.Scan(&repo.Name, &repo.URL, &repo.DefaultRef, &repo.LastCommit, &repo.LastScanAt, &repo.Status, &repo.Error); err != nil {
 			return nil, err
 		}
-		repo.Error = redact(repo.Error)
+		repo.URL = store.redact(repo.URL)
+		repo.Error = store.redact(repo.Error)
 		repos = append(repos, repo)
 	}
 	return repos, rows.Err()
@@ -722,7 +847,7 @@ FROM scans ORDER BY started_at DESC LIMIT 50
 		if err := rows.Scan(&scan.ID, &scan.Repository, &scan.Status, &scan.CommitSHA, &scan.StartedAt, &scan.FinishedAt, &scan.Error); err != nil {
 			return nil, err
 		}
-		scan.Error = redact(scan.Error)
+		scan.Error = store.redact(scan.Error)
 		scans = append(scans, scan)
 	}
 	return scans, rows.Err()
@@ -785,7 +910,7 @@ FROM status_results ORDER BY checked_at DESC
 			return nil, err
 		}
 		status.Health = core.HealthState(health)
-		status.Message = redact(status.Message)
+		status.Message = store.redact(status.Message)
 		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
 			status.CheckedAt = parsed
 		}
@@ -1121,7 +1246,7 @@ func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) 
 		status.Message = "not applicable"
 	}
 	checkedAt := status.CheckedAt.UTC().Format(time.RFC3339)
-	message := redact(status.Message)
+	message := store.redact(status.Message)
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO status_results(service_id, target, health, message, checked_at)
 VALUES(?, ?, ?, ?, ?)
@@ -1323,7 +1448,7 @@ ORDER BY service_id, target, checked_at ASC
 		}
 		sample := core.UptimeSample{
 			Health:  core.HealthState(health),
-			Message: redact(message),
+			Message: store.redact(message),
 		}
 		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
 			sample.CheckedAt = parsed
@@ -1392,14 +1517,6 @@ func fromJSON(data string, value any) {
 		return
 	}
 	_ = json.Unmarshal([]byte(data), value)
-}
-
-func redact(value string) string {
-	value = strings.ReplaceAll(value, "\n", " ")
-	if len(value) > 1000 {
-		value = value[:1000]
-	}
-	return value
 }
 
 const migrations = `

@@ -11,6 +11,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
 
@@ -262,7 +263,7 @@ func TestRepositoryPathFilters(t *testing.T) {
 	}
 }
 
-func TestCloneURLInjectsTokenWithoutMutatingConfig(t *testing.T) {
+func TestGitAuthUsesTokenFreeRemoteAndEnvScopedHeader(t *testing.T) {
 	t.Setenv("GITOPS_TEST_TOKEN", "secret-token")
 	cfg := config.Config{}
 	scanner := New(cfg, nil, slog.Default())
@@ -271,16 +272,227 @@ func TestCloneURLInjectsTokenWithoutMutatingConfig(t *testing.T) {
 		URL:      "https://github.com/example/repo.git",
 		TokenEnv: "GITOPS_TEST_TOKEN",
 	}
-	cloneURL, err := scanner.cloneURL(repo)
+	auth, err := scanner.gitAuth(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cloneURL, "x-access-token:secret-token") {
-		t.Fatalf("cloneURL = %q", cloneURL)
+	if auth.remoteURL != "https://github.com/example/repo.git" {
+		t.Fatalf("remoteURL = %q", auth.remoteURL)
+	}
+	env := strings.Join(auth.env, "\n")
+	if strings.Contains(env, "secret-token") {
+		t.Fatalf("env contains raw token: %#v", auth.env)
+	}
+	if !strings.Contains(env, "GIT_CONFIG_KEY_0=http.https://github.com/example/repo.git.extraHeader") {
+		t.Fatalf("extraHeader key missing: %#v", auth.env)
+	}
+	if !strings.Contains(env, "GIT_CONFIG_VALUE_0=Authorization: Basic ") {
+		t.Fatalf("extraHeader value missing: %#v", auth.env)
 	}
 	if repo.URL != "https://github.com/example/repo.git" {
 		t.Fatalf("repo URL mutated: %q", repo.URL)
 	}
+}
+
+func TestGitAuthPreservesEmbeddedCredentialsWithoutTokenAndRedacts(t *testing.T) {
+	secret := "embedded-secret-token"
+	cfg := config.Config{}
+	scanner := New(cfg, nil, slog.Default())
+	repo := config.RepositoryConfig{
+		Name: "repo",
+		URL:  "https://deploy:" + secret + "@github.com/example/repo.git",
+	}
+	auth, err := scanner.gitAuth(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.remoteURL != repo.URL {
+		t.Fatalf("remoteURL = %q, want credentialed config URL", auth.remoteURL)
+	}
+	if auth.stripRemoteUserinfo {
+		t.Fatal("stripRemoteUserinfo = true, want false without replacement token auth")
+	}
+	redacted := auth.redactor.Redact("git clone " + repo.URL + " failed with deploy:" + secret)
+	assertNoToken(t, "redacted auth error", redacted, secret)
+	if strings.Contains(redacted, "deploy:"+secret) {
+		t.Fatalf("redacted auth error contains userinfo: %q", redacted)
+	}
+}
+
+func TestScanAllFailedCloneWithTokenDoesNotLeak(t *testing.T) {
+	token := "clone-secret-token-t008"
+	t.Setenv("GITOPS_TEST_TOKEN", token)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "private",
+			URL:        "https://127.0.0.1:1/private/repo.git",
+			DefaultRef: "main",
+			TokenEnv:   "GITOPS_TEST_TOKEN",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	err = scanner.ScanAll(ctx)
+	if err == nil {
+		t.Fatal("ScanAll succeeded, want clone failure")
+	}
+	assertNoToken(t, "returned error", err.Error(), token)
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaryNoToken(t, summary, token)
+	assertNoTokenInTree(t, dataDir, token)
+}
+
+func TestScanAllFailedCloneWithEmbeddedCredentialsDoesNotLeak(t *testing.T) {
+	token := "embedded-clone-secret-t008"
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "private",
+			URL:        "https://deploy:" + token + "@127.0.0.1:1/private/repo.git",
+			DefaultRef: "main",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	err = scanner.ScanAll(ctx)
+	if err == nil {
+		t.Fatal("ScanAll succeeded, want clone failure")
+	}
+	assertNoToken(t, "returned error", err.Error(), token)
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaryNoToken(t, summary, token)
+	assertNoTokenInTree(t, dataDir, token)
+}
+
+func TestScanAllFailedFetchMigratesCredentialedRemoteAndDoesNotLeak(t *testing.T) {
+	token := "fetch-secret-token-t008"
+	t.Setenv("GITOPS_TEST_TOKEN", token)
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(dataDir, "repos", "fixture")
+	runGit(t, dataDir, "clone", "file://"+source, repoPath)
+	credentialedRemote := "https://x-access-token:" + token + "@127.0.0.1:1/private/repo.git"
+	runGit(t, repoPath, "remote", "set-url", "origin", credentialedRemote)
+	configPath := filepath.Join(repoPath, ".git", "config")
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), token) {
+		t.Fatalf("test setup did not create credentialed remote: %s", before)
+	}
+
+	dbPath := filepath.Join(dataDir, "dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "https://127.0.0.1:1/private/repo.git",
+			DefaultRef: "main",
+			TokenEnv:   "GITOPS_TEST_TOKEN",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	err = scanner.ScanAll(ctx)
+	if err == nil {
+		t.Fatal("ScanAll succeeded, want fetch failure")
+	}
+	assertNoToken(t, "returned error", err.Error(), token)
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoToken(t, ".git/config", string(after), token)
+	if !strings.Contains(string(after), "https://127.0.0.1:1/private/repo.git") {
+		t.Fatalf("remote was not rewritten token-free: %s", after)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSummaryNoToken(t, summary, token)
+	assertNoTokenInTree(t, dataDir, token)
+}
+
+func TestMigrateRemoteLeavesSSHOriginUnchanged(t *testing.T) {
+	ctx := context.Background()
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init", "-b", "main")
+	origin := "ssh://git@github.com/org/repo.git"
+	runGit(t, repoPath, "remote", "add", "origin", origin)
+	auth := gitAuth{
+		redactor:            sanitizer.New("token"),
+		stripRemoteUserinfo: true,
+	}
+	if err := migrateRemote(ctx, repoPath, auth); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
+	if got != origin {
+		t.Fatalf("origin = %q, want %q", got, origin)
+	}
+}
+
+func TestMigrateRemoteStripsHTTPSCredentialedOrigin(t *testing.T) {
+	ctx := context.Background()
+	token := "migrate-secret-token-t008"
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init", "-b", "main")
+	runGit(t, repoPath, "remote", "add", "origin", "https://x-access-token:"+token+"@github.com/org/repo.git")
+	auth := gitAuth{
+		redactor:            sanitizer.New(token),
+		stripRemoteUserinfo: true,
+	}
+	if err := migrateRemote(ctx, repoPath, auth); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
+	if got != "https://github.com/org/repo.git" {
+		t.Fatalf("origin = %q, want token-free HTTPS origin", got)
+	}
+	assertNoToken(t, "origin", got, token)
 }
 
 func TestGitEnvUsesSSHKey(t *testing.T) {
@@ -388,6 +600,57 @@ func contains(values []string, target string) bool {
 	return false
 }
 
+func assertSummaryNoToken(t *testing.T, summary core.DashboardSummary, token string) {
+	t.Helper()
+	for _, repo := range summary.Repositories {
+		assertNoToken(t, "repository error", repo.Error, token)
+	}
+	for _, scan := range summary.Scans {
+		assertNoToken(t, "scan error", scan.Error, token)
+	}
+	for _, status := range summary.Statuses {
+		assertNoToken(t, "status message", status.Message, token)
+	}
+	for _, uptime := range summary.Uptime {
+		for _, sample := range uptime.Samples {
+			assertNoToken(t, "uptime sample message", sample.Message, token)
+		}
+	}
+}
+
+func assertNoTokenInTree(t *testing.T, root, token string) {
+	t.Helper()
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		assertNoToken(t, path, string(data), token)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNoToken(t *testing.T, label, value, token string) {
+	t.Helper()
+	if strings.Contains(value, token) {
+		t.Fatalf("%s contains token %q: %q", label, token, value)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -406,4 +669,15 @@ func runGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
+}
+
+func gitOutputForTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v failed: %v", args, err)
+	}
+	return string(output)
 }

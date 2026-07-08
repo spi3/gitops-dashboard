@@ -15,6 +15,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/monitor"
+	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/scanner"
 	"github.com/example/gitops-dashboard/internal/storage"
 	"github.com/example/gitops-dashboard/internal/ui"
@@ -37,6 +38,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	store.AddRedactionValues(repositoryRedactionValues(cfg.Repositories)...)
+	if err := store.RedactPersistedSensitiveValues(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	if err := store.EnsureRepositories(context.Background(), cfg.Repositories); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -57,6 +63,18 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	return app, nil
+}
+
+func repositoryRedactionValues(repos []config.RepositoryConfig) []string {
+	values := []string{}
+	for _, repo := range repos {
+		values = append(values, sanitizer.URLUserinfoValues(repo.URL)...)
+		token, err := repo.Token()
+		if err == nil && token != "" {
+			values = append(values, token)
+		}
+	}
+	return values
 }
 
 func (app *App) Close() {

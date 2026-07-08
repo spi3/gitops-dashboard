@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/environment"
 	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/parser"
+	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
 
@@ -103,7 +105,7 @@ func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig
 		if err != nil {
 			return err
 		}
-		commit, err = gitOutput(ctx, path, nil, "rev-parse", "HEAD")
+		commit, err = gitOutput(ctx, path, sanitizer.Redactor{}, nil, "rev-parse", "HEAD")
 		if err != nil {
 			return err
 		}
@@ -123,7 +125,7 @@ func (scanner Scanner) SyncRepo(ctx context.Context, repo config.RepositoryConfi
 }
 
 func CurrentCommit(ctx context.Context, repoPath string) (string, error) {
-	commit, err := gitOutput(ctx, repoPath, nil, "rev-parse", "HEAD")
+	commit, err := gitOutput(ctx, repoPath, sanitizer.Redactor{}, nil, "rev-parse", "HEAD")
 	return strings.TrimSpace(commit), err
 }
 
@@ -132,17 +134,24 @@ func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfi
 	if err != nil {
 		return "", err
 	}
+	auth, err := scanner.gitAuth(repo)
+	if err != nil {
+		return "", err
+	}
 	repoPath := filepath.Join(repoCacheDir, safeName(repo.Name))
 	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
-		if _, err := gitOutput(ctx, repoPath, gitEnv(repo), "fetch", "--all", "--prune"); err != nil {
+		if err := migrateRemote(ctx, repoPath, auth); err != nil {
+			return "", err
+		}
+		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "fetch", "--all", "--prune"); err != nil {
 			return "", err
 		}
 		if repo.DefaultRef != "HEAD" {
-			if _, err := gitOutput(ctx, repoPath, gitEnv(repo), "checkout", repo.DefaultRef); err != nil {
+			if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "checkout", repo.DefaultRef); err != nil {
 				return "", err
 			}
 		}
-		if _, err := gitOutput(ctx, repoPath, gitEnv(repo), "pull", "--ff-only"); err != nil && repo.DefaultRef != "HEAD" {
+		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "pull", "--ff-only"); err != nil && repo.DefaultRef != "HEAD" {
 			return "", err
 		}
 		return repoPath, nil
@@ -150,16 +159,12 @@ func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfi
 	if err := os.MkdirAll(filepath.Dir(repoPath), 0o700); err != nil {
 		return "", err
 	}
-	cloneURL, err := scanner.cloneURL(repo)
-	if err != nil {
-		return "", err
-	}
 	args := []string{"clone"}
 	if repo.DefaultRef != "" && repo.DefaultRef != "HEAD" {
 		args = append(args, "--branch", repo.DefaultRef)
 	}
-	args = append(args, cloneURL, repoPath)
-	if _, err := gitOutput(ctx, repoCacheDir, gitEnv(repo), args...); err != nil {
+	args = append(args, auth.remoteURL, repoPath)
+	if _, err := gitOutput(ctx, repoCacheDir, auth.redactor, auth.env, args...); err != nil {
 		return "", err
 	}
 	return repoPath, nil
@@ -176,20 +181,81 @@ func (scanner Scanner) ensureRepoCacheDir() (string, error) {
 	return repoCacheDir, nil
 }
 
-func (scanner Scanner) cloneURL(repo config.RepositoryConfig) (string, error) {
+type gitAuth struct {
+	remoteURL           string
+	env                 []string
+	redactor            sanitizer.Redactor
+	stripRemoteUserinfo bool
+}
+
+func (scanner Scanner) gitAuth(repo config.RepositoryConfig) (gitAuth, error) {
 	token, err := repo.Token()
 	if err != nil {
-		return "", err
+		return gitAuth{}, err
 	}
+	env := gitEnv(repo)
+	redactionValues := sanitizer.URLUserinfoValues(repo.URL)
 	if token == "" {
-		return repo.URL, nil
+		if scanner.store != nil {
+			scanner.store.AddRedactionValues(redactionValues...)
+		}
+		return gitAuth{
+			remoteURL: repo.URL,
+			env:       env,
+			redactor:  sanitizer.New(redactionValues...),
+		}, nil
 	}
-	parsed, err := url.Parse(repo.URL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("repository %s token auth requires an https url", repo.Name)
+	remoteURL := tokenFreeRemoteURL(repo.URL)
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return gitAuth{}, fmt.Errorf("repository %s token auth requires an http(s) url", repo.Name)
 	}
-	parsed.User = url.UserPassword("x-access-token", token)
-	return parsed.String(), nil
+	basicCredential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	authHeader := "Authorization: Basic " + basicCredential
+	redactionValues = append(redactionValues, token, basicCredential, authHeader)
+	if scanner.store != nil {
+		scanner.store.AddRedactionValues(redactionValues...)
+	}
+	env = append(env,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http."+remoteURL+".extraHeader",
+		"GIT_CONFIG_VALUE_0="+authHeader,
+	)
+	return gitAuth{
+		remoteURL:           remoteURL,
+		env:                 env,
+		redactor:            sanitizer.New(redactionValues...),
+		stripRemoteUserinfo: true,
+	}, nil
+}
+
+func migrateRemote(ctx context.Context, repoPath string, auth gitAuth) error {
+	if !auth.stripRemoteUserinfo {
+		return nil
+	}
+	remoteURL, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	remoteURL = strings.TrimSpace(remoteURL)
+	tokenFreeURL := tokenFreeRemoteURL(remoteURL)
+	if tokenFreeURL == remoteURL {
+		return nil
+	}
+	_, err = gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "set-url", "origin", tokenFreeURL)
+	return err
+}
+
+func tokenFreeRemoteURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User == nil {
+		return raw
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return raw
+	}
+	parsed.User = nil
+	return parsed.String()
 }
 
 func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, commit string) ([]core.Service, error) {
@@ -426,7 +492,7 @@ func normalizedName(value string) string {
 	return replacer.Replace(value)
 }
 
-func gitOutput(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+func gitOutput(ctx context.Context, dir string, redactor sanitizer.Redactor, env []string, args ...string) (string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "git", args...)
@@ -437,7 +503,7 @@ func gitOutput(ctx context.Context, dir string, env []string, args ...string) (s
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, redact(stderr.String()))
+		return "", fmt.Errorf("git %s: %w: %s", redactor.Redact(strings.Join(args, " ")), err, redactor.Redact(stderr.String()))
 	}
 	return out.String(), nil
 }
@@ -494,11 +560,4 @@ func uniqueSorted(values []string) []string {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
-}
-
-func redact(value string) string {
-	if len(value) > 1000 {
-		value = value[:1000]
-	}
-	return strings.ReplaceAll(value, "\n", " ")
 }
