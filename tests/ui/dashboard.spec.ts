@@ -100,12 +100,12 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
   await expect(page.locator(".sentence")).toHaveText("Waiting for the first scan");
   await expect(page.getByText("Nothing here yet")).toBeVisible();
 
-  await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark/);
-  const themeButton = page.getByRole("button", { name: "Use dark theme" });
-  await themeButton.click();
-  const flipped = await page.locator("html").getAttribute("data-theme");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", /light|dark|vim/);
+  const themeSelect = page.getByLabel("Theme");
+  await themeSelect.selectOption("vim");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "vim");
   await page.reload();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", flipped ?? "dark");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "vim");
 
   await page.getByRole("button", { name: "Sync repos" }).click();
   await expect(page.locator(".sentence")).toHaveText("Waiting for live checks");
