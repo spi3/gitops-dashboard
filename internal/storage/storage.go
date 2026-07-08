@@ -21,6 +21,11 @@ type Store struct {
 	db *sql.DB
 }
 
+type RuntimeServiceSource struct {
+	Repository string
+	SourcePath string
+}
+
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -219,6 +224,67 @@ ON CONFLICT(name) DO NOTHING
 		}
 	}
 	return tx.Commit()
+}
+
+func (store *Store) PruneRuntimeServices(ctx context.Context, runtime string, keep []RuntimeServiceSource) error {
+	keepSources := map[string]struct{}{}
+	for _, source := range keep {
+		keepSources[runtimeSourceKey(source.Repository, source.SourcePath)] = struct{}{}
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, repository, source_path FROM services WHERE runtime=?`, runtime)
+	if err != nil {
+		return err
+	}
+	var removeIDs []string
+	affectedRepositories := map[string]struct{}{}
+	for rows.Next() {
+		var id, repository, sourcePath string
+		if err := rows.Scan(&id, &repository, &sourcePath); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if _, ok := keepSources[runtimeSourceKey(repository, sourcePath)]; ok {
+			continue
+		}
+		removeIDs = append(removeIDs, id)
+		affectedRepositories[repository] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range removeIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE id=?`, id); err != nil {
+			return err
+		}
+	}
+	for repository := range affectedRepositories {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM repositories
+WHERE name=? AND default_ref='configured' AND NOT EXISTS (
+  SELECT 1 FROM services WHERE repository=?
+)
+`, repository, repository); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func runtimeSourceKey(repository, sourcePath string) string {
+	return repository + "\x00" + sourcePath
 }
 
 func (store *Store) StartScan(ctx context.Context, repoName string) (int64, error) {

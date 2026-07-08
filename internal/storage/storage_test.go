@@ -199,6 +199,111 @@ func TestReplaceRuntimeServicesPreservesOtherRepositoryServices(t *testing.T) {
 	}
 }
 
+func TestPruneRuntimeServicesRemovesStaleSources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "kube",
+		URL:        "https://example.invalid/kube.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "kube")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptHost := core.Service{
+		ID:           "host-kept",
+		Name:         "serenity",
+		Repository:   "kube",
+		SourceCommit: "abc123",
+		SourcePath:   "infrastructure/inventory/hosts.yml",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	composeService := core.Service{
+		ID:           "compose-1",
+		Name:         "gitops-dashboard",
+		Repository:   "kube",
+		SourceCommit: "abc123",
+		SourcePath:   "docker_files/serenity/gitops-dashboard/docker-compose.yml",
+		Runtime:      "compose",
+		Kind:         "Service",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.FinishScan(ctx, scanID, "kube", "abc123", []core.Service{keptHost, composeService}, nil); err != nil {
+		t.Fatal(err)
+	}
+	staleHost := core.Service{
+		ID:           "host-stale",
+		Name:         "serenity",
+		Repository:   "ping/ansible-hosts",
+		SourceCommit: "",
+		SourcePath:   "/ansible/hosts.yml",
+		Runtime:      "host",
+		Kind:         "Host",
+		Health:       core.HealthUnknown,
+	}
+	if err := store.ReplaceRuntimeServices(ctx, "ping/ansible-hosts", "/ansible/hosts.yml", "host", []core.Service{staleHost}); err != nil {
+		t.Fatal(err)
+	}
+	for _, serviceID := range []string{"host-kept", "host-stale"} {
+		if err := store.UpsertStatus(ctx, core.StatusResult{
+			ServiceID: serviceID,
+			Target:    "ansible-hosts",
+			Health:    core.HealthHealthy,
+			Message:   "pong",
+			CheckedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = store.PruneRuntimeServices(ctx, "host", []RuntimeServiceSource{{
+		Repository: "kube",
+		SourcePath: "infrastructure/inventory/hosts.yml",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesByID := map[string]core.Service{}
+	for _, service := range summary.Services {
+		servicesByID[service.ID] = service
+	}
+	if _, ok := servicesByID["host-kept"]; !ok {
+		t.Fatalf("kept host missing from services: %#v", summary.Services)
+	}
+	if _, ok := servicesByID["compose-1"]; !ok {
+		t.Fatalf("compose service missing from services: %#v", summary.Services)
+	}
+	if _, ok := servicesByID["host-stale"]; ok {
+		t.Fatalf("stale host still present: %#v", summary.Services)
+	}
+	for _, repo := range summary.Repositories {
+		if repo.Name == "ping/ansible-hosts" {
+			t.Fatalf("stale configured repository still present: %#v", summary.Repositories)
+		}
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='host-kept'"); got != 1 {
+		t.Fatalf("kept host history rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='host-stale'"); got != 0 {
+		t.Fatalf("stale host history rows = %d, want 0", got)
+	}
+}
+
 func countRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var count int
