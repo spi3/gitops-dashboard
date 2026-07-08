@@ -140,6 +140,7 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 		Kind:        "Service",
 		Environment: "production",
 		Health:      core.HealthUnknown,
+		Exposure:    []string{"http://10.10.10.20"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +184,33 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	}
 	if summary.Statuses[0].Health != core.HealthUnknown {
 		t.Fatalf("re-enabled status health = %s, want unknown", summary.Statuses[0].Health)
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes","notApplicable":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("all-routes override status = %d, body=%q", res.Code, res.Body.String())
+	}
+	summary, err = app.store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundParent := false
+	for _, status := range summary.Statuses {
+		if status.Target == "routes" {
+			foundParent = true
+			if status.Health != core.HealthNotApplicable {
+				t.Fatalf("all-routes health = %s, want not_applicable", status.Health)
+			}
+		}
+		if strings.HasPrefix(status.Target, "routes: ") {
+			t.Fatalf("child route status %q remained after parent override", status.Target)
+		}
+	}
+	if !foundParent {
+		t.Fatalf("all-routes override did not create routes status: %#v", summary.Statuses)
 	}
 
 	res = httptest.NewRecorder()

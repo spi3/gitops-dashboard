@@ -34,24 +34,25 @@ type Scan struct {
 }
 
 type Service struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	Repository   string      `json:"repository"`
-	SourceCommit string      `json:"sourceCommit"`
-	SourcePath   string      `json:"sourcePath"`
-	Runtime      string      `json:"runtime"`
-	Kind         string      `json:"kind"`
-	Namespace    string      `json:"namespace"`
-	ResourceName string      `json:"resourceName"`
-	Environment  string      `json:"environment"`
-	Health       HealthState `json:"health"`
-	Images       []string    `json:"images"`
-	Ports        []string    `json:"ports"`
-	Dependencies []string    `json:"dependencies"`
-	Storage      []string    `json:"storage"`
-	Exposure     []string    `json:"exposure"`
-	ConfigRefs   []string    `json:"configRefs"`
-	Warnings     []string    `json:"warnings"`
+	ID            string      `json:"id"`
+	Name          string      `json:"name"`
+	Repository    string      `json:"repository"`
+	SourceCommit  string      `json:"sourceCommit"`
+	SourcePath    string      `json:"sourcePath"`
+	Runtime       string      `json:"runtime"`
+	Kind          string      `json:"kind"`
+	Namespace     string      `json:"namespace"`
+	ResourceName  string      `json:"resourceName"`
+	Environment   string      `json:"environment"`
+	Health        HealthState `json:"health"`
+	Images        []string    `json:"images"`
+	Ports         []string    `json:"ports"`
+	Dependencies  []string    `json:"dependencies"`
+	Storage       []string    `json:"storage"`
+	Exposure      []string    `json:"exposure"`
+	MonitorRoutes []string    `json:"monitorRoutes"`
+	ConfigRefs    []string    `json:"configRefs"`
+	Warnings      []string    `json:"warnings"`
 }
 
 type StatusResult struct {

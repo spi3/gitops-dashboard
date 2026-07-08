@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -529,6 +530,446 @@ func TestSetMonitorNotApplicableRemovesTargetFromHealthAndUptime(t *testing.T) {
 	}
 	if statusByTarget[badTarget].Health != core.HealthUnknown {
 		t.Fatalf("re-enabled status = %#v, want unknown until next check", statusByTarget[badTarget])
+	}
+}
+
+func TestParentRouteOverrideSuppressesLateChildStatusWrites(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "svc-app",
+		Name:        "app",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+		Exposure:    []string{"https://app.example.test"},
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", "routes", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-app",
+		Target:    "routes: https://app.example.test",
+		Health:    core.HealthUnhealthy,
+		Message:   "late check failed",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Services[0].Health != core.HealthUnknown {
+		t.Fatalf("service health = %s, want unknown", summary.Services[0].Health)
+	}
+	if len(summary.Uptime) != 0 {
+		t.Fatalf("uptime = %#v, want no child route contributions", summary.Uptime)
+	}
+	statusByTarget := map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		statusByTarget[status.Target] = status
+	}
+	if statusByTarget["routes"].Health != core.HealthNotApplicable {
+		t.Fatalf("parent status = %#v, want not_applicable", statusByTarget["routes"])
+	}
+	if _, ok := statusByTarget["routes: https://app.example.test"]; ok {
+		t.Fatalf("late child route status was stored despite parent override: %#v", statusByTarget["routes: https://app.example.test"])
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE service_id='svc-app' AND target='routes: https://app.example.test'"); got != 0 {
+		t.Fatalf("child status rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-app' AND target='routes: https://app.example.test'"); got != 0 {
+		t.Fatalf("child history rows = %d, want 0", got)
+	}
+}
+
+func TestSetMonitorNotApplicableAcceptsConfiguredSyntheticRouteTarget(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "svc-app",
+		Name:        "app",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+		Exposure: []string{
+			"https://app.example.test",
+			"ssh://app.example.test:22",
+		},
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+
+	target := "routes: https://app.example.test"
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", target, true); err != nil {
+		t.Fatalf("configured route override failed: %v", err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusByTarget := map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		statusByTarget[status.Target] = status
+	}
+	if statusByTarget[target].Health != core.HealthNotApplicable {
+		t.Fatalf("synthetic route status = %#v, want not_applicable", statusByTarget[target])
+	}
+
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", "routes: ssh://app.example.test:22", true); !errors.Is(err, ErrStatusNotFound) {
+		t.Fatalf("ssh route override error = %v, want ErrStatusNotFound", err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc-app", "routes: https://missing.example.test", true); !errors.Is(err, ErrStatusNotFound) {
+		t.Fatalf("missing route override error = %v, want ErrStatusNotFound", err)
+	}
+}
+
+func TestSetMonitorNotApplicableCanonicalizesSyntheticRouteTargets(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{name: "trailing slash", target: "routes: https://app.example.test/"},
+		{name: "default port", target: "routes: https://app.example.test:443"},
+		{name: "case variant", target: "routes: HTTPS://APP.EXAMPLE.TEST"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			service := core.Service{
+				ID:          "svc-app",
+				Name:        "app",
+				Repository:  "repo",
+				SourcePath:  "prod/compose.yaml",
+				Runtime:     "compose",
+				Kind:        "Service",
+				Environment: "production",
+				Health:      core.HealthUnknown,
+				Exposure:    []string{"https://app.example.test"},
+			}
+			if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+				t.Fatal(err)
+			}
+
+			const canonicalTarget = "routes: https://app.example.test"
+			if err := store.SetMonitorNotApplicable(ctx, "svc-app", tc.target, true); err != nil {
+				t.Fatal(err)
+			}
+			if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE service_id='svc-app' AND target='routes: https://app.example.test'"); got != 1 {
+				t.Fatalf("canonical override rows = %d, want 1", got)
+			}
+			if tc.target != canonicalTarget {
+				var rawRows int
+				if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM monitor_overrides WHERE service_id=? AND target=?`, "svc-app", tc.target).Scan(&rawRows); err != nil {
+					t.Fatal(err)
+				}
+				if rawRows != 0 {
+					t.Fatalf("raw override rows = %d, want 0", rawRows)
+				}
+			}
+			ignored, err := store.MonitorNotApplicable(ctx, "svc-app", canonicalTarget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ignored {
+				t.Fatalf("canonical target was not ignored")
+			}
+			ignored, err = store.MonitorNotApplicable(ctx, "svc-app", tc.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ignored {
+				t.Fatalf("alias target was not ignored")
+			}
+
+			if err := store.SetMonitorNotApplicable(ctx, "svc-app", tc.target, false); err != nil {
+				t.Fatal(err)
+			}
+			ignored, err = store.MonitorNotApplicable(ctx, "svc-app", canonicalTarget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ignored {
+				t.Fatalf("canonical target remained ignored after enabling alias")
+			}
+		})
+	}
+}
+
+func TestMigrateCanonicalizesStoredRouteTargets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := core.Service{
+		ID:          "svc-app",
+		Name:        "app",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+		Exposure:    []string{"https://app.example.test"},
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO monitor_overrides(service_id, target, not_applicable, updated_at) VALUES
+  ('svc-app', 'routes: https://app.example.test', 0, '2026-01-02T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/', 1, '2026-01-01T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test:443', 0, '2026-01-03T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/admin/', 1, '2026-01-04T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/a%2Fb', 1, '2026-01-05T00:00:00Z');
+INSERT INTO status_results(service_id, target, health, message, checked_at) VALUES
+  ('svc-app', 'routes: https://app.example.test', 'healthy', 'canonical ok', '2026-01-01T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/', 'degraded', 'slash degraded', '2026-01-02T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test:443', 'error', 'default port failed', '2026-01-03T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/admin/', 'healthy', 'admin slash ok', '2026-01-04T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/a%2Fb', 'healthy', 'escaped slash ok', '2026-01-05T00:00:00Z');
+INSERT INTO status_history(service_id, target, health, message, checked_at) VALUES
+  ('svc-app', 'routes: https://app.example.test/', 'degraded', 'slash degraded', '2026-01-02T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test:443', 'error', 'default port failed', '2026-01-03T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/admin/', 'healthy', 'admin slash ok', '2026-01-04T00:00:00Z'),
+  ('svc-app', 'routes: https://app.example.test/a%2Fb', 'healthy', 'escaped slash ok', '2026-01-05T00:00:00Z');
+`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target IN ('routes: https://app.example.test/', 'routes: https://app.example.test:443')"); got != 0 {
+		t.Fatalf("alias override rows = %d, want 0", got)
+	}
+	var notApplicable int
+	var updatedAt string
+	if err := store.db.QueryRowContext(ctx, `
+SELECT not_applicable, updated_at
+FROM monitor_overrides
+WHERE service_id='svc-app' AND target='routes: https://app.example.test'
+`).Scan(&notApplicable, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if notApplicable != 1 || updatedAt != "2026-01-03T00:00:00Z" {
+		t.Fatalf("merged override = not_applicable:%d updated_at:%s, want 1 and latest timestamp", notApplicable, updatedAt)
+	}
+	ignored, err := store.MonitorNotApplicable(ctx, "svc-app", "routes: https://app.example.test:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ignored {
+		t.Fatalf("default-port alias was not preserved as an active override")
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target='routes: https://app.example.test/admin/'"); got != 1 {
+		t.Fatalf("non-root trailing-slash override rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target='routes: https://app.example.test/admin'"); got != 0 {
+		t.Fatalf("non-root slashless override rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target='routes: https://app.example.test/a%2Fb'"); got != 1 {
+		t.Fatalf("escaped route override rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target='routes: https://app.example.test/a/b'"); got != 0 {
+		t.Fatalf("decoded route override rows = %d, want 0", got)
+	}
+
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target IN ('routes: https://app.example.test/', 'routes: https://app.example.test:443')"); got != 0 {
+		t.Fatalf("alias status rows = %d, want 0", got)
+	}
+	var health, message, checkedAt string
+	if err := store.db.QueryRowContext(ctx, `
+SELECT health, message, checked_at
+FROM status_results
+WHERE service_id='svc-app' AND target='routes: https://app.example.test'
+`).Scan(&health, &message, &checkedAt); err != nil {
+		t.Fatal(err)
+	}
+	if health != "not_applicable" || message != "not applicable" || checkedAt != "2026-01-03T00:00:00Z" {
+		t.Fatalf("merged status = %s/%s/%s, want active override to force not_applicable", health, message, checkedAt)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target='routes: https://app.example.test/admin/'"); got != 1 {
+		t.Fatalf("non-root trailing-slash status rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target='routes: https://app.example.test/admin'"); got != 0 {
+		t.Fatalf("non-root slashless status rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target='routes: https://app.example.test/a%2Fb'"); got != 1 {
+		t.Fatalf("escaped route status rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE target='routes: https://app.example.test/a/b'"); got != 0 {
+		t.Fatalf("decoded route status rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target IN ('routes: https://app.example.test/', 'routes: https://app.example.test:443')"); got != 0 {
+		t.Fatalf("alias history rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test'"); got != 2 {
+		t.Fatalf("canonical history rows = %d, want 2", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test' AND health='not_applicable'"); got != 2 {
+		t.Fatalf("canonical not_applicable history rows = %d, want 2", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test/admin/'"); got != 1 {
+		t.Fatalf("non-root trailing-slash history rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test/admin'"); got != 0 {
+		t.Fatalf("non-root slashless history rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test/a%2Fb'"); got != 1 {
+		t.Fatalf("escaped route history rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test/a/b'"); got != 0 {
+		t.Fatalf("decoded route history rows = %d, want 0", got)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Services) != 1 || len(summary.Services[0].MonitorRoutes) != 1 || summary.Services[0].MonitorRoutes[0] != "https://app.example.test" {
+		t.Fatalf("monitor routes = %#v, want canonical route in summary", summary.Services)
+	}
+	if summary.Services[0].Health != core.HealthUnknown {
+		t.Fatalf("service health = %s, want unknown because all route rows are ignored", summary.Services[0].Health)
+	}
+	if len(summary.Uptime) != 0 {
+		t.Fatalf("uptime = %#v, want ignored route excluded", summary.Uptime)
+	}
+}
+
+func TestSetMonitorNotApplicableHandlesRoutesParentAndLiteralTargets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "svc-routes",
+		Name:        "routes",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+		Exposure:    []string{"ssh://routes.example.test:22"},
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc-routes", "routes", true); !errors.Is(err, ErrStatusNotFound) {
+		t.Fatalf("synthetic ordinary routes error = %v, want ErrStatusNotFound", err)
+	}
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-routes", Target: "routes", Health: core.HealthHealthy, Message: "ok", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	childTarget := "routes: https://app.example.test"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-routes", Target: childTarget, Health: core.HealthHealthy, Message: "child ok", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc-routes", "routes", true); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusByTarget := map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		statusByTarget[status.Target] = status
+	}
+	if statusByTarget["routes"].Health != core.HealthNotApplicable {
+		t.Fatalf("ordinary routes status = %#v, want not_applicable", statusByTarget["routes"])
+	}
+	if statusByTarget[childTarget].Health != core.HealthHealthy {
+		t.Fatalf("child route status = %#v, want preserved healthy", statusByTarget[childTarget])
+	}
+
+	parentService := service
+	parentService.ID = "svc-routes-http"
+	parentService.Exposure = []string{"https://routes.example.test"}
+	if err := store.ReplaceConfiguredServices(ctx, "repo-http", "prod/compose.yaml", []core.Service{parentService}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-routes-http", Target: "routes", Health: core.HealthHealthy, Message: "ok", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	httpChildTarget := "routes: https://routes.example.test"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc-routes-http", Target: httpChildTarget, Health: core.HealthHealthy, Message: "child ok", CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc-routes-http", "routes", true); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusByTarget = map[string]core.StatusResult{}
+	for _, status := range summary.Statuses {
+		if status.ServiceID == "svc-routes-http" {
+			statusByTarget[status.Target] = status
+		}
+	}
+	if statusByTarget["routes"].Health != core.HealthNotApplicable {
+		t.Fatalf("parent routes status = %#v, want not_applicable", statusByTarget["routes"])
+	}
+	if _, ok := statusByTarget[httpChildTarget]; ok {
+		t.Fatalf("HTTP child route status = %#v, want removed by parent override", statusByTarget[httpChildTarget])
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-routes-http' AND target='routes: https://routes.example.test'"); got != 0 {
+		t.Fatalf("HTTP child route history rows = %d, want 0", got)
 	}
 }
 

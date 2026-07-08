@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -240,16 +240,19 @@ test("aggregates multi-target uptime on service tiles", async ({ page }) => {
   await expect(tile.locator(".pulseStrip")).toHaveAttribute("aria-label", /1 degraded/);
 });
 
-test("can mark individual monitor targets not applicable from the drawer", async ({ page }) => {
-  const overrideRequests: unknown[] = [];
+test("can mark individual route monitor targets not applicable from the drawer", async ({ page }) => {
+  const overrideRequests: MonitorOverrideRequest[] = [];
+  const summary = summaryWithNotApplicableMonitor();
   await page.route("**/api/summary", async (route) => {
     await route.fulfill({
       contentType: "application/json",
-      body: JSON.stringify(summaryWithNotApplicableMonitor())
+      body: JSON.stringify(summary)
     });
   });
   await page.route("**/api/monitor-overrides", async (route) => {
-    overrideRequests.push(route.request().postDataJSON());
+    const payload = route.request().postDataJSON() as MonitorOverrideRequest;
+    overrideRequests.push(payload);
+    applyMonitorOverride(summary, payload);
     await route.fulfill({
       contentType: "application/json",
       body: JSON.stringify({ status: "ok" })
@@ -263,20 +266,227 @@ test("can mark individual monitor targets not applicable from the drawer", async
 
   await tile.click();
   const drawer = page.getByRole("dialog");
-  const directTarget = drawer.locator(".targetBlock").filter({ hasText: "routes: http://10.10.10.20" });
-  await expect(directTarget.locator(".targetHead span")).toHaveText("not applicable");
+  const allRoutesTarget = drawer.locator(".targetBlock.allRoutesTarget");
+  await expect(allRoutesTarget.locator(".targetHead strong")).toHaveText("All routes");
+  await expect(allRoutesTarget.locator(".targetScope")).toHaveText("Service override");
+  await expect(allRoutesTarget.getByRole("button", { name: "Mark not applicable" })).toBeVisible();
+  await expect(drawer.getByRole("link", { name: /app\.example\.test:22/ })).toBeVisible();
+
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(2);
+  await expect(drawer.getByText("routes: https://app.example.test", { exact: true })).toHaveCount(0);
+  await expect(drawer.getByText("routes: http://10.10.10.20", { exact: true })).toHaveCount(0);
+  await expect(routeTargets.filter({ hasText: "ssh://app.example.test:22" })).toHaveCount(0);
+
+  const routedTarget = routeTargets.filter({ hasText: "https://app.example.test" });
+  await expect(routedTarget.locator(".targetHead strong")).toHaveText("https://app.example.test");
+  await expect(routedTarget.locator(".targetScope")).toHaveText("Route");
+  await expect(routedTarget.locator(".targetMeta")).toHaveText("100% · 3 checks · 24h");
+  await expect(routedTarget.locator(".targetNote")).toContainText("Up");
+
+  const directTarget = routeTargets.filter({ hasText: "http://10.10.10.20" });
+  await expect(directTarget.locator(".targetHead strong")).toHaveText("http://10.10.10.20");
+  await expect(directTarget.locator(".targetMeta")).toHaveText("not applicable");
+  await expect(directTarget).toHaveClass(/notApplicable/);
   await directTarget.getByRole("button", { name: "Enable monitor" }).click();
   expect(overrideRequests[0]).toEqual({
     serviceId: "svc-routed",
     target: "routes: http://10.10.10.20",
     notApplicable: false
   });
+  await expect(directTarget.locator(".targetMeta")).toHaveText("no checks yet");
+  await expect(directTarget).not.toHaveClass(/notApplicable/);
+  await expect(directTarget.getByRole("button", { name: "Mark not applicable" })).toBeVisible();
 
-  const routedTarget = drawer.locator(".targetBlock").filter({ hasText: "routes: https://app.example.test" });
   await routedTarget.getByRole("button", { name: "Mark not applicable" }).click();
   expect(overrideRequests[1]).toEqual({
     serviceId: "svc-routed",
     target: "routes: https://app.example.test",
+    notApplicable: true
+  });
+  await expect(routedTarget.locator(".targetMeta")).toHaveText("not applicable");
+  await expect(routedTarget).toHaveClass(/notApplicable/);
+
+  await allRoutesTarget.getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[2]).toEqual({
+    serviceId: "svc-routed",
+    target: "routes",
+    notApplicable: true
+  });
+  await expect(allRoutesTarget.locator(".targetMeta")).toHaveText("not applicable");
+  await expect(allRoutesTarget).toHaveClass(/notApplicable/);
+  await expect(routeTargets).toHaveCount(2);
+  await expect(routeTargets.filter({ hasText: "ssh://app.example.test:22" })).toHaveCount(0);
+});
+
+test("keeps all routes controls after re-enabling the all routes monitor", async ({ page }) => {
+  const overrideRequests: MonitorOverrideRequest[] = [];
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithPostEnableAllRoutes())
+    });
+  });
+  await page.route("**/api/monitor-overrides", async (route) => {
+    overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok" })
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "all-routes-enabled", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("No data");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  const allRoutesTarget = drawer.locator(".targetBlock.allRoutesTarget");
+  await expect(allRoutesTarget).toHaveCount(1);
+  await expect(allRoutesTarget.locator(".targetHead strong")).toHaveText("All routes");
+  await expect(allRoutesTarget.locator(".targetScope")).toHaveText("Service override");
+  await expect(allRoutesTarget.locator(".targetMeta")).toHaveText("No data");
+  await expect(allRoutesTarget.locator(".targetNote")).toContainText("monitor enabled; waiting for next check");
+  await expect(allRoutesTarget.getByRole("button", { name: "Mark not applicable" })).toBeVisible();
+  await expect(drawer.locator(".targetBlock .targetHead strong").filter({ hasText: /^routes$/ })).toHaveCount(0);
+
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(2);
+  await expect(routeTargets.filter({ hasText: "https://app.example.test" })).toHaveCount(1);
+  await expect(routeTargets.filter({ hasText: "http://10.10.10.20" })).toHaveCount(1);
+
+  await allRoutesTarget.getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[0]).toEqual({
+    serviceId: "svc-all-routes-enabled",
+    target: "routes",
+    notApplicable: true
+  });
+});
+
+test("keeps a literal routes monitor target out of the route override UI", async ({ page }) => {
+  const overrideRequests: MonitorOverrideRequest[] = [];
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithLiteralRoutesMonitor())
+    });
+  });
+  await page.route("**/api/monitor-overrides", async (route) => {
+    overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok" })
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "literal-routes", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Up");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.getByRole("link", { name: /literal\.example\.test:22/ })).toBeVisible();
+  await expect(drawer.locator(".targetBlock.allRoutesTarget")).toHaveCount(0);
+  await expect(drawer.locator(".targetBlock.routeTarget")).toHaveCount(0);
+
+  const target = drawer.locator(".targetBlock").filter({ hasText: "routes" });
+  await expect(target.locator(".targetHead strong")).toHaveText("routes");
+  await expect(target.locator(".targetMeta")).toHaveText("100% · 2 checks · 24h");
+  await target.getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[0]).toEqual({
+    serviceId: "svc-literal-routes",
+    target: "routes",
+    notApplicable: true
+  });
+});
+
+test("hides the all routes override when only stale route rows remain", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithStaleOnlyRouteRows())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "stale-routes", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Down");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.getByRole("link", { name: /stale\.example\.test:22/ })).toBeVisible();
+  await expect(drawer.locator(".targetBlock.allRoutesTarget")).toHaveCount(0);
+  await expect(drawer.getByText("All routes", { exact: true })).toHaveCount(0);
+
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(1);
+  await expect(routeTargets.locator(".targetHead strong")).toHaveText("https://old.example.test");
+});
+
+test("keys route controls from backend canonical monitor routes", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithCanonicalMonitorRoutes())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "canonical-routes", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Up");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.locator(".targetBlock.allRoutesTarget")).toHaveCount(1);
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(1);
+  await expect(routeTargets.locator(".targetHead strong")).toHaveText("https://app.example.test");
+  await expect(routeTargets.getByText("HTTPS://APP.EXAMPLE.TEST", { exact: true })).toHaveCount(0);
+  await expect(routeTargets.getByText("https://app.example.test:443", { exact: true })).toHaveCount(0);
+});
+
+test("keeps slash-distinct route controls and override targets", async ({ page }) => {
+  const overrideRequests: MonitorOverrideRequest[] = [];
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithSlashDistinctRoutes())
+    });
+  });
+  await page.route("**/api/monitor-overrides", async (route) => {
+    overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok" })
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "slash-routes", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Up");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.locator(".targetBlock.allRoutesTarget")).toHaveCount(1);
+
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(2);
+  await expect(routeTargets.locator(".targetHead strong")).toHaveText([
+    "https://app.example.test/admin",
+    "https://app.example.test/admin/"
+  ]);
+
+  await routeTargets.nth(0).getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[0]).toEqual({
+    serviceId: "svc-slash-routes",
+    target: "routes: https://app.example.test/admin",
+    notApplicable: true
+  });
+
+  await routeTargets.nth(1).getByRole("button", { name: "Mark not applicable" }).click();
+  expect(overrideRequests[1]).toEqual({
+    serviceId: "svc-slash-routes",
+    target: "routes: https://app.example.test/admin/",
     notApplicable: true
   });
 });
@@ -373,7 +583,14 @@ function createFixtureRepo(dir: string) {
 }
 
 function runGit(cwd: string, ...args: string[]) {
-  execFileSync("git", args, { cwd, stdio: "pipe" });
+  const result = spawnSync("git", args, { cwd, stdio: "pipe" });
+  if (result.status === 0) {
+    return;
+  }
+  const stderr = result.stderr.toString().trim();
+  const stdout = result.stdout.toString().trim();
+  const detail = stderr || stdout || result.error?.message || "";
+  throw new Error(`git ${args.join(" ")} failed${detail ? `: ${detail}` : ""}`);
 }
 
 function freePort() {
@@ -436,6 +653,7 @@ function baseService(id: string, name: string, health: string) {
     dependencies: [],
     storage: [],
     exposure: [],
+    monitorRoutes: [],
     configRefs: [],
     warnings: []
   };
@@ -530,7 +748,8 @@ function summaryWithNotApplicableMonitor() {
   const now = Date.now();
   const service = {
     ...baseService("svc-routed", "routed-app", "healthy"),
-    exposure: ["https://app.example.test", "http://10.10.10.20"]
+    exposure: ["https://app.example.test", "http://10.10.10.20", "ssh://app.example.test:22"],
+    monitorRoutes: ["https://app.example.test", "http://10.10.10.20"]
   };
   const goodTarget = "routes: https://app.example.test";
   const directTarget = "routes: http://10.10.10.20";
@@ -563,6 +782,196 @@ function summaryWithNotApplicableMonitor() {
       checkedAt: new Date(now).toISOString()
     }
   ]);
+}
+
+function summaryWithLiteralRoutesMonitor() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-literal-routes", "literal-routes", "healthy"),
+    exposure: ["ssh://literal.example.test:22"]
+  };
+  const samples = ["healthy", "healthy"].map((health, index) => ({
+    health,
+    checkedAt: new Date(now - (2 - index) * 60_000).toISOString(),
+    message: "monitor ok"
+  }));
+  return summaryShell([service], [
+    {
+      serviceId: "svc-literal-routes",
+      target: "routes",
+      uptimePercent: 100,
+      checkCount: 2,
+      samples
+    }
+  ], [
+    {
+      serviceId: "svc-literal-routes",
+      target: "routes",
+      health: "healthy",
+      message: "monitor ok",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithPostEnableAllRoutes() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-all-routes-enabled", "all-routes-enabled", "unknown"),
+    exposure: ["https://app.example.test", "http://10.10.10.20", "ssh://app.example.test:22"],
+    monitorRoutes: ["https://app.example.test", "http://10.10.10.20"]
+  };
+  return summaryShell([service], [], [
+    {
+      serviceId: "svc-all-routes-enabled",
+      target: "routes",
+      health: "unknown",
+      message: "monitor enabled; waiting for next check",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithStaleOnlyRouteRows() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-stale-routes", "stale-routes", "unhealthy"),
+    exposure: ["https://current.example.test", "ssh://stale.example.test:22"],
+    monitorRoutes: ["https://current.example.test"]
+  };
+  const staleTarget = "routes: https://old.example.test";
+  return summaryShell([service], [
+    {
+      serviceId: "svc-stale-routes",
+      target: staleTarget,
+      uptimePercent: 0,
+      checkCount: 1,
+      samples: [{
+        health: "unhealthy",
+        checkedAt: new Date(now).toISOString(),
+        message: "stale route failed"
+      }]
+    }
+  ], [
+    {
+      serviceId: "svc-stale-routes",
+      target: staleTarget,
+      health: "unhealthy",
+      message: "stale route failed",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithCanonicalMonitorRoutes() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-canonical-routes", "canonical-routes", "healthy"),
+    exposure: ["HTTPS://APP.EXAMPLE.TEST/", "https://app.example.test:443"],
+    monitorRoutes: ["https://app.example.test"]
+  };
+  const target = "routes: https://app.example.test";
+  return summaryShell([service], [
+    {
+      serviceId: "svc-canonical-routes",
+      target,
+      uptimePercent: 100,
+      checkCount: 2,
+      samples: [{
+        health: "healthy",
+        checkedAt: new Date(now - 60_000).toISOString(),
+        message: "route ok"
+      }]
+    }
+  ], [
+    {
+      serviceId: "svc-canonical-routes",
+      target,
+      health: "healthy",
+      message: "route ok",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithSlashDistinctRoutes() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-slash-routes", "slash-routes", "healthy"),
+    exposure: ["https://app.example.test/admin", "https://app.example.test/admin/"],
+    monitorRoutes: ["https://app.example.test/admin", "https://app.example.test/admin/"]
+  };
+  const samples = (target: string) => [{
+    health: "healthy",
+    checkedAt: new Date(now - 60_000).toISOString(),
+    message: `${target} ok`
+  }];
+  return summaryShell([service], [
+    {
+      serviceId: "svc-slash-routes",
+      target: "routes: https://app.example.test/admin",
+      uptimePercent: 100,
+      checkCount: 1,
+      samples: samples("admin")
+    },
+    {
+      serviceId: "svc-slash-routes",
+      target: "routes: https://app.example.test/admin/",
+      uptimePercent: 100,
+      checkCount: 1,
+      samples: samples("admin slash")
+    }
+  ], [
+    {
+      serviceId: "svc-slash-routes",
+      target: "routes: https://app.example.test/admin",
+      health: "healthy",
+      message: "admin ok",
+      checkedAt: new Date(now).toISOString()
+    },
+    {
+      serviceId: "svc-slash-routes",
+      target: "routes: https://app.example.test/admin/",
+      health: "healthy",
+      message: "admin slash ok",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+type MonitorOverrideRequest = {
+  serviceId: string;
+  target: string;
+  notApplicable: boolean;
+};
+
+function applyMonitorOverride(summary: ReturnType<typeof summaryWithNotApplicableMonitor>, override: MonitorOverrideRequest) {
+  if (override.target === "routes" && override.notApplicable) {
+    summary.statuses = summary.statuses.filter((status) => !status.target.startsWith("routes: "));
+    summary.uptime = summary.uptime.filter((stat) => !stat.target.startsWith("routes: "));
+  }
+  const index = summary.statuses.findIndex((status) => (
+    status.serviceId === override.serviceId && status.target === override.target
+  ));
+  if (!override.notApplicable) {
+    if (index >= 0 && summary.statuses[index]?.health === "not_applicable") {
+      summary.statuses.splice(index, 1);
+    }
+    return;
+  }
+
+  const status = {
+    serviceId: override.serviceId,
+    target: override.target,
+    health: "not_applicable" as const,
+    message: "not applicable",
+    checkedAt: new Date().toISOString()
+  };
+  if (index >= 0) {
+    summary.statuses[index] = status;
+  } else {
+    summary.statuses.push(status);
+  }
 }
 
 async function waitForServer(url: string) {

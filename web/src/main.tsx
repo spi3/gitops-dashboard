@@ -35,6 +35,7 @@ type Service = {
   images: string[];
   dependencies: string[];
   exposure: string[];
+  monitorRoutes?: string[];
 };
 
 type StatusResult = {
@@ -66,9 +67,13 @@ type TargetSample = {
 
 type MonitorTargetDetail = {
   target: string;
+  label: string;
+  kind: MonitorTargetKind;
   status: StatusResult | null;
   uptime: UptimeStat | null;
 };
+
+type MonitorTargetKind = "service_routes" | "route" | "target";
 
 type ContainerStatus = {
   id: string;
@@ -167,6 +172,8 @@ const tileSlots = 28;
 const drawerSlots = 40;
 const refreshIntervalMs = 30_000;
 const themeStorageKey = "gitops-dashboard-theme";
+const routesTarget = "routes";
+const routeTargetPrefix = `${routesTarget}:`;
 
 function App() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -618,7 +625,7 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
   const closeRef = useRef<HTMLButtonElement>(null);
   const routes = accessTargets(service);
   const commit = service.sourceCommit ? service.sourceCommit.slice(0, 7) : "";
-  const targets = monitorTargetDetails(statuses, uptime);
+  const targets = monitorTargetDetails(service, statuses, uptime);
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -675,10 +682,17 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
             const ignored = target.status?.health === "not_applicable";
             const busy = busyMonitorOverride === monitorOverrideKey(service.id, target.target);
             return (
-              <div className={`targetBlock ${ignored ? "notApplicable" : ""}`} key={target.target}>
+              <div className={targetBlockClass(target, ignored)} key={target.target}>
                 <div className="targetHead">
-                  <strong>{target.target}</strong>
-                  <span>{targetDetailMeta(target)}</span>
+                  <div className="targetTitle">
+                    <strong>{target.label}</strong>
+                    {target.kind !== "target" ? (
+                      <span className="targetScope">
+                        {target.kind === "service_routes" ? "Service override" : "Route"}
+                      </span>
+                    ) : null}
+                  </div>
+                  <span className="targetMeta">{targetDetailMeta(target)}</span>
                 </div>
                 {target.uptime ? <PulseStrip samples={target.uptime.samples} slots={drawerSlots} wide /> : null}
                 {ignored ? (
@@ -1080,20 +1094,64 @@ function latestCheckTime(uptime: UptimeStat[], statuses: StatusResult[]): string
   return latest;
 }
 
-function monitorTargetDetails(statuses: StatusResult[], uptime: UptimeStat[]): MonitorTargetDetail[] {
+function monitorTargetDetails(service: Service, statuses: StatusResult[], uptime: UptimeStat[]): MonitorTargetDetail[] {
   const byTarget = new Map<string, MonitorTargetDetail>();
+  const routeTargets = monitorRouteTargets(service);
+  const currentRouteTargetKeys = new Set(routeTargets.map((route) => routeTargetForUrl(route)));
+  const ensureDetail = (target: string, serviceRoutes = false) => {
+    const key = target;
+    let detail = byTarget.get(key);
+    if (!detail) {
+      const presentation = monitorTargetPresentation(target, serviceRoutes);
+      detail = { target, ...presentation, status: null, uptime: null };
+      byTarget.set(key, detail);
+    } else if (serviceRoutes) {
+      detail.label = "All routes";
+      detail.kind = "service_routes";
+    }
+    return detail;
+  };
+
   for (const stat of uptime) {
-    byTarget.set(stat.target, { target: stat.target, status: null, uptime: stat });
+    ensureDetail(stat.target).uptime = stat;
   }
   for (const status of statuses) {
-    const detail = byTarget.get(status.target);
-    if (detail) {
-      detail.status = status;
-    } else {
-      byTarget.set(status.target, { target: status.target, status, uptime: null });
+    const detail = ensureDetail(status.target);
+    detail.target = status.target;
+    detail.status = status;
+  }
+
+  const hasCurrentRouteRows = Array.from(byTarget.values()).some((target) => (
+    target.kind === "route" && currentRouteTargetKeys.has(target.target)
+  ));
+  const parentRouteStatus = statuses.find((status) => status.target === routesTarget);
+  const hasServiceRoutesParent = isServiceRoutesParentStatus(parentRouteStatus, routeTargets.length > 0, hasCurrentRouteRows);
+  if (hasServiceRoutesParent) {
+    ensureDetail(routesTarget, true);
+  } else if (routeTargets.length > 0 && hasCurrentRouteRows && !byTarget.has(routesTarget)) {
+    ensureDetail(routesTarget, true);
+  }
+
+  if (routeTargets.length > 0 && (hasCurrentRouteRows || hasServiceRoutesParent)) {
+    for (const route of routeTargets) {
+      if (!byTarget.has(routeTargetForUrl(route))) {
+        ensureDetail(routeTargetForUrl(route));
+      }
     }
   }
-  return Array.from(byTarget.values()).sort((left, right) => left.target.localeCompare(right.target));
+
+  const routeOrder = routeMonitorOrder(service);
+  return Array.from(byTarget.values()).sort((left, right) => compareMonitorTargets(left, right, routeOrder));
+}
+
+function isServiceRoutesParentStatus(status: StatusResult | undefined, hasConfiguredRoutes: boolean, hasCurrentRouteRows: boolean): boolean {
+  if (!hasConfiguredRoutes || !status || status.target !== routesTarget || hasCurrentRouteRows) {
+    return false;
+  }
+  if (status.health === "not_applicable") {
+    return true;
+  }
+  return status.health === "unknown" && status.message === "monitor enabled; waiting for next check";
 }
 
 function targetDetailMeta(target: MonitorTargetDetail): string {
@@ -1106,7 +1164,81 @@ function targetDetailMeta(target: MonitorTargetDetail): string {
   if (target.status) {
     return statusWord[target.status.health];
   }
+  if (target.kind === "service_routes") {
+    return "all routes";
+  }
   return "no checks yet";
+}
+
+function targetBlockClass(target: MonitorTargetDetail, ignored: boolean): string {
+  return [
+    "targetBlock",
+    target.kind === "service_routes" ? "allRoutesTarget" : "",
+    target.kind === "route" ? "routeTarget" : "",
+    ignored ? "notApplicable" : ""
+  ].filter(Boolean).join(" ");
+}
+
+function monitorTargetPresentation(target: string, serviceRoutes = false): Pick<MonitorTargetDetail, "label" | "kind"> {
+  if (target === routesTarget && serviceRoutes) {
+    return { label: "All routes", kind: "service_routes" };
+  }
+  if (isPerRouteTarget(target)) {
+    return { label: routeUrlForTarget(target), kind: "route" };
+  }
+  return { label: target, kind: "target" };
+}
+
+function compareMonitorTargets(
+  left: MonitorTargetDetail,
+  right: MonitorTargetDetail,
+  routeOrder: Map<string, number>
+): number {
+  const kindOrder: Record<MonitorTargetKind, number> = {
+    service_routes: 0,
+    route: 1,
+    target: 2
+  };
+  const leftKind = kindOrder[left.kind];
+  const rightKind = kindOrder[right.kind];
+  if (leftKind !== rightKind) {
+    return leftKind - rightKind;
+  }
+  if (left.kind === "route" && right.kind === "route") {
+    const leftOrder = routeOrder.get(left.target) ?? Number.MAX_SAFE_INTEGER;
+    const rightOrder = routeOrder.get(right.target) ?? Number.MAX_SAFE_INTEGER;
+    if (leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+  }
+  return left.label.localeCompare(right.label);
+}
+
+function routeMonitorOrder(service: Service): Map<string, number> {
+  const order = new Map<string, number>();
+  monitorRouteTargets(service).forEach((route, index) => {
+    order.set(routeTargetForUrl(route), index);
+  });
+  return order;
+}
+
+function isPerRouteTarget(target: string): boolean {
+  return target.startsWith(routeTargetPrefix);
+}
+
+function routeUrlForTarget(target: string): string {
+  const route = target.startsWith(`${routeTargetPrefix} `)
+    ? target.slice(routeTargetPrefix.length + 1)
+    : target.slice(routeTargetPrefix.length);
+  return route || "Route";
+}
+
+function routeTargetForUrl(url: string): string {
+  return `${routeTargetPrefix} ${url}`;
+}
+
+function monitorRouteTargets(service: Service): string[] {
+  return service.monitorRoutes ?? [];
 }
 
 function monitorOverrideKey(serviceId: string, target: string): string {

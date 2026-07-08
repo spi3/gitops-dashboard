@@ -15,6 +15,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/routetarget"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -23,6 +24,11 @@ type Store struct {
 }
 
 var ErrStatusNotFound = errors.New("status result not found")
+
+const (
+	routeMonitorTarget = routetarget.Parent
+	routeTargetPrefix  = routetarget.Prefix
+)
 
 type RuntimeServiceSource struct {
 	Repository string
@@ -56,6 +62,284 @@ func (store *Store) migrate(ctx context.Context) error {
 	}
 	if err := store.ensureColumn(ctx, "services", "config_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
+	}
+	if err := store.canonicalizeStoredRouteTargets(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (store *Store) canonicalizeStoredRouteTargets(ctx context.Context) error {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := canonicalizeMonitorOverrides(ctx, tx); err != nil {
+		return err
+	}
+	if err := canonicalizeStatusResults(ctx, tx); err != nil {
+		return err
+	}
+	if err := canonicalizeStatusHistory(ctx, tx); err != nil {
+		return err
+	}
+	if err := enforceActiveRouteOverrideStatuses(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type monitorOverrideRouteAlias struct {
+	serviceID     string
+	target        string
+	notApplicable int
+	updatedAt     string
+	canonical     string
+}
+
+func canonicalizeMonitorOverrides(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT service_id, target, not_applicable, updated_at
+FROM monitor_overrides
+WHERE target LIKE ?
+`, routeTargetPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("query route override aliases: %w", err)
+	}
+	var aliases []monitorOverrideRouteAlias
+	for rows.Next() {
+		var alias monitorOverrideRouteAlias
+		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.notApplicable, &alias.updatedAt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		if !ok || canonical == alias.target {
+			continue
+		}
+		alias.canonical = canonical
+		aliases = append(aliases, alias)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, alias := range aliases {
+		var existingNotApplicable int
+		var existingUpdatedAt string
+		err := tx.QueryRowContext(ctx, `
+SELECT not_applicable, updated_at
+FROM monitor_overrides
+WHERE service_id=? AND target=?
+`, alias.serviceID, alias.canonical).Scan(&existingNotApplicable, &existingUpdatedAt)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx, `
+UPDATE monitor_overrides SET target=?
+WHERE service_id=? AND target=?
+`, alias.canonical, alias.serviceID, alias.target); err != nil {
+				return fmt.Errorf("canonicalize route override %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+		case err != nil:
+			return err
+		default:
+			mergedNotApplicable := existingNotApplicable
+			if alias.notApplicable > mergedNotApplicable {
+				mergedNotApplicable = alias.notApplicable
+			}
+			mergedUpdatedAt := existingUpdatedAt
+			if alias.updatedAt > mergedUpdatedAt {
+				mergedUpdatedAt = alias.updatedAt
+			}
+			if _, err := tx.ExecContext(ctx, `
+UPDATE monitor_overrides SET not_applicable=?, updated_at=?
+WHERE service_id=? AND target=?
+`, mergedNotApplicable, mergedUpdatedAt, alias.serviceID, alias.canonical); err != nil {
+				return fmt.Errorf("merge route override %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+DELETE FROM monitor_overrides
+WHERE service_id=? AND target=?
+`, alias.serviceID, alias.target); err != nil {
+				return fmt.Errorf("delete route override alias %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+		}
+	}
+	return nil
+}
+
+type statusResultRouteAlias struct {
+	serviceID string
+	target    string
+	health    string
+	message   string
+	checkedAt string
+	canonical string
+}
+
+func canonicalizeStatusResults(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT service_id, target, health, message, checked_at
+FROM status_results
+WHERE target LIKE ?
+`, routeTargetPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("query route status aliases: %w", err)
+	}
+	var aliases []statusResultRouteAlias
+	for rows.Next() {
+		var alias statusResultRouteAlias
+		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.health, &alias.message, &alias.checkedAt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		if !ok || canonical == alias.target {
+			continue
+		}
+		alias.canonical = canonical
+		aliases = append(aliases, alias)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, alias := range aliases {
+		var existing statusResultRouteAlias
+		err := tx.QueryRowContext(ctx, `
+SELECT service_id, target, health, message, checked_at
+FROM status_results
+WHERE service_id=? AND target=?
+`, alias.serviceID, alias.canonical).Scan(&existing.serviceID, &existing.target, &existing.health, &existing.message, &existing.checkedAt)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.ExecContext(ctx, `
+UPDATE status_results SET target=?
+WHERE service_id=? AND target=?
+`, alias.canonical, alias.serviceID, alias.target); err != nil {
+				return fmt.Errorf("canonicalize route status %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+		case err != nil:
+			return err
+		default:
+			chosen := existing
+			if shouldReplaceCanonicalStatus(alias, existing) {
+				chosen = alias
+			}
+			if _, err := tx.ExecContext(ctx, `
+UPDATE status_results SET health=?, message=?, checked_at=?
+WHERE service_id=? AND target=?
+`, chosen.health, chosen.message, chosen.checkedAt, alias.serviceID, alias.canonical); err != nil {
+				return fmt.Errorf("merge route status %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+			if _, err := tx.ExecContext(ctx, `
+DELETE FROM status_results
+WHERE service_id=? AND target=?
+`, alias.serviceID, alias.target); err != nil {
+				return fmt.Errorf("delete route status alias %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+		}
+	}
+	return nil
+}
+
+func shouldReplaceCanonicalStatus(candidate, existing statusResultRouteAlias) bool {
+	if candidate.checkedAt != existing.checkedAt {
+		return candidate.checkedAt > existing.checkedAt
+	}
+	candidatePriority := healthPriority(core.HealthState(candidate.health))
+	existingPriority := healthPriority(core.HealthState(existing.health))
+	if candidatePriority != existingPriority {
+		return candidatePriority < existingPriority
+	}
+	return candidate.target < existing.target
+}
+
+type statusHistoryRouteAlias struct {
+	id        int64
+	target    string
+	canonical string
+}
+
+func canonicalizeStatusHistory(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, target
+FROM status_history
+WHERE target LIKE ?
+`, routeTargetPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("query route history aliases: %w", err)
+	}
+	var aliases []statusHistoryRouteAlias
+	for rows.Next() {
+		var alias statusHistoryRouteAlias
+		if err := rows.Scan(&alias.id, &alias.target); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		if !ok || canonical == alias.target {
+			continue
+		}
+		alias.canonical = canonical
+		aliases = append(aliases, alias)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, alias := range aliases {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE status_history SET target=?
+WHERE id=?
+`, alias.canonical, alias.id); err != nil {
+			return fmt.Errorf("canonicalize route history %d/%s: %w", alias.id, alias.target, err)
+		}
+	}
+	return nil
+}
+
+type activeRouteOverride struct {
+	serviceID string
+	target    string
+	updatedAt string
+}
+
+func enforceActiveRouteOverrideStatuses(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT service_id, target, updated_at
+FROM monitor_overrides
+WHERE target LIKE ? AND not_applicable=1
+`, routeTargetPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("query active route overrides: %w", err)
+	}
+	var overrides []activeRouteOverride
+	for rows.Next() {
+		var override activeRouteOverride
+		if err := rows.Scan(&override.serviceID, &override.target, &override.updatedAt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		overrides = append(overrides, override)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, override := range overrides {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(service_id, target) DO UPDATE SET
+  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at
+`, override.serviceID, override.target, string(core.HealthNotApplicable), "not applicable", override.updatedAt); err != nil {
+			return fmt.Errorf("force route override status %s/%s: %w", override.serviceID, override.target, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE status_history
+SET health=?, message=?
+WHERE service_id=? AND target=?
+`, string(core.HealthNotApplicable), "not applicable", override.serviceID, override.target); err != nil {
+			return fmt.Errorf("force route override history %s/%s: %w", override.serviceID, override.target, err)
+		}
 	}
 	return nil
 }
@@ -481,6 +765,10 @@ FROM services ORDER BY repository, runtime, name
 }
 
 func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, error) {
+	parentRouteOverrides, err := store.parentRouteOverrideServices(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := store.db.QueryContext(ctx, `
 SELECT service_id, target, health, message, checked_at
 FROM status_results ORDER BY checked_at DESC
@@ -501,6 +789,9 @@ FROM status_results ORDER BY checked_at DESC
 		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
 			status.CheckedAt = parsed
 		}
+		if parentRouteOverrides[status.ServiceID] && strings.HasPrefix(status.Target, routeTargetPrefix) {
+			continue
+		}
 		statuses = append(statuses, status)
 	}
 	return statuses, rows.Err()
@@ -518,6 +809,12 @@ func (store *Store) SetMonitorNotApplicable(ctx context.Context, serviceID, targ
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	resolved, err := resolveMonitorOverrideTarget(ctx, tx, serviceID, target)
+	if err != nil {
+		return err
+	}
+	target = resolved.target
+
 	var exists int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM status_results WHERE service_id=? AND target=?
@@ -525,7 +822,12 @@ SELECT COUNT(*) FROM status_results WHERE service_id=? AND target=?
 		return err
 	}
 	if exists == 0 {
-		return ErrStatusNotFound
+		if !notApplicable {
+			return ErrStatusNotFound
+		}
+		if !resolved.syntheticRouteTarget {
+			return ErrStatusNotFound
+		}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -538,11 +840,24 @@ ON CONFLICT(service_id, target) DO UPDATE SET not_applicable=1, updated_at=exclu
 			return fmt.Errorf("set monitor override %s/%s: %w", serviceID, target, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-UPDATE status_results SET health=?, message=?, checked_at=? WHERE service_id=? AND target=?
-`, string(core.HealthNotApplicable), "not applicable", now, serviceID, target); err != nil {
+INSERT INTO status_results(service_id, target, health, message, checked_at)
+VALUES(?, ?, ?, ?, ?)
+ON CONFLICT(service_id, target) DO UPDATE SET
+  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at
+`, serviceID, target, string(core.HealthNotApplicable), "not applicable", now); err != nil {
 			return fmt.Errorf("update status override %s/%s: %w", serviceID, target, err)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target=?`, serviceID, target); err != nil {
+		if resolved.syntheticRouteParent {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target LIKE ?`, serviceID, routeTargetPrefix+"%"); err != nil {
+				return fmt.Errorf("clear child route statuses %s/%s: %w", serviceID, target, err)
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target LIKE ?`, serviceID, routeTargetPrefix+"%"); err != nil {
+				return fmt.Errorf("clear child route history %s/%s: %w", serviceID, target, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM status_history WHERE service_id=? AND target=?
+`, serviceID, target); err != nil {
 			return fmt.Errorf("clear ignored status history %s/%s: %w", serviceID, target, err)
 		}
 	} else {
@@ -560,25 +875,73 @@ WHERE service_id=? AND target=? AND health=?
 	return tx.Commit()
 }
 
+type resolvedMonitorOverrideTarget struct {
+	target               string
+	syntheticRouteTarget bool
+	syntheticRouteParent bool
+}
+
+func resolveMonitorOverrideTarget(ctx context.Context, tx *sql.Tx, serviceID, target string) (resolvedMonitorOverrideTarget, error) {
+	resolved := resolvedMonitorOverrideTarget{target: strings.TrimSpace(target)}
+	routes, err := serviceMonitorRoutes(ctx, tx, serviceID)
+	if err != nil {
+		return resolved, err
+	}
+	if resolved.target == routeMonitorTarget {
+		if len(routes) > 0 {
+			resolved.syntheticRouteTarget = true
+			resolved.syntheticRouteParent = true
+		}
+		return resolved, nil
+	}
+	route, ok := routetarget.RouteFromTarget(resolved.target)
+	if !ok {
+		return resolved, nil
+	}
+	resolved.target = routetarget.Target(route)
+	for _, configuredRoute := range routes {
+		if configuredRoute == route {
+			resolved.target = routetarget.Target(configuredRoute)
+			resolved.syntheticRouteTarget = true
+			return resolved, nil
+		}
+	}
+	return resolved, nil
+}
+
+type serviceQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func serviceMonitorRoutes(ctx context.Context, queryer serviceQuerier, serviceID string) ([]string, error) {
+	var exposureJSON string
+	err := queryer.QueryRowContext(ctx, `SELECT exposure_json FROM services WHERE id=?`, serviceID).Scan(&exposureJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var exposure []string
+	fromJSON(exposureJSON, &exposure)
+	return monitorRoutesFromExposure(exposure), nil
+}
+
+func monitorRoutesFromExposure(exposure []string) []string {
+	return routetarget.Routes(exposure)
+}
+
 func (store *Store) MonitorNotApplicable(ctx context.Context, serviceID, target string) (bool, error) {
 	serviceID = strings.TrimSpace(serviceID)
-	target = strings.TrimSpace(target)
+	target = canonicalStatusTarget(target)
 	if serviceID == "" || target == "" {
 		return false, nil
 	}
-	var ignored int
-	err := store.db.QueryRowContext(ctx, `
-SELECT COALESCE(not_applicable, 0)
-FROM monitor_overrides
-WHERE service_id=? AND target=?
-`, serviceID, target).Scan(&ignored)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	exact, parent, err := monitorOverrideState(ctx, store.db, serviceID, target)
 	if err != nil {
 		return false, err
 	}
-	return ignored == 1, nil
+	return exact || parent, nil
 }
 
 func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarget, prefix string, keep []string) error {
@@ -728,6 +1091,7 @@ func normalizeService(service core.Service) core.Service {
 	if service.Exposure == nil {
 		service.Exposure = []string{}
 	}
+	service.MonitorRoutes = monitorRoutesFromExposure(service.Exposure)
 	if service.ConfigRefs == nil {
 		service.ConfigRefs = []string{}
 	}
@@ -738,16 +1102,21 @@ func normalizeService(service core.Service) core.Service {
 }
 
 func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) error {
+	status.ServiceID = strings.TrimSpace(status.ServiceID)
+	status.Target = canonicalStatusTarget(status.Target)
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	notApplicable, err := monitorNotApplicable(ctx, tx, status.ServiceID, status.Target)
+	exactOverride, parentOverride, err := monitorOverrideState(ctx, tx, status.ServiceID, status.Target)
 	if err != nil {
 		return err
 	}
-	if notApplicable {
+	if parentOverride && routetarget.IsChildTarget(status.Target) {
+		return tx.Commit()
+	}
+	if exactOverride {
 		status.Health = core.HealthNotApplicable
 		status.Message = "not applicable"
 	}
@@ -779,24 +1148,104 @@ VALUES(?, ?, ?, ?, ?)
 	return tx.Commit()
 }
 
-func monitorNotApplicable(ctx context.Context, tx *sql.Tx, serviceID, target string) (bool, error) {
-	var ignored int
-	err := tx.QueryRowContext(ctx, `
-SELECT COALESCE(not_applicable, 0)
+type overrideQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func monitorOverrideState(ctx context.Context, queryer overrideQuerier, serviceID, target string) (bool, bool, error) {
+	target = canonicalStatusTarget(target)
+	childTarget := routetarget.IsChildTarget(target)
+	query := `
+SELECT target
 FROM monitor_overrides
-WHERE service_id=? AND target=?
-`, serviceID, target).Scan(&ignored)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+WHERE service_id=? AND not_applicable=1 AND target=?
+`
+	args := []any{serviceID, target}
+	if childTarget {
+		query = `
+SELECT target
+FROM monitor_overrides
+WHERE service_id=? AND not_applicable=1 AND target IN (?, ?)
+`
+		args = []any{serviceID, target, routeMonitorTarget}
 	}
+	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return ignored == 1, nil
+	defer rows.Close()
+	exactOverride := false
+	parentOverride := false
+	for rows.Next() {
+		var overrideTarget string
+		if err := rows.Scan(&overrideTarget); err != nil {
+			return false, false, err
+		}
+		switch {
+		case overrideTarget == target:
+			exactOverride = true
+		case childTarget && overrideTarget == routeMonitorTarget:
+			parentOverride = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, false, err
+	}
+	if parentOverride {
+		routes, err := serviceMonitorRoutes(ctx, queryer, serviceID)
+		if err != nil {
+			return false, false, err
+		}
+		parentOverride = len(routes) > 0
+	}
+	return exactOverride, parentOverride, nil
+}
+
+func canonicalStatusTarget(target string) string {
+	canonical, ok := routetarget.CanonicalTarget(target)
+	if ok {
+		return canonical
+	}
+	return strings.TrimSpace(target)
+}
+
+func (store *Store) parentRouteOverrideServices(ctx context.Context) (map[string]bool, error) {
+	rows, err := store.db.QueryContext(ctx, `
+SELECT s.id, s.exposure_json
+FROM services s
+JOIN monitor_overrides o ON o.service_id=s.id
+WHERE o.target=? AND o.not_applicable=1
+`, routeMonitorTarget)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	services := map[string]bool{}
+	for rows.Next() {
+		var serviceID string
+		var exposureJSON string
+		if err := rows.Scan(&serviceID, &exposureJSON); err != nil {
+			return nil, err
+		}
+		var exposure []string
+		fromJSON(exposureJSON, &exposure)
+		if len(monitorRoutesFromExposure(exposure)) > 0 {
+			services[serviceID] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return services, nil
 }
 
 func (store *Store) UptimeStats(ctx context.Context) ([]core.UptimeStat, error) {
 	windowStart := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
+	parentRouteOverrides, err := store.parentRouteOverrideServices(ctx)
+	if err != nil {
+		return nil, err
+	}
 	stats := map[string]*core.UptimeStat{}
 	order := []string{}
 	countRows, err := store.db.QueryContext(ctx, `
@@ -821,6 +1270,9 @@ GROUP BY h.service_id, h.target
 		var upCount, totalCount int
 		if err := countRows.Scan(&serviceID, &target, &upCount, &totalCount); err != nil {
 			return nil, err
+		}
+		if parentRouteOverrides[serviceID] && strings.HasPrefix(target, routeTargetPrefix) {
+			continue
 		}
 		percent := 0.0
 		if totalCount > 0 {
@@ -861,6 +1313,9 @@ ORDER BY service_id, target, checked_at ASC
 		var serviceID, target, health, message, checkedAt string
 		if err := sampleRows.Scan(&serviceID, &target, &health, &message, &checkedAt); err != nil {
 			return nil, err
+		}
+		if parentRouteOverrides[serviceID] && strings.HasPrefix(target, routeTargetPrefix) {
+			continue
 		}
 		stat, ok := stats[serviceID+"\x00"+target]
 		if !ok {

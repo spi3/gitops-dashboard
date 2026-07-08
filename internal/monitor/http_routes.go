@@ -4,16 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/routetarget"
 )
 
 const (
@@ -195,112 +192,9 @@ func routeStatusTargets(prefix string, routes []string) []string {
 }
 
 func httpRoutes(exposure []string) []string {
-	var routes []string
-	seen := map[string]bool{}
-	for _, candidate := range exposure {
-		route, ok := normalizeHTTPRoute(candidate)
-		if !ok {
-			continue
-		}
-		if seen[route] {
-			continue
-		}
-		seen[route] = true
-		routes = append(routes, route)
-	}
-	sort.SliceStable(routes, func(i, j int) bool {
-		leftScore := routeScore(routes[i])
-		rightScore := routeScore(routes[j])
-		if leftScore != rightScore {
-			return leftScore > rightScore
-		}
-		return preferRoute(routes[i], routes[j])
-	})
-	return routes
+	return routetarget.Routes(exposure)
 }
 
 func normalizeHTTPRoute(candidate string) (string, bool) {
-	value := strings.TrimSpace(candidate)
-	if value == "" || strings.HasPrefix(value, "service/") {
-		return "", false
-	}
-	if strings.Contains(value, "://") {
-		parsed, err := url.Parse(value)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-			return "", false
-		}
-		if !isCheckableRouteHost(parsed.Hostname()) {
-			return "", false
-		}
-		return parsed.String(), true
-	}
-
-	host := strings.TrimSuffix(value, "/")
-	if !isCheckableRouteHost(hostOnly(host)) {
-		return "", false
-	}
-	scheme := "https"
-	if isLANOrIP(hostOnly(host)) {
-		scheme = "http"
-	}
-	return scheme + "://" + host, true
-}
-
-func isCheckableRouteHost(host string) bool {
-	host = strings.ToLower(strings.Trim(host, "[]"))
-	if host == "" {
-		return false
-	}
-	if strings.HasSuffix(host, ".svc") || strings.Contains(host, ".svc.") || strings.HasSuffix(host, ".cluster.local") {
-		return false
-	}
-	if net.ParseIP(host) != nil {
-		return true
-	}
-	return strings.Contains(host, ".")
-}
-
-func isLANOrIP(host string) bool {
-	host = strings.ToLower(strings.Trim(host, "[]"))
-	return strings.HasSuffix(host, ".lan") || net.ParseIP(host) != nil
-}
-
-func hostOnly(host string) string {
-	withoutPath := strings.SplitN(host, "/", 2)[0]
-	if parsedHost, _, err := net.SplitHostPort(withoutPath); err == nil {
-		return parsedHost
-	}
-	return withoutPath
-}
-
-func routeScore(route string) int {
-	parsed, err := url.Parse(route)
-	if err != nil {
-		return 0
-	}
-	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
-	score := 0
-	if net.ParseIP(host) == nil {
-		score += 100
-		if strings.HasSuffix(host, ".lan") {
-			score += 30
-		}
-	}
-	if parsed.Port() != "" {
-		score += 20
-	}
-	if parsed.Path != "" && parsed.Path != "/" {
-		score += 10
-	}
-	if parsed.Scheme == "https" {
-		score += 5
-	}
-	return score
-}
-
-func preferRoute(candidate, current string) bool {
-	if len(candidate) != len(current) {
-		return len(candidate) < len(current)
-	}
-	return candidate < current
+	return routetarget.Normalize(candidate)
 }

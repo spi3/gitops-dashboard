@@ -776,8 +776,24 @@ main {
   color: var(--ink-3);
 }
 
+.targetBlock.allRoutesTarget {
+  background: var(--card-hover);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.targetBlock.routeTarget {
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+}
+
+.targetBlock.routeTarget.notApplicable {
+  border-left-color: var(--line-soft);
+}
+
 .targetHead {
-  align-items: baseline;
+  align-items: flex-start;
   display: flex;
   font-family: "JetBrains Mono Variable", ui-monospace, monospace;
   font-size: 12px;
@@ -785,18 +801,40 @@ main {
   justify-content: space-between;
 }
 
+.targetTitle {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
 .targetHead strong {
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .targetHead span {
   color: var(--ink-3);
 }
 
+.targetScope {
+  font-size: 11px;
+}
+
+.targetMeta {
+  flex: none;
+  text-align: right;
+}
+
 .targetNote {
   color: var(--ink-2);
   font-size: 13px;
   margin: 0;
+}
+
+.targetBlock.notApplicable .pulseStrip,
+.targetBlock.notApplicable .targetNote {
+  opacity: 0.72;
 }
 
 .targetToggle {

@@ -296,6 +296,13 @@ func TestNormalizeHTTPRoute(t *testing.T) {
 		ok        bool
 	}{
 		{name: "https route", candidate: "https://app.example.test/path", want: "https://app.example.test/path", ok: true},
+		{name: "trailing slash", candidate: "https://app.example.test/", want: "https://app.example.test", ok: true},
+		{name: "non-root trailing slash", candidate: "https://app.example.test/admin/", want: "https://app.example.test/admin/", ok: true},
+		{name: "default https port", candidate: "https://app.example.test:443", want: "https://app.example.test", ok: true},
+		{name: "non-root default https port", candidate: "https://app.example.test:443/admin/", want: "https://app.example.test/admin/", ok: true},
+		{name: "escaped slash", candidate: "https://app.example.test/a%2Fb", want: "https://app.example.test/a%2Fb", ok: true},
+		{name: "escaped space", candidate: "https://app.example.test/a%20b", want: "https://app.example.test/a%20b", ok: true},
+		{name: "case variant", candidate: "HTTPS://APP.EXAMPLE.TEST", want: "https://app.example.test", ok: true},
 		{name: "lan host", candidate: "app.lan:8080", want: "http://app.lan:8080", ok: true},
 		{name: "public host", candidate: "app.example.test", want: "https://app.example.test", ok: true},
 		{name: "ip host", candidate: "10.10.10.20:8080", want: "http://10.10.10.20:8080", ok: true},
@@ -341,7 +348,7 @@ func TestFirstHTTPRoutePrefersMostSpecificRoute(t *testing.T) {
 				"https://jellyfin.regulalabs.com",
 				"service/jellyfin",
 			},
-			want: "http://jellyfin.lan/",
+			want: "http://jellyfin.lan",
 		},
 		{
 			name: "fallback to only bare ip route",
