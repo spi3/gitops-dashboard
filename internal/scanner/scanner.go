@@ -31,7 +31,11 @@ type Scanner struct {
 	logger *slog.Logger
 }
 
-const GitCommandTimeout = 2 * time.Minute
+const (
+	GitCommandTimeout        = 2 * time.Minute
+	repoSyncGitCommands      = 6
+	repoSyncOperationTimeout = time.Duration(repoSyncGitCommands)*GitCommandTimeout + 30*time.Second
+)
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Scanner {
 	return Scanner{cfg: cfg, store: store, logger: logger}
@@ -96,6 +100,17 @@ func (scanner Scanner) runRepoLoop(ctx context.Context, repo config.RepositoryCo
 }
 
 func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig) error {
+	key, err := scanner.repoOperationKey(repo)
+	if err != nil {
+		return err
+	}
+	_, err = repoScanFlights.do(ctx, key, func() (any, error) {
+		return nil, scanner.scanOneUnshared(ctx, repo)
+	})
+	return err
+}
+
+func (scanner Scanner) scanOneUnshared(ctx context.Context, repo config.RepositoryConfig) error {
 	scanID, err := scanner.store.StartScan(ctx, repo.Name)
 	if err != nil {
 		return err
@@ -132,6 +147,24 @@ func CurrentCommit(ctx context.Context, repoPath string) (string, error) {
 }
 
 func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
+	key, err := scanner.repoOperationKey(repo)
+	if err != nil {
+		return "", err
+	}
+	value, err := repoSyncFlights.doDetached(ctx, key, func() (any, error) {
+		// Keep the shared git operation alive when a monitor-scoped caller times out;
+		// each caller still bounds its own wait through doDetached.
+		syncCtx, cancel := context.WithTimeout(context.Background(), repoSyncOperationTimeout)
+		defer cancel()
+		return scanner.syncRepoUnshared(syncCtx, repo)
+	})
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
+}
+
+func (scanner Scanner) syncRepoUnshared(ctx context.Context, repo config.RepositoryConfig) (string, error) {
 	repoCacheDir, err := scanner.ensureRepoCacheDir()
 	if err != nil {
 		return "", err
@@ -265,6 +298,7 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 	var kubeResources []parser.KubernetesResource
 	var traefikRoutes []parser.TraefikRoute
 	var parseErrors []string
+	pathFilter := newRepoPathFilter(repo)
 	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			parseErrors = append(parseErrors, walkErr.Error())
@@ -275,7 +309,7 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 				return filepath.SkipDir
 			}
 			rel, err := filepath.Rel(repoPath, path)
-			if err == nil && shouldSkipRepoDir(repo, rel) {
+			if err == nil && pathFilter.shouldSkipDir(rel) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -284,7 +318,7 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 		if err != nil {
 			return nil
 		}
-		if !shouldScanRepoPath(repo, rel) {
+		if !pathFilter.shouldScan(rel) {
 			return nil
 		}
 		switch {

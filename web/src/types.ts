@@ -139,3 +139,12 @@ export type EnvironmentGroup = {
 
 export type Tab = "services" | "agents";
 export type AgentConnection = "connected" | "stale" | "offline" | "never";
+
+export type DashboardActionStatus = {
+  id: string;
+  action: "scan" | "monitor";
+  status: "running" | "ok" | "error";
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+};

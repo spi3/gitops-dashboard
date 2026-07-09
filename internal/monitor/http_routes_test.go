@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -95,6 +96,104 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 		if status.ServiceID == "internal" {
 			t.Fatalf("internal service produced status: %#v", status)
 		}
+	}
+}
+
+func TestHTTPRouteCheckRecordsTimeoutForEveryQueuedRoute(t *testing.T) {
+	t.Parallel()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	services := make([]core.Service, 0, httpRouteConcurrency+2)
+	for i := 0; i < httpRouteConcurrency+2; i++ {
+		services = append(services, core.Service{
+			ID:       fmt.Sprintf("svc-%02d", i),
+			Exposure: []string{fmt.Sprintf("https://app-%02d.example.test", i)},
+		})
+	}
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, services, client); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != len(services) {
+		t.Fatalf("statuses = %#v, want %d timeout rows", statuses, len(services))
+	}
+	for _, status := range statuses {
+		if status.Health != core.HealthError || !strings.Contains(status.Message, "timed out") {
+			t.Fatalf("status = %#v, want explicit timeout error", status)
+		}
+	}
+}
+
+func TestHTTPRouteCheckSkipsCanceledResults(t *testing.T) {
+	t.Parallel()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const target = "routes: https://app.example.test"
+	if err := store.UpsertStatus(context.Background(), core.StatusResult{
+		ServiceID: "app",
+		Target:    target,
+		Health:    core.HealthHealthy,
+		Message:   "previous healthy",
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	monitor := New(config.Config{}, store, slog.Default())
+	done := make(chan error, 1)
+	go func() {
+		done <- monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, []core.Service{
+			{ID: "app", Exposure: []string{"https://app.example.test"}},
+		}, client)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for route check to start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for canceled route check to finish")
+	}
+
+	statuses, err := store.StatusResults(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Target != target || statuses[0].Health != core.HealthHealthy || statuses[0].Message != "previous healthy" {
+		t.Fatalf("statuses = %#v, want previous healthy route status unchanged", statuses)
 	}
 }
 

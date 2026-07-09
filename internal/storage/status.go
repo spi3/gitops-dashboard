@@ -130,7 +130,7 @@ WHERE service_id=? AND target=? AND health=?
 			return fmt.Errorf("reset status override %s/%s: %w", serviceID, target, err)
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 type resolvedMonitorOverrideTarget struct {
@@ -247,7 +247,7 @@ func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarg
 			return err
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 type RouteMonitorLookup struct {
@@ -381,7 +381,7 @@ func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, 
 	if err := deleteByServiceAndTargets(ctx, tx, "status_history", serviceID, removeTargets); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
@@ -511,7 +511,7 @@ DELETE FROM status_history WHERE service_id=? AND target=?
 `, status.ServiceID, status.Target); err != nil {
 			return fmt.Errorf("clear not applicable status history %s/%s: %w", status.ServiceID, status.Target, err)
 		}
-		return tx.Commit()
+		return store.commitAndInvalidateSummary(tx)
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO status_history(service_id, target, health, message, checked_at)
@@ -520,13 +520,17 @@ VALUES(?, ?, ?, ?, ?)
 	if err != nil {
 		return fmt.Errorf("insert status history %s/%s: %w", status.ServiceID, status.Target, err)
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 func (store *Store) PruneStatusHistory(ctx context.Context) error {
 	cutoff := time.Now().UTC().Add(-statusHistoryWindow).Format(time.RFC3339)
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff); err != nil {
+	result, err := store.db.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff)
+	if err != nil {
 		return fmt.Errorf("prune status history: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err == nil && rows > 0 {
+		store.invalidateSummary()
 	}
 	return nil
 }

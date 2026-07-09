@@ -20,6 +20,43 @@ import (
 	clientgotesting "k8s.io/client-go/testing"
 )
 
+func TestRunTargetLoopWithoutCheckTimeoutDoesNotAddDefaultDeadline(t *testing.T) {
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	checked := make(chan bool, 1)
+	loopDone := make(chan struct{})
+	monitor := New(config.Config{}, store, slog.Default())
+	go func() {
+		monitor.runTargetLoop(ctx, "uncapped", time.Hour, nil, func(checkCtx context.Context, _ []core.Service) error {
+			_, hasDeadline := checkCtx.Deadline()
+			checked <- hasDeadline
+			return nil
+		})
+		close(loopDone)
+	}()
+
+	select {
+	case hasDeadline := <-checked:
+		if hasDeadline {
+			t.Fatal("uncapped scheduled check received a synthetic deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for scheduled check")
+	}
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for target loop to stop")
+	}
+}
+
 func TestKubernetesStatusMappingWithFakeClient(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

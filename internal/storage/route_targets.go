@@ -58,6 +58,9 @@ func (store *Store) canonicalizeStoredRouteTargetsForNames(ctx context.Context, 
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
+	if changed {
+		store.invalidateSummary()
+	}
 	return changed, nil
 }
 

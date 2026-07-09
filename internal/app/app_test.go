@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -730,7 +730,7 @@ func TestReadyzDoesNotCacheCanceledProbe(t *testing.T) {
 	}
 }
 
-func TestScanExtendsWriteDeadline(t *testing.T) {
+func TestScanEndpointStartsAsyncAction(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{
 		Server: config.ServerConfig{
@@ -746,148 +746,66 @@ func TestScanExtendsWriteDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
 	app.scanAll = func(context.Context) error {
-		time.Sleep(150 * time.Millisecond)
+		close(started)
+		<-release
 		return nil
 	}
-	server := httptest.NewUnstartedServer(app.Handler())
-	server.Config.WriteTimeout = 25 * time.Millisecond
-	server.Start()
-	defer server.Close()
 
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/scan", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/scan", nil)
 	addStateChangingHeader(req)
-	res, err := server.Client().Do(req)
-	if err != nil {
-		t.Fatalf("scan request failed before response: %v", err)
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("scan status = %d, body=%q", res.Code, res.Body.String())
 	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
+	var action dashboardAction
+	if err := json.NewDecoder(res.Body).Decode(&action); err != nil {
 		t.Fatal(err)
 	}
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("scan status = %d, body=%q", res.StatusCode, body)
+	if action.ID == "" || action.Action != "scan" || action.Status != actionStatusRunning {
+		t.Fatalf("action = %#v, want running scan action", action)
 	}
-	if !strings.Contains(string(body), `"status": "ok"`) {
-		t.Fatalf("scan body = %q, want ok status", body)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("scan action did not start")
 	}
-}
 
-func TestMonitorWriteBudgetUsesConfiguredTimeouts(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name     string
-		cfg      config.Config
-		services []core.Service
-		want     time.Duration
-	}{
-		{
-			name: "default floor",
-			cfg:  config.Config{},
-			want: 8 * time.Minute,
-		},
-		{
-			name: "single http timeout above floor",
-			cfg: config.Config{Runtime: config.RuntimeConfig{
-				HTTP: []config.HTTPRouteTarget{{
-					Name:    "routes",
-					Timeout: "10m",
-				}},
-			}},
-			services: []core.Service{{
-				ID:       "svc",
-				Exposure: []string{"https://app.example.test"},
-			}},
-			want: 30*time.Minute + actionWriteDeadlineMargin,
-		},
-		{
-			name: "sequential http targets add together",
-			cfg: config.Config{Runtime: config.RuntimeConfig{
-				HTTP: []config.HTTPRouteTarget{
-					{
-						Name:    "routes-a",
-						Timeout: "10m",
-					},
-					{
-						Name:    "routes-b",
-						Timeout: "10m",
-					},
-				},
-			}},
-			services: []core.Service{{
-				ID:       "svc",
-				Exposure: []string{"https://app.example.test"},
-			}},
-			want: 60*time.Minute + actionWriteDeadlineMargin,
-		},
-		{
-			name: "http routes add concurrency waves",
-			cfg: config.Config{Runtime: config.RuntimeConfig{
-				HTTP: []config.HTTPRouteTarget{{
-					Name:    "routes",
-					Timeout: "10m",
-				}},
-			}},
-			services: []core.Service{{
-				ID:       "svc",
-				Exposure: sixteenHTTPRoutes(),
-			}},
-			want: 60*time.Minute + actionWriteDeadlineMargin,
-		},
-		{
-			name: "repo backed ping inventory adds sync budget",
-			cfg: config.Config{Runtime: config.RuntimeConfig{
-				Ping: []config.PingTarget{{
-					Name:             "hosts",
-					Repository:       "repo",
-					AnsibleInventory: "inventory/hosts.yml",
-					Timeout:          "12m",
-				}},
-			}},
-			want: 36*time.Minute + actionWriteDeadlineMargin,
-		},
-		{
-			name: "sequential ping and http targets add together",
-			cfg: config.Config{Runtime: config.RuntimeConfig{
-				HTTP: []config.HTTPRouteTarget{{
-					Name:    "routes",
-					Timeout: "10m",
-				}},
-				Ping: []config.PingTarget{{
-					Name:    "hosts",
-					Host:    "host.example.test",
-					Timeout: "12m",
-				}},
-			}},
-			services: []core.Service{{
-				ID:       "svc",
-				Exposure: []string{"https://app.example.test"},
-			}},
-			want: 48*time.Minute + actionWriteDeadlineMargin,
-		},
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/actions/"+action.ID, nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("running action status = %d, body=%q", res.Code, res.Body.String())
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			app := &App{cfg: tt.cfg}
-			got := monitorActionWriteBudget(app.monitorSequentialTimeoutBudget(tt.services))
-			if got != tt.want {
-				t.Fatalf("monitor write budget = %s, want %s", got, tt.want)
-			}
-		})
+	if err := json.NewDecoder(res.Body).Decode(&action); err != nil {
+		t.Fatal(err)
 	}
-}
+	if action.Status != actionStatusRunning {
+		t.Fatalf("action status = %s, want running", action.Status)
+	}
 
-func sixteenHTTPRoutes() []string {
-	routes := make([]string, 0, 16)
-	for i := 0; i < 16; i++ {
-		routes = append(routes, fmt.Sprintf("https://app-%02d.example.test", i))
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for {
+		res = httptest.NewRecorder()
+		handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/actions/"+action.ID, nil))
+		if res.Code != http.StatusOK {
+			t.Fatalf("finished action status = %d, body=%q", res.Code, res.Body.String())
+		}
+		if err := json.NewDecoder(res.Body).Decode(&action); err != nil {
+			t.Fatal(err)
+		}
+		if action.Status == actionStatusOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("action = %#v, want ok", action)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return routes
 }
 
 func TestSummaryLogsDecodeError(t *testing.T) {
@@ -1026,7 +944,7 @@ func TestStateChangingEndpointsRequireCSRFHeaders(t *testing.T) {
 	req.Header.Set("Origin", "http://dashboard.example.test")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("same-origin status = %d, body=%q", res.Code, res.Body.String())
 	}
 
@@ -1036,7 +954,7 @@ func TestStateChangingEndpointsRequireCSRFHeaders(t *testing.T) {
 	addStateChangingHeader(req)
 	req.Header.Set("Origin", devOrigin)
 	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("configured dev origin status = %d, body=%q", res.Code, res.Body.String())
 	}
 
@@ -1052,7 +970,7 @@ func TestStateChangingEndpointsRequireCSRFHeaders(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/monitor", nil)
 	addStateChangingHeader(req)
 	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("non-browser status = %d, body=%q", res.Code, res.Body.String())
 	}
 }
@@ -1076,7 +994,7 @@ func TestStateChangingEndpointAllowsDevConfigOrigin(t *testing.T) {
 	addStateChangingHeader(req)
 	req.Header.Set("Origin", "http://regula1.lan:5173")
 	app.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("regula1.lan dev origin status = %d, body=%q", res.Code, res.Body.String())
 	}
 }

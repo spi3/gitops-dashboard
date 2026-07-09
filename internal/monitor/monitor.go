@@ -25,6 +25,9 @@ var ErrAgentTargetUnauthorized = errors.New("agent target is not authorized for 
 const (
 	dockerComposeProjectLabel       = core.DockerComposeProjectLabel
 	dockerComposeServiceLabel       = core.DockerComposeServiceLabel
+	defaultCheckRunTimeout          = 20 * time.Second
+	checkRunDeadlineMargin          = 2 * time.Second
+	statusWriteTimeout              = 30 * time.Second
 	statusHistoryMaintenanceTimeout = 20 * time.Second
 )
 
@@ -35,10 +38,13 @@ type Monitor struct {
 	cfg    config.Config
 	store  *storage.Store
 	logger *slog.Logger
+
+	pingCache *pingInventoryCache
+	ping      pingFunc
 }
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Monitor {
-	return Monitor{cfg: cfg, store: store, logger: logger}
+	return Monitor{cfg: cfg, store: store, logger: logger, pingCache: newPingInventoryCache(), ping: systemPing}
 }
 
 func (monitor Monitor) Run(ctx context.Context) {
@@ -113,7 +119,10 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 		}
 	}
 	for _, target := range monitor.cfg.Runtime.HTTP {
-		if err := monitor.checkHTTPRoutes(ctx, target, services); err != nil {
+		err := monitor.runCheckWithTimeout(ctx, monitor.httpRouteRunTimeout(target, services), func(checkCtx context.Context) error {
+			return monitor.checkHTTPRoutes(checkCtx, target, services)
+		})
+		if err != nil {
 			monitor.logger.Error("http route monitoring failed", "target", target.Name, "error", err)
 			combined = err
 		}
@@ -183,30 +192,32 @@ func agentTargetAllowed(target string, authorizedTargets []string) bool {
 }
 
 func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
+	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkDocker(checkCtx, target, services)
 	})
 }
 
 func (monitor Monitor) runKubernetesLoop(ctx context.Context, target config.KubernetesTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
+	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkKubernetes(checkCtx, target, services)
 	})
 }
 
 func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPRouteTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.Name, interval, func(checkCtx context.Context, services []core.Service) error {
+	monitor.runTargetLoop(ctx, target.Name, interval, func(services []core.Service) time.Duration {
+		return monitor.httpRouteRunTimeout(target, services)
+	}, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkHTTPRoutes(checkCtx, target, services)
 	})
 }
 
 func (monitor Monitor) runPingLoop(ctx context.Context, target config.PingTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.EffectiveName(), interval, func(checkCtx context.Context, _ []core.Service) error {
+	monitor.runTargetLoop(ctx, target.EffectiveName(), interval, nil, func(checkCtx context.Context, _ []core.Service) error {
 		return monitor.checkPing(checkCtx, target)
 	})
 }
 
-func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, check func(context.Context, []core.Service) error) {
+func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, checkTimeout func([]core.Service) time.Duration, check func(context.Context, []core.Service) error) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	failures := 0
@@ -215,19 +226,24 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			services, err := monitor.store.Services(checkCtx)
+			services, err := monitor.store.Services(ctx)
 			if err == nil {
-				err = check(checkCtx, services)
+				if checkTimeout != nil {
+					timeout := checkTimeout(services)
+					err = monitor.runCheckWithTimeout(ctx, timeout, func(checkCtx context.Context) error {
+						return check(checkCtx, services)
+					})
+				} else {
+					err = check(ctx, services)
+				}
 			}
-			if pruneErr := monitor.store.PruneStatusHistory(checkCtx); pruneErr != nil {
+			if pruneErr := monitor.store.PruneStatusHistory(ctx); pruneErr != nil {
 				if err != nil {
 					err = fmt.Errorf("%w; status history prune failed: %w", err, pruneErr)
 				} else {
 					err = pruneErr
 				}
 			}
-			cancel()
 			if err != nil {
 				failures++
 				monitor.logger.Error("runtime monitoring failed", "target", targetName, "error", err, "failures", failures)
@@ -249,6 +265,46 @@ func nextInterval(interval time.Duration, failures int) time.Duration {
 		return 5 * time.Minute
 	}
 	return next
+}
+
+func (monitor Monitor) runCheckWithTimeout(ctx context.Context, timeout time.Duration, check func(context.Context) error) error {
+	if timeout <= 0 {
+		timeout = defaultCheckRunTimeout
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return check(checkCtx)
+}
+
+func (monitor Monitor) upsertMonitorStatus(ctx context.Context, status core.StatusResult) error {
+	writeCtx, cancel, ok := statusWriteContext(ctx)
+	if !ok {
+		return nil
+	}
+	defer cancel()
+	return monitor.store.UpsertStatus(writeCtx, status)
+}
+
+func statusWriteContext(ctx context.Context) (context.Context, context.CancelFunc, bool) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil, nil, false
+	}
+	writeBase := ctx
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		writeBase = context.WithoutCancel(ctx)
+	}
+	writeCtx, cancel := context.WithTimeout(writeBase, statusWriteTimeout)
+	return writeCtx, cancel, true
+}
+
+func timeoutWaves(checks, concurrency int) int {
+	if checks < 1 {
+		return 1
+	}
+	if concurrency < 1 {
+		return checks
+	}
+	return (checks + concurrency - 1) / concurrency
 }
 
 func (monitor Monitor) checkDocker(ctx context.Context, target config.DockerTarget, services []core.Service) error {

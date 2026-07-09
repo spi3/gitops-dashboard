@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 const (
 	defaultHTTPRouteTimeout = 5 * time.Second
 	httpRouteConcurrency    = 8
+	httpRouteRequestBudget  = 2
 )
 
 func HTTPRouteConcurrencyLimit() int {
@@ -153,34 +155,40 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	}
 
 	for _, status := range overriddenStatuses {
-		if err := monitor.store.UpsertStatus(ctx, status); err != nil {
+		if err := monitor.upsertMonitorStatus(ctx, status); err != nil {
 			return err
 		}
 	}
 
 	results := make(chan core.StatusResult, len(checks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, httpRouteConcurrency)
-
+	jobs := make(chan httpRouteCheck, len(checks))
 	for _, check := range checks {
+		jobs <- check
+	}
+	close(jobs)
+	workers := min(httpRouteConcurrency, len(checks))
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(check httpRouteCheck) {
+		go func() {
 			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
+			for check := range jobs {
+				if err := ctx.Err(); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						results <- timeoutHTTPRouteResult(check, time.Now().UTC())
+					}
+					continue
+				}
+				health, message := checkHTTPRoute(ctx, client, check.route)
+				results <- core.StatusResult{
+					ServiceID: check.serviceID,
+					Target:    check.target,
+					Health:    health,
+					Message:   message,
+					CheckedAt: time.Now().UTC(),
+				}
 			}
-			health, message := checkHTTPRoute(ctx, client, check.route)
-			results <- core.StatusResult{
-				ServiceID: check.serviceID,
-				Target:    check.target,
-				Health:    health,
-				Message:   message,
-				CheckedAt: time.Now().UTC(),
-			}
-		}(check)
+		}()
 	}
 
 	go func() {
@@ -189,11 +197,31 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	}()
 
 	for status := range results {
-		if err := monitor.store.UpsertStatus(ctx, status); err != nil {
+		if err := monitor.upsertMonitorStatus(ctx, status); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (monitor Monitor) httpRouteRunTimeout(target config.HTTPRouteTarget, services []core.Service) time.Duration {
+	timeout, err := target.TimeoutDuration()
+	if err != nil || timeout == 0 {
+		timeout = defaultHTTPRouteTimeout
+	}
+	checks := httpRouteCheckCount(services)
+	return time.Duration(timeoutWaves(checks, httpRouteConcurrency))*httpRouteRequestBudget*timeout + checkRunDeadlineMargin
+}
+
+func httpRouteCheckCount(services []core.Service) int {
+	checks := 0
+	for _, service := range services {
+		if service.ID == "" {
+			continue
+		}
+		checks += len(httpRoutes(service.Exposure))
+	}
+	return checks
 }
 
 func checkHTTPRouteWithPolicy(ctx context.Context, client *http.Client, route string, policy routetarget.EgressPolicy) (core.HealthState, string) {
@@ -213,6 +241,9 @@ func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (cor
 		if message, ok := routePolicyStatus(err); ok {
 			return core.HealthNotApplicable, message
 		}
+		if routeTimedOut(ctx, err) {
+			return core.HealthError, fmt.Sprintf("%s timed out", route)
+		}
 		return core.HealthError, fmt.Sprintf("%s failed: %s", route, err)
 	}
 	message := fmt.Sprintf("%s %s -> %s", method, route, status)
@@ -228,6 +259,21 @@ func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (cor
 	default:
 		return core.HealthUnhealthy, message
 	}
+}
+
+func timeoutHTTPRouteResult(check httpRouteCheck, checkedAt time.Time) core.StatusResult {
+	message := fmt.Sprintf("%s timed out before route check completed", check.route)
+	return core.StatusResult{
+		ServiceID: check.serviceID,
+		Target:    check.target,
+		Health:    core.HealthError,
+		Message:   message,
+		CheckedAt: checkedAt,
+	}
+}
+
+func routeTimedOut(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 func doRouteRequest(ctx context.Context, client *http.Client, method, route string) (int, string, string, error) {

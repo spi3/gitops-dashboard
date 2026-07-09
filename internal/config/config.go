@@ -112,13 +112,14 @@ type EgressPolicyRules struct {
 }
 
 type PingTarget struct {
-	Name             string `yaml:"name"`
-	Host             string `yaml:"host"`
-	Repository       string `yaml:"repository"`
-	AnsibleInventory string `yaml:"ansibleInventory"`
-	Interval         string `yaml:"interval"`
-	Timeout          string `yaml:"timeout"`
-	Environment      string `yaml:"environment"`
+	Name               string `yaml:"name"`
+	Host               string `yaml:"host"`
+	Repository         string `yaml:"repository"`
+	AnsibleInventory   string `yaml:"ansibleInventory"`
+	Interval           string `yaml:"interval"`
+	Timeout            string `yaml:"timeout"`
+	MinRefreshInterval string `yaml:"minRefreshInterval"`
+	Environment        string `yaml:"environment"`
 }
 
 type MonitoringConfig struct {
@@ -405,6 +406,9 @@ func (cfg Config) Validate() error {
 		if _, err := target.TimeoutDuration(); err != nil {
 			return err
 		}
+		if _, err := target.MinRefreshDuration(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -516,6 +520,10 @@ func (target PingTarget) IntervalDuration() (time.Duration, error) {
 
 func (target PingTarget) TimeoutDuration() (time.Duration, error) {
 	return optionalPositiveDuration(target.Timeout, "runtime.ping.timeout")
+}
+
+func (target PingTarget) MinRefreshDuration() (time.Duration, error) {
+	return optionalPositiveDuration(target.MinRefreshInterval, "runtime.ping.minRefreshInterval")
 }
 
 func (cfg AgentConfig) IntervalDuration() (time.Duration, error) {

@@ -26,6 +26,9 @@ type Store struct {
 	decodeMu           sync.Mutex
 	decodeFailures     map[decodeFailureKey]decodeFailure
 	jsonProbeCursors   map[persistedJSONColumnKey]int64
+	summaryMu          sync.RWMutex
+	summaryVersion     uint64
+	summaryCache       summaryCache
 }
 
 var ErrStatusNotFound = errors.New("status result not found")

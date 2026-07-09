@@ -19,9 +19,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/auth"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
-	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/monitor"
-	"github.com/example/gitops-dashboard/internal/routetarget"
 	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/scanner"
 	"github.com/example/gitops-dashboard/internal/storage"
@@ -42,6 +40,14 @@ type App struct {
 	scanAll   func(context.Context) error
 	checkAll  func(context.Context) error
 
+	actionCtx     context.Context
+	actionCancel  context.CancelFunc
+	actionsWG     sync.WaitGroup
+	actionsMu     sync.Mutex
+	actions       map[string]dashboardAction
+	activeActions map[string]string
+	nextActionID  int64
+
 	readinessMu    sync.Mutex
 	readinessCache readinessStatus
 	readinessTTL   time.Duration
@@ -55,18 +61,7 @@ const (
 	stateChangingRequestHeader = "X-GitOps-Dashboard-CSRF"
 	readinessTimeout           = 2 * time.Second
 	readinessCacheTTL          = 30 * time.Second
-	actionWriteDeadlineMargin  = 30 * time.Second
-	scanGitCommandsPerRepo     = 6
-	scanFinishTimeout          = 30 * time.Second
-	minActionWriteBudget       = 5 * time.Minute
 	readinessJSONSampleLimit   = 5
-	httpRouteRequestAttempts   = 2
-	// syncPingTarget can run scanner.SyncRepo plus scanner.CurrentCommit. In the
-	// existing-repo worst case, that is remote get-url, remote set-url, fetch,
-	// checkout, pull, and rev-parse.
-	pingInventorySyncGitCommands   = 6
-	monitorBudgetSafetyNumerator   = 3
-	monitorBudgetSafetyDenominator = 2
 )
 
 var (
@@ -98,12 +93,17 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	actionCtx, actionCancel := context.WithCancel(context.Background())
 	app := &App{
-		cfg:       cfg,
-		store:     store,
-		auth:      auth.New(cfg.Auth),
-		agentAuth: auth.NewAgentTokenAuthenticator(cfg),
-		logger:    logger,
+		cfg:           cfg,
+		store:         store,
+		auth:          auth.New(cfg.Auth),
+		agentAuth:     auth.NewAgentTokenAuthenticator(cfg),
+		logger:        logger,
+		actionCtx:     actionCtx,
+		actionCancel:  actionCancel,
+		actions:       map[string]dashboardAction{},
+		activeActions: map[string]string{},
 	}
 	app.upgrader.CheckOrigin = app.checkAgentOrigin
 	app.scanner = scanner.New(cfg, store, logger)
@@ -133,6 +133,10 @@ func repositoryRedactionValues(repos []config.RepositoryConfig) []string {
 }
 
 func (app *App) Close() {
+	if app.actionCancel != nil {
+		app.actionCancel()
+	}
+	app.actionsWG.Wait()
 	if app.store != nil {
 		_ = app.store.Close()
 	}
@@ -151,6 +155,7 @@ func (app *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/summary", app.summary)
 	mux.HandleFunc("POST /api/scan", app.requireStateChangingRequest(app.scan))
 	mux.HandleFunc("POST /api/monitor", app.requireStateChangingRequest(app.checkMonitor))
+	mux.HandleFunc("GET /api/actions/{id}", app.actionStatus)
 	mux.HandleFunc("POST /api/monitor-overrides", app.requireStateChangingRequest(app.monitorOverride))
 	mux.HandleFunc("GET /api/agents/connect", app.agentConnect)
 	mux.Handle("GET /", app.staticHandler())
@@ -336,163 +341,25 @@ func mergeAgents(reported []core.AgentInfo, docker []config.DockerTarget) []core
 }
 
 func (app *App) scan(w http.ResponseWriter, r *http.Request) {
-	app.extendWriteDeadline(w, app.scanWriteBudget(), "scan")
 	scanAll := app.scanAll
 	if scanAll == nil {
 		scanAll = app.scanner.ScanAll
 	}
-	if err := scanAll(r.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	app.writeJSON(w, map[string]string{"status": "ok"})
+	action := app.startAction("scan", scanAll)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	app.writeJSON(w, action)
 }
 
 func (app *App) checkMonitor(w http.ResponseWriter, r *http.Request) {
-	app.extendWriteDeadline(w, app.monitorWriteBudget(r.Context()), "monitor")
 	checkAll := app.checkAll
 	if checkAll == nil {
 		checkAll = app.monitor.CheckAll
 	}
-	if err := checkAll(r.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	app.writeJSON(w, map[string]string{"status": "ok"})
-}
-
-func (app *App) extendWriteDeadline(w http.ResponseWriter, budget time.Duration, action string) {
-	if budget <= 0 {
-		return
-	}
-	deadline := time.Now().Add(budget)
-	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		app.logger.Warn("extend response write deadline failed", "action", action, "deadline", deadline.Format(time.RFC3339), "error", err)
-	}
-}
-
-func (app *App) scanWriteBudget() time.Duration {
-	repositories := len(app.cfg.Repositories)
-	if repositories < 1 {
-		repositories = 1
-	}
-	perRepository := scanGitCommandsPerRepo*scanner.GitCommandTimeout + scanFinishTimeout
-	return actionWriteBudget(time.Duration(repositories) * perRepository)
-}
-
-func actionWriteBudget(timeout time.Duration) time.Duration {
-	if timeout < minActionWriteBudget {
-		timeout = minActionWriteBudget
-	}
-	return timeout + actionWriteDeadlineMargin
-}
-
-func monitorActionWriteBudget(timeout time.Duration) time.Duration {
-	if timeout < minActionWriteBudget {
-		timeout = minActionWriteBudget
-	}
-	// This budget approximates an emergent worst case across storage reads, git
-	// sync, route fallback requests, monitor fan-out waves, and status writes.
-	// Enumeration has repeatedly missed terms, so keep a safety factor to absorb
-	// unknowns before the fixed response-write margin.
-	//
-	// T-020 should consider converting /api/scan and /api/monitor to async
-	// endpoints (202 plus status polling) to eliminate this class of synchronous
-	// response-deadline problem.
-	timeout = timeout * monitorBudgetSafetyNumerator / monitorBudgetSafetyDenominator
-	return timeout + actionWriteDeadlineMargin
-}
-
-func (app *App) monitorWriteBudget(ctx context.Context) time.Duration {
-	var services []core.Service
-	if app.store != nil {
-		var err error
-		services, err = app.store.Services(ctx)
-		if err != nil {
-			logger := app.logger
-			if logger == nil {
-				logger = slog.Default()
-			}
-			logger.Warn("monitor write budget service count unavailable", "error", err)
-		}
-	}
-	return monitorActionWriteBudget(app.monitorSequentialTimeoutBudget(services))
-}
-
-func (app *App) monitorSequentialTimeoutBudget(services []core.Service) time.Duration {
-	// Keep this in step with monitor.CheckAll: Docker and Kubernetes target loops
-	// run first and currently have no configured operation timeout; HTTP targets
-	// then run sequentially, followed by ping targets sequentially. HTTP and ping
-	// checks fan out within a target using semaphores, so each sequential target
-	// gets one timeout budget per concurrency wave.
-	total := time.Duration(0)
-	routeChecks := httpRouteCheckCount(services)
-	for _, target := range app.cfg.Runtime.HTTP {
-		timeout, err := target.TimeoutDuration()
-		if err != nil {
-			continue
-		}
-		if timeout == 0 {
-			timeout = monitor.DefaultHTTPRouteTimeout()
-		}
-		total += time.Duration(timeoutWaves(routeChecks, monitor.HTTPRouteConcurrencyLimit())) * httpRouteRequestAttempts * timeout
-	}
-	for _, target := range app.cfg.Runtime.Ping {
-		total += pingInventorySyncBudget(target)
-		timeout, err := target.TimeoutDuration()
-		if err != nil {
-			continue
-		}
-		if timeout == 0 {
-			timeout = monitor.DefaultPingTimeout()
-		}
-		checks := pingCheckCount(target, services)
-		total += time.Duration(timeoutWaves(checks, monitor.PingConcurrencyLimit())) * timeout
-	}
-	return total
-}
-
-func pingInventorySyncBudget(target config.PingTarget) time.Duration {
-	if strings.TrimSpace(target.Repository) == "" || strings.TrimSpace(target.AnsibleInventory) == "" {
-		return 0
-	}
-	return time.Duration(pingInventorySyncGitCommands) * scanner.GitCommandTimeout
-}
-
-func httpRouteCheckCount(services []core.Service) int {
-	checks := 0
-	for _, service := range services {
-		if service.ID == "" {
-			continue
-		}
-		checks += len(routetarget.Routes(service.Exposure))
-	}
-	return checks
-}
-
-func pingCheckCount(target config.PingTarget, services []core.Service) int {
-	repository := hostinventory.RepositoryName(target)
-	source := hostinventory.Source(target)
-	checks := 0
-	for _, service := range services {
-		if service.Repository == repository && service.Runtime == "host" && service.SourcePath == source {
-			checks++
-		}
-	}
-	if checks == 0 && target.Host != "" {
-		return 1
-	}
-	return checks
-}
-
-func timeoutWaves(checks, concurrency int) int {
-	if checks < 1 {
-		return 1
-	}
-	if concurrency < 1 {
-		return checks
-	}
-	return (checks + concurrency - 1) / concurrency
+	action := app.startAction("monitor", checkAll)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	app.writeJSON(w, action)
 }
 
 type monitorOverrideRequest struct {

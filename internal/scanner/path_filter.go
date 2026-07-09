@@ -9,27 +9,76 @@ import (
 )
 
 func shouldScanRepoPath(repo config.RepositoryConfig, rel string) bool {
+	return newRepoPathFilter(repo).shouldScan(rel)
+}
+
+func shouldSkipRepoDir(repo config.RepositoryConfig, rel string) bool {
+	return newRepoPathFilter(repo).shouldSkipDir(rel)
+}
+
+type repoPathFilter struct {
+	include []repoPathPattern
+	exclude []repoPathPattern
+}
+
+type repoPathPattern struct {
+	value   string
+	hasGlob bool
+	regex   *regexp.Regexp
+	invalid bool
+}
+
+func newRepoPathFilter(repo config.RepositoryConfig) repoPathFilter {
+	return repoPathFilter{
+		include: compileRepoPathPatterns(repo.IncludePaths),
+		exclude: compileRepoPathPatterns(repo.ExcludePaths),
+	}
+}
+
+func compileRepoPathPatterns(patterns []string) []repoPathPattern {
+	compiled := make([]repoPathPattern, 0, len(patterns))
+	for _, pattern := range patterns {
+		compiled = append(compiled, compileRepoPathPattern(pattern))
+	}
+	return compiled
+}
+
+func compileRepoPathPattern(pattern string) repoPathPattern {
+	compiled := repoPathPattern{value: normalizeRepoPath(pattern)}
+	compiled.hasGlob = hasGlob(compiled.value)
+	if compiled.hasGlob && strings.Contains(compiled.value, "**") {
+		regex, err := regexp.Compile(globRegex(compiled.value))
+		if err != nil {
+			compiled.invalid = true
+			return compiled
+		}
+		compiled.regex = regex
+	}
+	return compiled
+}
+
+func (filter repoPathFilter) shouldScan(rel string) bool {
 	rel = normalizeRepoPath(rel)
 	if rel == "." {
 		return true
 	}
-	if matchesAnyRepoPath(repo.ExcludePaths, rel) {
+	if filter.matchesAny(filter.exclude, rel) {
 		return false
 	}
-	if len(repo.IncludePaths) == 0 {
+	if len(filter.include) == 0 {
 		return true
 	}
-	return matchesAnyRepoPath(repo.IncludePaths, rel)
+	return filter.matchesAny(filter.include, rel)
 }
 
-func shouldSkipRepoDir(repo config.RepositoryConfig, rel string) bool {
+func (filter repoPathFilter) shouldSkipDir(rel string) bool {
 	rel = normalizeRepoPath(rel)
-	return rel != "." && matchesAnyRepoPath(repo.ExcludePaths, rel)
+	return rel != "." && filter.matchesAny(filter.exclude, rel)
 }
 
-func matchesAnyRepoPath(patterns []string, rel string) bool {
+func (filter repoPathFilter) matchesAny(patterns []repoPathPattern, rel string) bool {
 	for _, pattern := range patterns {
-		if matchesRepoPath(pattern, rel) {
+		if pattern.matches(rel) {
 			return true
 		}
 	}
@@ -37,19 +86,22 @@ func matchesAnyRepoPath(patterns []string, rel string) bool {
 }
 
 func matchesRepoPath(pattern, rel string) bool {
-	pattern = normalizeRepoPath(pattern)
+	return compileRepoPathPattern(pattern).matches(rel)
+}
+
+func (pattern repoPathPattern) matches(rel string) bool {
 	rel = normalizeRepoPath(rel)
-	if pattern == "." || rel == "." {
+	if pattern.invalid || pattern.value == "." || rel == "." {
 		return false
 	}
-	if !hasGlob(pattern) {
-		return rel == pattern || strings.HasPrefix(rel, pattern+"/")
+	if !pattern.hasGlob {
+		return rel == pattern.value || strings.HasPrefix(rel, pattern.value+"/")
 	}
-	if repoGlobMatch(pattern, rel) {
+	if pattern.globMatch(rel) {
 		return true
 	}
 	for ancestor := path.Dir(rel); ancestor != "." && ancestor != "/"; ancestor = path.Dir(ancestor) {
-		if repoGlobMatch(pattern, ancestor) {
+		if pattern.globMatch(ancestor) {
 			return true
 		}
 	}
@@ -71,12 +123,18 @@ func hasGlob(value string) bool {
 }
 
 func repoGlobMatch(pattern, rel string) bool {
-	if !strings.Contains(pattern, "**") {
-		ok, err := path.Match(pattern, rel)
+	return compileRepoPathPattern(pattern).globMatch(rel)
+}
+
+func (pattern repoPathPattern) globMatch(rel string) bool {
+	if pattern.invalid {
+		return false
+	}
+	if !strings.Contains(pattern.value, "**") {
+		ok, err := path.Match(pattern.value, rel)
 		return err == nil && ok
 	}
-	ok, err := regexp.MatchString(globRegex(pattern), rel)
-	return err == nil && ok
+	return pattern.regex != nil && pattern.regex.MatchString(rel)
 }
 
 func globRegex(pattern string) string {

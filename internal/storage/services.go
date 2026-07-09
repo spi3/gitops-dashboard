@@ -29,6 +29,7 @@ ON CONFLICT(name) DO UPDATE SET url=excluded.url, default_ref=excluded.default_r
 			return fmt.Errorf("upsert repository %s: %w", repo.Name, err)
 		}
 	}
+	store.invalidateSummary()
 	return nil
 }
 
@@ -96,7 +97,7 @@ ON CONFLICT(name) DO UPDATE SET
 			return err
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 func (store *Store) ReplaceRuntimeServices(ctx context.Context, repositoryName, source, runtime string, services []core.Service) error {
@@ -158,7 +159,7 @@ ON CONFLICT(name) DO NOTHING
 			return err
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 func (store *Store) PruneRuntimeServices(ctx context.Context, runtime string, keep []RuntimeServiceSource) error {
@@ -215,7 +216,21 @@ WHERE name=? AND default_ref='configured' AND NOT EXISTS (
 			return err
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
+}
+
+func (store *Store) RuntimeServiceSourceCommit(ctx context.Context, repositoryName, source, runtime string) (string, bool, error) {
+	var commit string
+	var count int
+	err := store.db.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(source_commit), ''), COUNT(*)
+FROM services
+WHERE repository=? AND source_path=? AND runtime=?
+`, repositoryName, source, runtime).Scan(&commit, &count)
+	if err != nil {
+		return "", false, err
+	}
+	return commit, count > 0, nil
 }
 
 func runtimeSourceKey(repository, sourcePath string) string {
@@ -224,11 +239,12 @@ func runtimeSourceKey(repository, sourcePath string) string {
 
 func (store *Store) StartScan(ctx context.Context, repoName string) (int64, error) {
 	result, err := store.db.ExecContext(ctx, `
-INSERT INTO scans(repository, status, started_at) VALUES(?, 'running', ?)
-`, repoName, time.Now().UTC().Format(time.RFC3339))
+	INSERT INTO scans(repository, status, started_at) VALUES(?, 'running', ?)
+	`, repoName, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return 0, fmt.Errorf("start scan %s: %w", repoName, err)
 	}
+	store.invalidateSummary()
 	return result.LastInsertId()
 }
 
@@ -266,7 +282,7 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 			}
 		}
 	}
-	return tx.Commit()
+	return store.commitAndInvalidateSummary(tx)
 }
 
 func insertService(ctx context.Context, tx *sql.Tx, service core.Service) error {
@@ -288,6 +304,19 @@ INSERT INTO services(
 }
 
 func (store *Store) Summary(ctx context.Context) (core.DashboardSummary, error) {
+	if summary, ok := store.cachedSummary(); ok {
+		return summary, nil
+	}
+	version := store.currentSummaryVersion()
+	summary, err := store.buildSummary(ctx)
+	if err != nil {
+		return core.DashboardSummary{}, err
+	}
+	store.cacheSummary(version, summary)
+	return cloneDashboardSummary(summary), nil
+}
+
+func (store *Store) buildSummary(ctx context.Context) (core.DashboardSummary, error) {
 	repos, err := store.Repositories(ctx)
 	if err != nil {
 		return core.DashboardSummary{}, err

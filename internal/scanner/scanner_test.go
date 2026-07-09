@@ -2,12 +2,17 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
@@ -264,6 +269,241 @@ func TestRepositoryPathFilters(t *testing.T) {
 			t.Fatalf("shouldScanRepoPath(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
+}
+
+func TestCompiledRepositoryPathFilterMatchesLegacySemantics(t *testing.T) {
+	t.Parallel()
+	repo := config.RepositoryConfig{
+		IncludePaths: []string{"clusters/**/apps/*.yaml", "docker_files/serenity", "apps/[ab]*/**"},
+		ExcludePaths: []string{"**/gotk-components.yaml", "clusters/**/retired", "apps/**/tmp"},
+	}
+	filter := newRepoPathFilter(repo)
+	for _, rel := range []string{
+		"clusters/main/apps/web.yaml",
+		"clusters/main/apps/nested/web.yaml",
+		"clusters/main/flux-system/gotk-components.yaml",
+		"clusters/main/retired/app.yaml",
+		"docker_files/serenity/web/docker-compose.yml",
+		"docker_files/other/web/docker-compose.yml",
+		"apps/api/prod/deploy.yaml",
+		"apps/batch/tmp/job.yaml",
+		"README.md",
+	} {
+		if got, want := filter.shouldScan(rel), legacyShouldScanRepoPath(repo, rel); got != want {
+			t.Fatalf("compiled shouldScan(%q) = %v, want legacy %v", rel, got, want)
+		}
+		if got, want := filter.shouldSkipDir(rel), legacyShouldSkipRepoDir(repo, rel); got != want {
+			t.Fatalf("compiled shouldSkipDir(%q) = %v, want legacy %v", rel, got, want)
+		}
+	}
+}
+
+func TestConcurrentScanAllCoalescesRepositoryScan(t *testing.T) {
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	gitShim := filepath.Join(binDir, "git")
+	if err := os.WriteFile(gitShim, []byte("#!/bin/sh\nif [ \"$1\" = \"clone\" ]; then sleep 0.2; fi\nexec "+shellQuote(realGit)+" \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- scanner.ScanAll(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Scans) != 1 {
+		t.Fatalf("scans = %#v, want one coalesced scan", summary.Scans)
+	}
+}
+
+func TestDetachedRepoSyncLeaderTimeoutDoesNotCancelJoiningScan(t *testing.T) {
+	source := createFixtureRepo(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signalDir := t.TempDir()
+	cloneStarted := filepath.Join(signalDir, "clone-started")
+	releaseClone := filepath.Join(signalDir, "release-clone")
+	binDir := t.TempDir()
+	gitShim := filepath.Join(binDir, "git")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"clone\" ]; then\n" +
+		"  touch " + shellQuote(cloneStarted) + "\n" +
+		"  while [ ! -f " + shellQuote(releaseClone) + " ]; do sleep 0.01; done\n" +
+		"fi\n" +
+		"exec " + shellQuote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(gitShim, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+
+	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelLeader()
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := scanner.SyncRepo(leaderCtx, cfg.Repositories[0])
+		leaderDone <- err
+	}()
+	waitForFile(t, cloneStarted)
+	select {
+	case err := <-leaderDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("leader SyncRepo error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for leader SyncRepo deadline")
+	}
+
+	scanDone := make(chan error, 1)
+	go func() {
+		scanDone <- scanner.ScanAll(context.Background())
+	}()
+	waitForRunningScan(t, store, "fixture")
+	if err := os.WriteFile(releaseClone, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-scanDone:
+		if err != nil {
+			t.Fatalf("joining ScanAll failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for joining scan")
+	}
+
+	summary, err := store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Services) != 2 {
+		t.Fatalf("services = %#v, want scan to complete after joining detached sync", summary.Services)
+	}
+	if len(summary.Scans) != 1 || summary.Scans[0].Status != "ok" {
+		t.Fatalf("scans = %#v, want successful joining scan", summary.Scans)
+	}
+}
+
+func legacyShouldScanRepoPath(repo config.RepositoryConfig, rel string) bool {
+	rel = normalizeRepoPath(rel)
+	if rel == "." {
+		return true
+	}
+	if legacyMatchesAnyRepoPath(repo.ExcludePaths, rel) {
+		return false
+	}
+	if len(repo.IncludePaths) == 0 {
+		return true
+	}
+	return legacyMatchesAnyRepoPath(repo.IncludePaths, rel)
+}
+
+func legacyShouldSkipRepoDir(repo config.RepositoryConfig, rel string) bool {
+	rel = normalizeRepoPath(rel)
+	return rel != "." && legacyMatchesAnyRepoPath(repo.ExcludePaths, rel)
+}
+
+func legacyMatchesAnyRepoPath(patterns []string, rel string) bool {
+	for _, pattern := range patterns {
+		if legacyMatchesRepoPath(pattern, rel) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyMatchesRepoPath(pattern, rel string) bool {
+	pattern = normalizeRepoPath(pattern)
+	rel = normalizeRepoPath(rel)
+	if pattern == "." || rel == "." {
+		return false
+	}
+	if !hasGlob(pattern) {
+		return rel == pattern || strings.HasPrefix(rel, pattern+"/")
+	}
+	if legacyRepoGlobMatch(pattern, rel) {
+		return true
+	}
+	for ancestor := path.Dir(rel); ancestor != "." && ancestor != "/"; ancestor = path.Dir(ancestor) {
+		if legacyRepoGlobMatch(pattern, ancestor) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyRepoGlobMatch(pattern, rel string) bool {
+	if !strings.Contains(pattern, "**") {
+		ok, err := path.Match(pattern, rel)
+		return err == nil && ok
+	}
+	ok, err := regexp.MatchString(globRegex(pattern), rel)
+	return err == nil && ok
 }
 
 func TestGitAuthUsesTokenFreeRemoteAndEnvScopedHeader(t *testing.T) {
@@ -602,6 +842,42 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForRunningScan(t *testing.T, store *storage.Store, repository string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		scans, err := store.Scans(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, scan := range scans {
+			if scan.Repository == repository && scan.Status == "running" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for running scan in %s; scans=%#v", repository, scans)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func assertSummaryNoToken(t *testing.T, summary core.DashboardSummary, token string) {

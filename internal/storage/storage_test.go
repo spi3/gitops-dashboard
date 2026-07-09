@@ -786,6 +786,124 @@ func TestSummaryHealthAggregatesAcrossTargets(t *testing.T) {
 	}
 }
 
+func TestSummaryCacheInvalidatesOnStatusWrite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{{
+		ID:         "svc",
+		Name:       "web",
+		Repository: "repo",
+		SourcePath: "prod/compose.yaml",
+		Runtime:    "compose",
+		Kind:       "Service",
+		Health:     core.HealthUnknown,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc",
+		Target:    "local",
+		Health:    core.HealthHealthy,
+		Message:   "first",
+		CheckedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Uptime) != 1 || summary.Uptime[0].CheckCount != 1 {
+		t.Fatalf("first uptime = %#v, want one check", summary.Uptime)
+	}
+	store.summaryMu.RLock()
+	cacheValid := store.summaryCache.valid
+	store.summaryMu.RUnlock()
+	if !cacheValid {
+		t.Fatal("summary cache was not populated")
+	}
+
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc",
+		Target:    "local",
+		Health:    core.HealthUnhealthy,
+		Message:   "second",
+		CheckedAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.summaryMu.RLock()
+	cacheValid = store.summaryCache.valid
+	store.summaryMu.RUnlock()
+	if cacheValid {
+		t.Fatal("summary cache remained valid after status write")
+	}
+	summary, err = store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Uptime) != 1 || summary.Uptime[0].CheckCount != 2 || summary.Uptime[0].UptimePercent != 50 {
+		t.Fatalf("rebuilt uptime = %#v, want two checks at 50%%", summary.Uptime)
+	}
+}
+
+func TestSummaryCacheExpiresRollingUptimeWindow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{{
+		ID:         "svc",
+		Name:       "web",
+		Repository: "repo",
+		SourcePath: "prod/compose.yaml",
+		Runtime:    "compose",
+		Kind:       "Service",
+		Health:     core.HealthUnknown,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "svc",
+		Target:    "local",
+		Health:    core.HealthHealthy,
+		Message:   "inside window",
+		CheckedAt: time.Now().UTC().Add(-23 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Uptime) != 1 {
+		t.Fatalf("cached uptime = %#v, want one in-window stat", summary.Uptime)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE status_history SET checked_at=?`, time.Now().UTC().Add(-25*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	store.summaryMu.Lock()
+	store.summaryCache.cachedAt = time.Now().UTC().Add(-summaryCacheTTL - time.Second)
+	store.summaryMu.Unlock()
+
+	summary, err = store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Uptime) != 0 {
+		t.Fatalf("expired-cache uptime = %#v, want rolling window recomputed empty", summary.Uptime)
+	}
+}
+
 func TestSetMonitorNotApplicableRemovesTargetFromHealthAndUptime(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
