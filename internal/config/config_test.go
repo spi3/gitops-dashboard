@@ -84,6 +84,29 @@ runtime:
 	}
 }
 
+func TestLoadConfigLoadsServerAllowedOrigins(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  allowedOrigins:
+    - http://127.0.0.1:5173
+    - http://localhost:5173
+    - http://regula1.lan:5173
+auth:
+  mode: dev-no-auth
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cfg.Server.AllowedOrigins, []string{"http://127.0.0.1:5173", "http://localhost:5173", "http://regula1.lan:5173"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("server allowed origins = %#v, want %#v", got, want)
+	}
+}
+
 func TestLoadConfigLoadsHTTPRouteEgressPolicy(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.yaml")

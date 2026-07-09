@@ -9,6 +9,8 @@ type Theme = "light" | "dark";
 type Tone = "steady" | "pending" | "watch" | "alert";
 type ImageVersionState = "matching" | "mismatched" | "unknown" | "mutable";
 
+const stateChangingRequestHeaders = { "X-GitOps-Dashboard-CSRF": "1" };
+
 type Repository = {
   name: string;
   status: string;
@@ -246,7 +248,10 @@ function App() {
   const trigger = useCallback(async (action: "scan" | "monitor") => {
     setBusyAction(action);
     try {
-      const response = await fetch(`/api/${action}`, { method: "POST" });
+      const response = await fetch(`/api/${action}`, {
+        method: "POST",
+        headers: stateChangingRequestHeaders
+      });
       if (!response.ok) {
         throw new Error(`/api/${action} failed: ${response.status}`);
       }
@@ -264,7 +269,7 @@ function App() {
     try {
       const response = await fetch("/api/monitor-overrides", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...stateChangingRequestHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({ serviceId, target, notApplicable })
       });
       if (!response.ok) {

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -14,6 +14,10 @@ let baseURL = "";
 let server: ChildProcessWithoutNullStreams | null = null;
 let fakeDocker: Server | null = null;
 let serverLogs = "";
+
+function expectStateChangingHeader(route: Route) {
+  expect(route.request().headers()["x-gitops-dashboard-csrf"]).toBe("1");
+}
 
 test.beforeAll(async () => {
   tempRoot = mkdtempSync(path.join(tmpdir(), "gitops-dashboard-ui-"));
@@ -287,6 +291,7 @@ test("can mark individual route monitor targets not applicable from the drawer",
     });
   });
   await page.route("**/api/monitor-overrides", async (route) => {
+    expectStateChangingHeader(route);
     const payload = route.request().postDataJSON() as MonitorOverrideRequest;
     overrideRequests.push(payload);
     applyMonitorOverride(summary, payload);
@@ -365,6 +370,7 @@ test("keeps all routes controls after re-enabling the all routes monitor", async
     });
   });
   await page.route("**/api/monitor-overrides", async (route) => {
+    expectStateChangingHeader(route);
     overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
     await route.fulfill({
       contentType: "application/json",
@@ -409,6 +415,7 @@ test("keeps a literal routes monitor target out of the route override UI", async
     });
   });
   await page.route("**/api/monitor-overrides", async (route) => {
+    expectStateChangingHeader(route);
     overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
     await route.fulfill({
       contentType: "application/json",
@@ -535,6 +542,7 @@ test("keeps slash-distinct route controls and override targets", async ({ page }
     });
   });
   await page.route("**/api/monitor-overrides", async (route) => {
+    expectStateChangingHeader(route);
     overrideRequests.push(route.request().postDataJSON() as MonitorOverrideRequest);
     await route.fulfill({
       contentType: "application/json",

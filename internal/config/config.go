@@ -30,9 +30,10 @@ const (
 )
 
 type ServerConfig struct {
-	Listen       string `yaml:"listen"`
-	DataDir      string `yaml:"dataDir"`
-	RepoCacheDir string `yaml:"repoCacheDir"`
+	Listen         string   `yaml:"listen"`
+	DataDir        string   `yaml:"dataDir"`
+	RepoCacheDir   string   `yaml:"repoCacheDir"`
+	AllowedOrigins []string `yaml:"allowedOrigins"`
 }
 
 type AuthConfig struct {

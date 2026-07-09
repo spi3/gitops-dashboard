@@ -12,6 +12,7 @@ export default defineConfig({
   },
   server: {
     host: "0.0.0.0",
+    // Keep non-local dev hosts in sync with examples/config.dev.yaml server.allowedOrigins.
     allowedHosts: ["regula1.lan"],
     port: 5173,
     proxy: {

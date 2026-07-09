@@ -123,6 +123,128 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	}
 }
 
+func TestStateChangingEndpointsRequireCSRFHeaders(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler()
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/summary", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("read-only summary status = %d, want 200", res.Code)
+	}
+
+	for _, endpoint := range []string{"/api/scan", "/api/monitor", "/api/monitor-overrides"} {
+		res = httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader("{}"))
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusForbidden {
+			t.Fatalf("%s without CSRF header status = %d, want 403", endpoint, res.Code)
+		}
+	}
+
+	res = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://dashboard.example.test/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Origin", "https://attacker.example.test")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin status = %d, want 403", res.Code)
+	}
+
+	devOrigin := "http://127.0.0.1:5173"
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18080/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Origin", devOrigin)
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("unconfigured dev origin status = %d, want 403", res.Code)
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "http://dashboard.example.test/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("cross-site fetch metadata status = %d, want 403", res.Code)
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "http://dashboard.example.test/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Origin", "http://dashboard.example.test")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("same-origin status = %d, body=%q", res.Code, res.Body.String())
+	}
+
+	app.cfg.Server.AllowedOrigins = []string{devOrigin, "http://localhost:5173"}
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18080/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Origin", devOrigin)
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("configured dev origin status = %d, body=%q", res.Code, res.Body.String())
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18080/api/monitor", nil)
+	req.Header.Set("Origin", devOrigin)
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("configured dev origin without CSRF header status = %d, want 403", res.Code)
+	}
+
+	res = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/monitor", nil)
+	addStateChangingHeader(req)
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("non-browser status = %d, body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestStateChangingEndpointAllowsDevConfigOrigin(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(filepath.Join("..", "..", "examples", "config.dev.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Server.DataDir = t.TempDir()
+	cfg.Server.RepoCacheDir = filepath.Join(cfg.Server.DataDir, "repos")
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	res := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18080/api/monitor", nil)
+	addStateChangingHeader(req)
+	req.Header.Set("Origin", "http://regula1.lan:5173")
+	app.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("regula1.lan dev origin status = %d, body=%q", res.Code, res.Body.String())
+	}
+}
+
 func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{
@@ -167,6 +289,7 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	res := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes: http://10.10.10.20","notApplicable":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	addStateChangingHeader(req)
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("override status = %d, body=%q", res.Code, res.Body.String())
@@ -182,6 +305,7 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	res = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes: http://10.10.10.20","notApplicable":false}`))
 	req.Header.Set("Content-Type", "application/json")
+	addStateChangingHeader(req)
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("enable override status = %d, body=%q", res.Code, res.Body.String())
@@ -197,6 +321,7 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	res = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"routes","notApplicable":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	addStateChangingHeader(req)
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("all-routes override status = %d, body=%q", res.Code, res.Body.String())
@@ -224,6 +349,7 @@ func TestMonitorOverrideEndpointMarksTargetNotApplicable(t *testing.T) {
 	res = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/api/monitor-overrides", strings.NewReader(`{"serviceId":"svc","target":"missing","notApplicable":true}`))
 	req.Header.Set("Content-Type", "application/json")
+	addStateChangingHeader(req)
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("missing override status = %d, want 404", res.Code)
@@ -306,4 +432,8 @@ func runGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
+}
+
+func addStateChangingHeader(req *http.Request) {
+	req.Header.Set(stateChangingRequestHeader, "1")
 }

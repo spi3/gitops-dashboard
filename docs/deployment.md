@@ -164,6 +164,14 @@ Browser WebSocket upgrades must come from the same host as the dashboard
 request, unless an origin is listed in `auth.agent.allowedOrigins`.
 Non-browser agents that omit the `Origin` header keep working unchanged.
 
+Browser POSTs to dashboard state-changing endpoints must also include the
+`X-GitOps-Dashboard-CSRF` header and come from the dashboard host, unless an
+origin is listed in `server.allowedOrigins`. Production deployments should leave
+`server.allowedOrigins` unset unless they intentionally serve the UI through a
+trusted alternate origin. `Sec-Fetch-Site: cross-site` requests are still
+rejected. `examples/config.dev.yaml` allows the local Vite dev server origins
+used by `make dev-ui`.
+
 Minimal agent config:
 
 ```yaml

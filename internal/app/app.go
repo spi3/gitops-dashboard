@@ -38,8 +38,9 @@ type App struct {
 }
 
 const (
-	agentTokenHeader = "X-Agent-Token"
-	agentTokenQuery  = "token"
+	agentTokenHeader           = "X-Agent-Token"
+	agentTokenQuery            = "token"
+	stateChangingRequestHeader = "X-GitOps-Dashboard-CSRF"
 )
 
 var (
@@ -114,12 +115,52 @@ func (app *App) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", app.ready)
 	mux.HandleFunc("GET /api/version", app.version)
 	mux.HandleFunc("GET /api/summary", app.summary)
-	mux.HandleFunc("POST /api/scan", app.scan)
-	mux.HandleFunc("POST /api/monitor", app.checkMonitor)
-	mux.HandleFunc("POST /api/monitor-overrides", app.monitorOverride)
+	mux.HandleFunc("POST /api/scan", app.requireStateChangingRequest(app.scan))
+	mux.HandleFunc("POST /api/monitor", app.requireStateChangingRequest(app.checkMonitor))
+	mux.HandleFunc("POST /api/monitor-overrides", app.requireStateChangingRequest(app.monitorOverride))
 	mux.HandleFunc("GET /api/agents/connect", app.agentConnect)
 	mux.Handle("GET /", app.staticHandler())
 	return app.auth.Middleware(mux)
+}
+
+func (app *App) requireStateChangingRequest(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(r.Header.Get(stateChangingRequestHeader)) == "" {
+			http.Error(w, "state-changing request header required", http.StatusForbidden)
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+			app.logger.Warn("state-changing request fetch metadata rejected", "site", r.Header.Get("Sec-Fetch-Site"), "path", r.URL.Path)
+			http.Error(w, "state-changing request fetch metadata rejected", http.StatusForbidden)
+			return
+		}
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			parsed, ok := parseHTTPOrigin(origin)
+			if !ok || !app.stateChangingOriginAllowed(parsed, r.Host) {
+				app.logger.Warn("state-changing request origin rejected", "origin", origin, "host", r.Host, "path", r.URL.Path)
+				http.Error(w, "state-changing request origin rejected", http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+func (app *App) stateChangingOriginAllowed(origin *url.URL, requestHost string) bool {
+	if originMatchesRequestHost(origin, requestHost) {
+		return true
+	}
+	for _, allowedOrigin := range app.cfg.Server.AllowedOrigins {
+		allowed, ok := parseHTTPOrigin(allowedOrigin)
+		if !ok {
+			continue
+		}
+		if sameOrigin(origin, allowed) {
+			return true
+		}
+	}
+	return false
 }
 
 func (app *App) health(w http.ResponseWriter, _ *http.Request) {

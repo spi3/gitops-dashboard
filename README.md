@@ -55,6 +55,14 @@ Useful endpoints:
 - `GET /api/summary`
 - `POST /api/scan`
 - `POST /api/monitor`
+- `POST /api/monitor-overrides`
+
+State-changing API calls must include `X-GitOps-Dashboard-CSRF: 1`. The
+same-origin UI sends it automatically; curl and other non-browser clients must
+set it explicitly. Requests with cross-site `Origin` or `Sec-Fetch-Site` headers
+are rejected. Additional trusted browser origins can be listed in
+`server.allowedOrigins`; `Sec-Fetch-Site: cross-site` is still rejected. Leave
+`server.allowedOrigins` unset for strict same-host behavior.
 
 ## Configuration
 
@@ -258,8 +266,11 @@ Then open:
 http://127.0.0.1:5173
 ```
 
-The Vite proxy defaults to `http://127.0.0.1:18080`. Override it when the Go
-server is listening elsewhere:
+`examples/config.dev.yaml` allows `http://127.0.0.1:5173` and
+`http://localhost:5173`, plus `http://regula1.lan:5173` for the Vite
+`allowedHosts` entry, in `server.allowedOrigins` so Vite-proxied POST actions
+work with the CSRF/origin guard during hot reload. The Vite proxy defaults to
+`http://127.0.0.1:18080`. Override it when the Go server is listening elsewhere:
 
 ```sh
 make dev-ui VITE_API_TARGET=http://127.0.0.1:19090

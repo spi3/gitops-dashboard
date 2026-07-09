@@ -2,6 +2,11 @@ server:
   listen: ":18080"
   dataDir: "data/dev"
   repoCacheDir: "data/dev/repos"
+  allowedOrigins:
+    # Keep these in sync with Vite dev hosts in vite.config.ts.
+    - "http://127.0.0.1:5173"
+    - "http://localhost:5173"
+    - "http://regula1.lan:5173"
 auth:
   # Development only. Do not expose this config outside a trusted local shell.
   mode: dev-no-auth
