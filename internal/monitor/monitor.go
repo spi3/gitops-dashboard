@@ -24,6 +24,11 @@ import (
 
 var ErrAgentTargetUnauthorized = errors.New("agent target is not authorized for token")
 
+const (
+	dockerComposeProjectLabel = core.DockerComposeProjectLabel
+	dockerComposeServiceLabel = core.DockerComposeServiceLabel
+)
+
 type Monitor struct {
 	cfg    config.Config
 	store  *storage.Store
@@ -99,6 +104,7 @@ func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentM
 		return fmt.Errorf("%w: %q", ErrAgentTargetUnauthorized, target)
 	}
 	message.Target = target
+	message = core.FilterAgentMessageDockerLabels(message)
 	if err := monitor.store.UpsertAgent(ctx, message); err != nil {
 		return err
 	}
@@ -209,12 +215,23 @@ func (monitor Monitor) checkDocker(ctx context.Context, target config.DockerTarg
 	if err != nil {
 		return err
 	}
+	containers = filterDockerContainerLabels(containers)
 	imageInspector, err := newDockerImageInspector(target.Host)
 	if err != nil {
 		imageInspector = nil
 	}
+	directTargets := directDockerTargets(monitor.cfg.Runtime.Docker)
+	if len(directTargets) == 0 {
+		directTargets = []config.DockerTarget{target}
+	}
 	for _, service := range services {
 		if service.Runtime != "compose" {
+			continue
+		}
+		if !dockerServiceAppliesToTarget(service, target, directTargets) {
+			if err := monitor.store.PruneStatusTargets(ctx, service.ID, target.Name, "", nil); err != nil {
+				return err
+			}
 			continue
 		}
 		health, message, observedImages := dockerStatus(ctx, service, target.Name, containers, imageInspector)
@@ -232,6 +249,37 @@ func (monitor Monitor) checkDocker(ctx context.Context, target config.DockerTarg
 	return nil
 }
 
+func directDockerTargets(targets []config.DockerTarget) []config.DockerTarget {
+	direct := make([]config.DockerTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.Kind == "agent" {
+			continue
+		}
+		direct = append(direct, target)
+	}
+	return direct
+}
+
+func dockerServiceAppliesToTarget(service core.Service, target config.DockerTarget, directTargets []config.DockerTarget) bool {
+	boundTarget := composeServiceTarget(service)
+	if boundTarget != "" {
+		return boundTarget == strings.TrimSpace(target.Name)
+	}
+
+	// Backward-compatible default: legacy scans without a docker_files/<target>
+	// source are checked only when there is one direct Docker target to choose.
+	if len(directTargets) != 1 {
+		return false
+	}
+	return sameDockerTarget(directTargets[0], target)
+}
+
+func sameDockerTarget(left, right config.DockerTarget) bool {
+	return strings.TrimSpace(left.Name) == strings.TrimSpace(right.Name) &&
+		strings.TrimSpace(left.Kind) == strings.TrimSpace(right.Kind) &&
+		strings.TrimSpace(left.Host) == strings.TrimSpace(right.Host)
+}
+
 func dockerHealth(service core.Service, containers []dockerContainer) (core.HealthState, string) {
 	health, message, _ := dockerStatus(context.Background(), service, "", containers, nil)
 	return health, message
@@ -241,29 +289,27 @@ func dockerStatus(ctx context.Context, service core.Service, target string, cont
 	matches := matchingDockerContainers(service, containers)
 	observedImages := observedDockerImages(ctx, target, matches, imageInspector)
 	for _, container := range matches {
-		if matchesContainer(service, container) {
-			if strings.EqualFold(container.State, "running") {
-				switch strings.ToLower(strings.TrimSpace(container.Health)) {
-				case "unhealthy":
-					return core.HealthUnhealthy, container.Status, observedImages
-				case "starting":
-					return core.HealthDegraded, container.Status, observedImages
-				case "healthy":
-					return core.HealthHealthy, container.Status, observedImages
-				}
-				status := strings.ToLower(container.Status)
-				if strings.Contains(status, "(unhealthy)") {
-					return core.HealthUnhealthy, container.Status, observedImages
-				}
-				if strings.Contains(status, "(health: starting)") {
-					return core.HealthDegraded, container.Status, observedImages
-				}
+		if strings.EqualFold(container.State, "running") {
+			switch strings.ToLower(strings.TrimSpace(container.Health)) {
+			case "unhealthy":
+				return core.HealthUnhealthy, container.Status, observedImages
+			case "starting":
+				return core.HealthDegraded, container.Status, observedImages
+			case "healthy":
 				return core.HealthHealthy, container.Status, observedImages
 			}
-			return core.HealthUnhealthy, container.Status, observedImages
+			status := strings.ToLower(container.Status)
+			if strings.Contains(status, "(unhealthy)") {
+				return core.HealthUnhealthy, container.Status, observedImages
+			}
+			if strings.Contains(status, "(health: starting)") {
+				return core.HealthDegraded, container.Status, observedImages
+			}
+			return core.HealthHealthy, container.Status, observedImages
 		}
+		return core.HealthUnhealthy, container.Status, observedImages
 	}
-	return core.HealthUnknown, "no matching container", nil
+	return core.HealthUnknown, "container not found", nil
 }
 
 func matchingDockerContainers(service core.Service, containers []dockerContainer) []dockerContainer {
@@ -274,6 +320,13 @@ func matchingDockerContainers(service core.Service, containers []dockerContainer
 		}
 	}
 	return matches
+}
+
+func filterDockerContainerLabels(containers []dockerContainer) []dockerContainer {
+	for i := range containers {
+		containers[i].Labels = core.FilterDockerComposeLabels(containers[i].Labels)
+	}
+	return containers
 }
 
 func observedDockerImages(ctx context.Context, target string, containers []dockerContainer, imageInspector *dockerImageInspector) []core.ObservedImage {
@@ -387,28 +440,108 @@ func mergeDockerRepoDigests(values ...[]string) []string {
 }
 
 func matchesContainer(service core.Service, container dockerContainer) bool {
-	for _, name := range container.Names {
-		if strings.Contains(strings.TrimPrefix(name, "/"), service.Name) {
-			return true
-		}
+	if _, ok := container.Labels[dockerComposeServiceLabel]; ok {
+		return matchesComposeLabels(service, container.Labels)
 	}
-	for _, image := range service.Images {
-		if image != "" && image == container.Image {
-			return true
+	expectedNames := map[string]struct{}{}
+	if name := strings.TrimSpace(service.Name); name != "" {
+		expectedNames[name] = struct{}{}
+	}
+	if name := strings.TrimSpace(service.ResourceName); name != "" {
+		expectedNames[name] = struct{}{}
+	}
+	for _, name := range container.Names {
+		containerName := dockerContainerName(name)
+		for expectedName := range expectedNames {
+			if containerName == expectedName || matchesGeneratedComposeName(containerName, expectedName) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
+func matchesComposeLabels(service core.Service, labels map[string]string) bool {
+	serviceLabel := strings.TrimSpace(labels[dockerComposeServiceLabel])
+	expectedService := strings.TrimSpace(service.ResourceName)
+	if expectedService == "" {
+		expectedService = strings.TrimSpace(service.Name)
+	}
+	if serviceLabel == "" || serviceLabel != expectedService {
+		return false
+	}
+	projectLabel := strings.TrimSpace(labels[dockerComposeProjectLabel])
+	expectedProject := composeProjectName(service)
+	if projectLabel == "" || expectedProject == "" {
+		return true
+	}
+	return projectLabel == expectedProject
+}
+
+func matchesGeneratedComposeName(containerName, serviceName string) bool {
+	containerName = strings.TrimSpace(containerName)
+	serviceName = strings.TrimSpace(serviceName)
+	if containerName == "" || serviceName == "" {
+		return false
+	}
+	for _, separator := range []string{"-", "_"} {
+		suffixStart := strings.LastIndex(containerName, separator)
+		if suffixStart <= 0 || suffixStart == len(containerName)-1 {
+			continue
+		}
+		if !isPositiveInteger(containerName[suffixStart+len(separator):]) {
+			continue
+		}
+		serviceEnd := suffixStart
+		serviceStart := serviceEnd - len(serviceName)
+		if serviceStart <= 0 {
+			continue
+		}
+		if containerName[serviceStart:serviceEnd] != serviceName {
+			continue
+		}
+		if containerName[serviceStart-len(separator):serviceStart] != separator {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isPositiveInteger(value string) bool {
+	if value == "" {
+		return false
+	}
+	nonZero := false
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+		if char != '0' {
+			nonZero = true
+		}
+	}
+	return nonZero
+}
+
+func dockerContainerName(name string) string {
+	return strings.TrimPrefix(strings.TrimSpace(name), "/")
+}
+
+func composeProjectName(service core.Service) string {
+	return strings.TrimSpace(service.ComposeProject)
+}
+
 type dockerContainer struct {
-	ID          string   `json:"Id"`
-	Names       []string `json:"Names"`
-	Image       string   `json:"Image"`
-	ImageID     string   `json:"ImageID"`
-	RepoDigests []string `json:"RepoDigests"`
-	State       string   `json:"State"`
-	Status      string   `json:"Status"`
-	Health      string   `json:"Health"`
+	ID          string            `json:"Id"`
+	Names       []string          `json:"Names"`
+	Image       string            `json:"Image"`
+	ImageID     string            `json:"ImageID"`
+	RepoDigests []string          `json:"RepoDigests"`
+	Labels      map[string]string `json:"Labels"`
+	State       string            `json:"State"`
+	Status      string            `json:"Status"`
+	Health      string            `json:"Health"`
 }
 
 func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
@@ -424,6 +557,7 @@ func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
 			Image:       status.Image,
 			ImageID:     status.ImageID,
 			RepoDigests: status.RepoDigests,
+			Labels:      status.Labels,
 			State:       status.State,
 			Status:      status.Status,
 			Health:      status.Health,

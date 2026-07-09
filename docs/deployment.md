@@ -137,6 +137,22 @@ runtime:
       host: unix:///var/run/docker.sock
 ```
 
+Direct Docker targets are bound to Compose services by source path when the
+scanner can infer a host: a service discovered under `docker_files/<target>/...`
+is checked only by the Docker target with the same `name`. If a Compose service
+does not have an inferable target in its source path, the dashboard checks it
+only when exactly one direct Docker target is configured; with multiple direct
+targets, the service is left unbound instead of guessing. Container matching uses
+Docker Compose labels when available; a Compose file's top-level `name:` is used
+for the project label comparison only when it is literal. Interpolated names such
+as `$STACK_NAME` or `${STACK_NAME:-prod}` are treated as unknown because the
+dashboard cannot know the deployment host environment or Compose `.env` values,
+so the service label is matched without a strict project comparison. Escaped
+`$$` sequences are unescaped to literal dollars. For unlabeled legacy agent
+reports, the fallback accepts exact container-name equality and Compose-generated
+`<project>-<service>-<index>` or `<project>_<service>_<index>` names with exact
+service-name segment boundaries.
+
 ## Health Endpoints
 
 - `GET /healthz`

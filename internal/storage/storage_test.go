@@ -1326,6 +1326,11 @@ func TestUpsertAgentThenAgentsRoundtrip(t *testing.T) {
 			ID:    "abc123",
 			Name:  "/stack-web-1",
 			Image: "example/web:v1",
+			Labels: map[string]string{
+				core.DockerComposeProjectLabel:                  "stack",
+				core.DockerComposeServiceLabel:                  "web",
+				"traefik.http.middlewares.auth.basicauth.users": "admin:$2y$05$secret",
+			},
 			State: "running",
 		}},
 	}); err != nil {
@@ -1356,6 +1361,15 @@ func TestUpsertAgentThenAgentsRoundtrip(t *testing.T) {
 	serenity := agents[1]
 	if len(serenity.Containers) != 1 || serenity.Containers[0].Name != "/stack-web-1" {
 		t.Fatalf("serenity containers = %#v", serenity.Containers)
+	}
+	labels := serenity.Containers[0].Labels
+	if len(labels) != 2 ||
+		labels[core.DockerComposeProjectLabel] != "stack" ||
+		labels[core.DockerComposeServiceLabel] != "web" {
+		t.Fatalf("serenity labels = %#v, want only compose identity labels", labels)
+	}
+	if _, ok := labels["traefik.http.middlewares.auth.basicauth.users"]; ok {
+		t.Fatalf("serenity labels leaked sensitive Docker label: %#v", labels)
 	}
 	if serenity.LastSeenAt == "" {
 		t.Fatal("serenity last_seen_at is empty, want set")

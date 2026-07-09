@@ -10,6 +10,7 @@ func TestParseCompose(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "compose.yaml")
 	if err := os.WriteFile(path, []byte(`
+name: custom-stack
 services:
   web:
     image: example/web:v1
@@ -41,6 +42,9 @@ services:
 	if len(project.Services) != 2 {
 		t.Fatalf("services = %d, want 2", len(project.Services))
 	}
+	if project.Name != "custom-stack" {
+		t.Fatalf("project name = %q, want custom-stack", project.Name)
+	}
 	if project.Services[1].Name != "web" {
 		t.Fatalf("service order/name = %q, want web", project.Services[1].Name)
 	}
@@ -56,6 +60,50 @@ services:
 	if !contains(project.Services[1].Exposure, "https://web.example.test") {
 		t.Fatalf("exposure = %v, want traefik host route", project.Services[1].Exposure)
 	}
+}
+
+func TestParseComposeTreatsProjectNameInterpolationAsUnknown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "default interpolation", raw: "${GITOPS_DASHBOARD_TEST_STACK_NAME:-prod}", want: ""},
+		{name: "unresolved interpolation", raw: "${GITOPS_DASHBOARD_TEST_STACK_NAME}", want: ""},
+		{name: "unbraced interpolation", raw: "$GITOPS_DASHBOARD_TEST_STACK_NAME", want: ""},
+		{name: "escaped dollar", raw: "foo$$bar", want: "foo$bar"},
+		{name: "literal", raw: "custom-stack", want: "custom-stack"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			project := parseComposeProjectName(t, tc.raw)
+			if project.Name != tc.want {
+				t.Fatalf("project name = %q, want %q", project.Name, tc.want)
+			}
+		})
+	}
+}
+
+func parseComposeProjectName(t *testing.T, name string) ComposeProject {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "compose.yaml")
+	if err := os.WriteFile(path, []byte(`
+name: `+name+`
+services:
+  web:
+    image: example/web:v1
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project, err := ParseCompose(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return project
 }
 
 func contains(values []string, target string) bool {

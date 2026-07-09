@@ -74,6 +74,7 @@ func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessa
 			Image:       item.Image,
 			ImageID:     item.ImageID,
 			RepoDigests: repoDigests,
+			Labels:      core.FilterDockerComposeLabels(item.Labels),
 			State:       item.State,
 			Status:      item.Status,
 		})

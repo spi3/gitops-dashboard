@@ -78,6 +78,7 @@ type Service struct {
 	SourceCommit       string              `json:"sourceCommit"`
 	SourcePath         string              `json:"sourcePath"`
 	Runtime            string              `json:"runtime"`
+	ComposeProject     string              `json:"composeProject,omitempty"`
 	Kind               string              `json:"kind"`
 	Namespace          string              `json:"namespace"`
 	ResourceName       string              `json:"resourceName"`
@@ -143,14 +144,40 @@ type AgentMessage struct {
 	Containers []ContainerStatus `json:"containers"`
 }
 
+const (
+	DockerComposeProjectLabel = "com.docker.compose.project"
+	DockerComposeServiceLabel = "com.docker.compose.service"
+)
+
 type ContainerStatus struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Image        string   `json:"image"`
-	ImageID      string   `json:"imageId"`
-	RepoDigests  []string `json:"repoDigests"`
-	State        string   `json:"state"`
-	Status       string   `json:"status"`
-	Health       string   `json:"health"`
-	RestartCount int      `json:"restartCount"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Image        string            `json:"image"`
+	ImageID      string            `json:"imageId"`
+	RepoDigests  []string          `json:"repoDigests"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	State        string            `json:"state"`
+	Status       string            `json:"status"`
+	Health       string            `json:"health"`
+	RestartCount int               `json:"restartCount"`
+}
+
+func FilterDockerComposeLabels(labels map[string]string) map[string]string {
+	filtered := map[string]string{}
+	for _, key := range []string{DockerComposeProjectLabel, DockerComposeServiceLabel} {
+		if value, ok := labels[key]; ok {
+			filtered[key] = value
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+func FilterAgentMessageDockerLabels(message AgentMessage) AgentMessage {
+	for i := range message.Containers {
+		message.Containers[i].Labels = FilterDockerComposeLabels(message.Containers[i].Labels)
+	}
+	return message
 }

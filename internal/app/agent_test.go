@@ -57,6 +57,11 @@ func TestAgentReportAppearsInSummary(t *testing.T) {
 		Containers: []core.ContainerStatus{{
 			Name:  "/stack-web-1",
 			Image: "example/web:v1",
+			Labels: map[string]string{
+				core.DockerComposeProjectLabel:                  "stack",
+				core.DockerComposeServiceLabel:                  "web",
+				"traefik.http.middlewares.auth.basicauth.users": "admin:$2y$05$secret",
+			},
 			State: "running",
 		}},
 	}
@@ -91,6 +96,15 @@ func TestAgentReportAppearsInSummary(t *testing.T) {
 	}
 	if len(serenity.Containers) != 1 || serenity.Containers[0].Name != "/stack-web-1" {
 		t.Fatalf("serenity containers = %#v", serenity.Containers)
+	}
+	labels := serenity.Containers[0].Labels
+	if len(labels) != 2 ||
+		labels[core.DockerComposeProjectLabel] != "stack" ||
+		labels[core.DockerComposeServiceLabel] != "web" {
+		t.Fatalf("serenity labels = %#v, want only compose identity labels", labels)
+	}
+	if _, ok := labels["traefik.http.middlewares.auth.basicauth.users"]; ok {
+		t.Fatalf("serenity labels leaked sensitive Docker label: %#v", labels)
 	}
 	albert, ok := byTarget["albert"]
 	if !ok || albert.LastSeenAt != "" || !albert.Configured {

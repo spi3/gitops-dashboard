@@ -11,6 +11,7 @@ import (
 )
 
 type ComposeProject struct {
+	Name     string
 	Services []ComposeService
 }
 
@@ -28,6 +29,7 @@ type ComposeService struct {
 }
 
 type composeFile struct {
+	Name     string                    `yaml:"name"`
 	Services map[string]composeService `yaml:"services"`
 }
 
@@ -74,7 +76,7 @@ func ParseCompose(path string) (ComposeProject, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	project := ComposeProject{}
+	project := ComposeProject{Name: normalizeComposeProjectName(file.Name)}
 	for _, name := range names {
 		raw := file.Services[name]
 		service := ComposeService{
@@ -94,6 +96,24 @@ func ParseCompose(path string) (ComposeProject, error) {
 		project.Services = append(project.Services, service)
 	}
 	return project, nil
+}
+
+func normalizeComposeProjectName(name string) string {
+	name = strings.TrimSpace(name)
+	var literal strings.Builder
+	for i := 0; i < len(name); i++ {
+		if name[i] != '$' {
+			literal.WriteByte(name[i])
+			continue
+		}
+		if i+1 < len(name) && name[i+1] == '$' {
+			literal.WriteByte('$')
+			i++
+			continue
+		}
+		return ""
+	}
+	return literal.String()
 }
 
 func envVars(value any) []string {

@@ -65,6 +65,9 @@ func TestScanAllClonesAndParsesFixtureRepository(t *testing.T) {
 	servicesByName := map[string][]string{}
 	for _, service := range summary.Services {
 		servicesByName[service.Name] = service.Exposure
+		if service.Runtime == "compose" && service.ComposeProject != "prod-stack" {
+			t.Fatalf("compose project = %q, want prod-stack", service.ComposeProject)
+		}
 	}
 	if !contains(servicesByName["web"], "https://web.example.test") {
 		t.Fatalf("web exposure = %v, want traefik route", servicesByName["web"])
@@ -515,6 +518,7 @@ func createFixtureRepo(t *testing.T) string {
 	runGit(t, dir, "config", "user.name", "Test")
 	runGit(t, dir, "config", "user.email", "test@example.invalid")
 	writeFile(t, filepath.Join(dir, "prod", "compose.yaml"), `
+name: prod-stack
 services:
   web:
     image: example/web:v1

@@ -186,6 +186,9 @@ func (store *Store) migrate(ctx context.Context) error {
 	if err := store.ensureColumn(ctx, "services", "config_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
+	if err := store.ensureColumn(ctx, "services", "compose_project", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := store.ensureColumn(ctx, "status_results", "observed_images_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
@@ -752,12 +755,12 @@ func insertService(ctx context.Context, tx *sql.Tx, service core.Service) error 
 	service = normalizeService(service)
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO services(
-  id, name, repository, source_commit, source_path, runtime, kind, namespace,
-  resource_name, environment, health, images_json, ports_json, dependencies_json,
-  storage_json, exposure_json, config_json, warnings_json
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, service.ID, service.Name, service.Repository, service.SourceCommit, service.SourcePath,
-		service.Runtime, service.Kind, service.Namespace, service.ResourceName, service.Environment,
+	  id, name, repository, source_commit, source_path, runtime, kind, namespace,
+	  compose_project, resource_name, environment, health, images_json, ports_json, dependencies_json,
+	  storage_json, exposure_json, config_json, warnings_json
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, service.ID, service.Name, service.Repository, service.SourceCommit, service.SourcePath,
+		service.Runtime, service.Kind, service.Namespace, service.ComposeProject, service.ResourceName, service.Environment,
 		string(service.Health), toJSON(service.Images), toJSON(service.Ports), toJSON(service.Dependencies),
 		toJSON(service.Storage), toJSON(service.Exposure), toJSON(service.ConfigRefs), toJSON(service.Warnings))
 	if err != nil {
@@ -860,7 +863,7 @@ FROM scans ORDER BY started_at DESC LIMIT 50
 func (store *Store) Services(ctx context.Context) ([]core.Service, error) {
 	rows, err := store.db.QueryContext(ctx, `
 SELECT id, name, repository, source_commit, source_path, runtime, kind, namespace,
-       resource_name, environment, health, images_json, ports_json, dependencies_json,
+       compose_project, resource_name, environment, health, images_json, ports_json, dependencies_json,
        storage_json, exposure_json, config_json, warnings_json
 FROM services ORDER BY repository, runtime, name
 `)
@@ -874,7 +877,7 @@ FROM services ORDER BY repository, runtime, name
 		var health string
 		var images, ports, dependencies, storageRefs, exposure, configRefs, warnings string
 		err := rows.Scan(&service.ID, &service.Name, &service.Repository, &service.SourceCommit,
-			&service.SourcePath, &service.Runtime, &service.Kind, &service.Namespace, &service.ResourceName,
+			&service.SourcePath, &service.Runtime, &service.Kind, &service.Namespace, &service.ComposeProject, &service.ResourceName,
 			&service.Environment, &health, &images, &ports, &dependencies, &storageRefs, &exposure, &configRefs, &warnings)
 		if err != nil {
 			return nil, err
@@ -1210,6 +1213,7 @@ func healthPriority(health core.HealthState) int {
 }
 
 func normalizeService(service core.Service) core.Service {
+	service.ComposeProject = strings.TrimSpace(service.ComposeProject)
 	if service.Images == nil {
 		service.Images = []string{}
 	}
@@ -1487,8 +1491,9 @@ ORDER BY service_id, target, checked_at ASC
 }
 
 func (store *Store) UpsertAgent(ctx context.Context, message core.AgentMessage) error {
+	message = core.FilterAgentMessageDockerLabels(message)
 	_, err := store.db.ExecContext(ctx, `
-INSERT INTO agents(target, last_seen_at, status_json)
+	INSERT INTO agents(target, last_seen_at, status_json)
 VALUES(?, ?, ?)
 ON CONFLICT(target) DO UPDATE SET last_seen_at=excluded.last_seen_at, status_json=excluded.status_json
 `, message.Target, time.Now().UTC().Format(time.RFC3339), toJSON(message.Containers))
@@ -1573,10 +1578,11 @@ CREATE TABLE IF NOT EXISTS services (
   ports_json TEXT NOT NULL,
   dependencies_json TEXT NOT NULL,
   storage_json TEXT NOT NULL,
-  exposure_json TEXT NOT NULL,
-  config_json TEXT NOT NULL DEFAULT '[]',
-  warnings_json TEXT NOT NULL
-);
+	  exposure_json TEXT NOT NULL,
+	  config_json TEXT NOT NULL DEFAULT '[]',
+	  compose_project TEXT NOT NULL DEFAULT '',
+	  warnings_json TEXT NOT NULL
+	);
 
 CREATE TABLE IF NOT EXISTS status_results (
   service_id TEXT NOT NULL,

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/example/gitops-dashboard/internal/config"
+	"github.com/example/gitops-dashboard/internal/core"
 )
 
 func TestCollectDockerInspectsRepoDigests(t *testing.T) {
@@ -24,8 +25,13 @@ func TestCollectDockerInspectsRepoDigests(t *testing.T) {
 					Names:   []string{"/stack-api-1"},
 					Image:   "example/api:v1",
 					ImageID: "sha256:api",
-					State:   "running",
-					Status:  "Up 1 minute",
+					Labels: map[string]string{
+						core.DockerComposeProjectLabel:                  "stack",
+						core.DockerComposeServiceLabel:                  "api",
+						"traefik.http.middlewares.auth.basicauth.users": "admin:$2y$05$secret",
+					},
+					State:  "running",
+					Status: "Up 1 minute",
 				},
 				{
 					ID:      "container-2",
@@ -78,5 +84,14 @@ func TestCollectDockerInspectsRepoDigests(t *testing.T) {
 		if len(container.RepoDigests) != 1 || container.RepoDigests[0] != "example/api@sha256:release" {
 			t.Fatalf("container = %#v, want inspected repo digest for live container", container)
 		}
+	}
+	labels := message.Containers[0].Labels
+	if len(labels) != 2 ||
+		labels[core.DockerComposeProjectLabel] != "stack" ||
+		labels[core.DockerComposeServiceLabel] != "api" {
+		t.Fatalf("labels = %#v, want only compose identity labels", labels)
+	}
+	if _, ok := labels["traefik.http.middlewares.auth.basicauth.users"]; ok {
+		t.Fatalf("labels leaked sensitive Docker label: %#v", labels)
 	}
 }
