@@ -25,8 +25,9 @@ import (
 var ErrAgentTargetUnauthorized = errors.New("agent target is not authorized for token")
 
 const (
-	dockerComposeProjectLabel = core.DockerComposeProjectLabel
-	dockerComposeServiceLabel = core.DockerComposeServiceLabel
+	dockerComposeProjectLabel       = core.DockerComposeProjectLabel
+	dockerComposeServiceLabel       = core.DockerComposeServiceLabel
+	statusHistoryMaintenanceTimeout = 20 * time.Second
 )
 
 type Monitor struct {
@@ -45,6 +46,7 @@ func (monitor Monitor) Run(ctx context.Context) {
 		monitor.logger.Error("monitoring scheduler disabled", "error", err)
 		return
 	}
+	go monitor.runStatusHistoryMaintenance(ctx, defaultInterval)
 	for _, target := range monitor.cfg.Runtime.Docker {
 		if target.Kind == "agent" {
 			continue
@@ -59,6 +61,32 @@ func (monitor Monitor) Run(ctx context.Context) {
 	}
 	for _, target := range monitor.cfg.Runtime.Ping {
 		go monitor.runPingLoop(ctx, target, target.CheckInterval(defaultInterval))
+	}
+}
+
+func (monitor Monitor) runStatusHistoryMaintenance(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	monitor.pruneStatusHistory(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			monitor.pruneStatusHistory(ctx)
+		}
+	}
+}
+
+func (monitor Monitor) pruneStatusHistory(ctx context.Context) {
+	checkCtx, cancel := context.WithTimeout(ctx, statusHistoryMaintenanceTimeout)
+	defer cancel()
+	if err := monitor.store.PruneStatusHistory(checkCtx); err != nil {
+		monitor.logger.Error("status history prune failed", "error", err)
 	}
 }
 
@@ -92,6 +120,11 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 	for _, target := range monitor.cfg.Runtime.Ping {
 		if err := monitor.checkPing(ctx, target); err != nil {
 			monitor.logger.Error("ping monitoring failed", "target", target.EffectiveName(), "error", err)
+			combined = err
+		}
+	}
+	if err := monitor.store.PruneStatusHistory(ctx); err != nil {
+		if combined == nil {
 			combined = err
 		}
 	}
@@ -185,6 +218,13 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 			services, err := monitor.store.Services(checkCtx)
 			if err == nil {
 				err = check(checkCtx, services)
+			}
+			if pruneErr := monitor.store.PruneStatusHistory(checkCtx); pruneErr != nil {
+				if err != nil {
+					err = fmt.Errorf("%w; status history prune failed: %w", err, pruneErr)
+				} else {
+					err = pruneErr
+				}
 			}
 			cancel()
 			if err != nil {

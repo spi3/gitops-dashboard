@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1085,6 +1086,202 @@ WHERE service_id='svc-app' AND target='routes: https://app.example.test'
 	}
 }
 
+func TestRouteMonitorLookupBatchesStatusTargetsAndOverrides(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO monitor_overrides(service_id, target, not_applicable, updated_at)
+VALUES
+  ('svc-a', 'routes', 1, '2026-01-01T00:00:00Z'),
+  ('svc-a', 'routes: https://app.example.test', 1, '2026-01-01T00:00:00Z'),
+  ('svc-a', 'docker', 1, '2026-01-01T00:00:00Z'),
+  ('svc-b', 'routes: https://api.example.test', 1, '2026-01-01T00:00:00Z')
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at)
+VALUES
+  ('svc-a', 'routes', 'healthy', 'parent', '2026-01-01T00:00:00Z'),
+  ('svc-a', 'routes: https://app.example.test', 'healthy', 'child', '2026-01-01T00:00:00Z'),
+  ('svc-a', 'routes: https://old.example.test', 'healthy', 'stale', '2026-01-01T00:00:00Z'),
+  ('svc-a', 'docker', 'healthy', 'other', '2026-01-01T00:00:00Z'),
+  ('svc-b', 'routes: https://api.example.test', 'healthy', 'child', '2026-01-01T00:00:00Z'),
+  ('svc-b', 'routes: https://other.example.test', 'healthy', 'other', '2026-01-01T00:00:00Z')
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	lookup, err := store.RouteMonitorLookup(ctx, []string{"svc-a", "svc-b", "svc-a", "", "svc-c"}, "routes", "routes: ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svcA, ok := lookup["svc-a"]
+	if !ok {
+		t.Fatal("missing svc-a state")
+	}
+	if len(svcA.Overrides) != 2 {
+		t.Fatalf("svc-a overrides = %#v, want 2", svcA.Overrides)
+	}
+	if _, ok := svcA.Overrides["routes"]; !ok {
+		t.Fatal("svc-a overrides missing parent route override")
+	}
+	if _, ok := svcA.Overrides["routes: https://app.example.test"]; !ok {
+		t.Fatal("svc-a overrides missing exact child override")
+	}
+	if _, ok := svcA.StatusTargets["routes"]; !ok {
+		t.Fatal("svc-a status target missing parent route target")
+	}
+	if _, ok := svcA.StatusTargets["routes: https://app.example.test"]; !ok {
+		t.Fatal("svc-a status target missing configured child target")
+	}
+	if _, ok := svcA.StatusTargets["routes: https://old.example.test"]; !ok {
+		t.Fatal("svc-a status target missing stale child target")
+	}
+	if _, ok := svcA.StatusTargets["docker"]; ok {
+		t.Fatal("svc-a status target contained non-route target")
+	}
+	if _, ok := svcA.Overrides["docker"]; ok {
+		t.Fatal("svc-a override lookup included non-route target")
+	}
+
+	svcB, ok := lookup["svc-b"]
+	if !ok {
+		t.Fatal("missing svc-b state")
+	}
+	if _, ok := svcB.Overrides["routes: https://api.example.test"]; len(svcB.Overrides) != 1 || !ok {
+		t.Fatal("svc-b override set did not include only expected child override")
+	}
+	if len(svcB.StatusTargets) != 2 {
+		t.Fatalf("svc-b status targets = %#v, want 2", svcB.StatusTargets)
+	}
+	if _, ok := svcB.StatusTargets["routes: https://api.example.test"]; !ok {
+		t.Fatal("svc-b status target missing configured child target")
+	}
+	if _, ok := svcB.StatusTargets["routes: https://other.example.test"]; !ok {
+		t.Fatal("svc-b status target missing stale child target")
+	}
+
+	svcC, ok := lookup["svc-c"]
+	if !ok {
+		t.Fatal("missing svc-c state")
+	}
+	if len(svcC.Overrides) != 0 || len(svcC.StatusTargets) != 0 {
+		t.Fatalf("svc-c lookup state = %#v, want empty maps", svcC)
+	}
+	if len(lookup) != 3 {
+		t.Fatalf("lookup map = %#v, want 3 services after dedupe", len(lookup))
+	}
+}
+
+func TestRouteMonitorLookupUsesCustomHTTPParentPrefixAndBatchesLargeSets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	target := "svc-http"
+	prefix := target + ": "
+
+	for i := 0; i < 1100; i++ {
+		serviceID := fmt.Sprintf("svc-%04d", i)
+		_, err := store.db.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at)
+VALUES (?, ?, 'healthy', 'ok', '2026-01-01T00:00:00Z')
+`, serviceID, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.db.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at)
+VALUES (?, ?, 'healthy', 'child ok', '2026-01-01T00:00:00Z')
+`, serviceID, prefix+"https://example.test/"+serviceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, err = store.db.ExecContext(ctx, `
+INSERT INTO monitor_overrides(service_id, target, not_applicable, updated_at)
+VALUES ('svc-0000', ?, 1, '2026-01-01T00:00:00Z'),
+       ('svc-0000', ?, 1, '2026-01-01T00:00:00Z')
+`, target, prefix+"https://app.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serviceIDs := make([]string, 1100)
+	for i := 0; i < 1100; i++ {
+		serviceIDs[i] = fmt.Sprintf("svc-%04d", i)
+	}
+	lookup, err := store.RouteMonitorLookup(ctx, serviceIDs, target, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lookup) != 1100 {
+		t.Fatalf("lookup size = %d, want 1100", len(lookup))
+	}
+	svc0, ok := lookup["svc-0000"]
+	if !ok {
+		t.Fatal("svc-0000 missing from lookup")
+	}
+	if _, ok := svc0.Overrides[target]; !ok {
+		t.Fatal("svc-0000 missing exact parent override for configured target")
+	}
+	if _, ok := svc0.Overrides[prefix+"https://app.example.test"]; !ok {
+		t.Fatal("svc-0000 missing exact child override for configured target")
+	}
+	if _, ok := svc0.StatusTargets[target]; !ok {
+		t.Fatal("svc-0000 missing configured target from status")
+	}
+	if _, ok := svc0.StatusTargets[prefix+"https://example.test/svc-0000"]; !ok {
+		t.Fatal("svc-0000 missing configured child status target")
+	}
+}
+
+func TestStatusHistoryCheckedAtIndexMigrationIsIdempotent(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countIndexes := func() int {
+		var count int
+		if err := store.db.QueryRowContext(context.Background(), `
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type='index' AND name='idx_status_history_checked_at_lookup'
+`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	if got := countIndexes(); got != 1 {
+		t.Fatalf("status_history checked_at index count after first migrate = %d, want 1", got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if got := countIndexes(); got != 1 {
+		t.Fatalf("status_history checked_at index count after second migrate = %d, want 1", got)
+	}
+}
+
 func TestSetMonitorNotApplicableHandlesRoutesParentAndLiteralTargets(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1274,6 +1471,7 @@ func TestUptimePruneAndWindow(t *testing.T) {
 	defer store.Close()
 	now := time.Now().UTC().Truncate(time.Second)
 	// Insert directly so these rows survive to be observed; UpsertStatus would prune the old one in its own transaction.
+	// Prune now runs as a separate maintenance pass after monitor runs.
 	old := now.Add(-10 * 24 * time.Hour).Format(time.RFC3339)
 	stale := now.Add(-30 * time.Hour).Format(time.RFC3339)
 	for _, checkedAt := range []string{old, stale} {
@@ -1290,6 +1488,9 @@ VALUES('svc', 'local', 'healthy', 'up', ?)`, checkedAt); err != nil {
 	if err := store.UpsertStatus(ctx, core.StatusResult{
 		ServiceID: "svc", Target: "local", Health: core.HealthHealthy, Message: "up", CheckedAt: now,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PruneStatusHistory(ctx); err != nil {
 		t.Fatal(err)
 	}
 	// The 10-day-old row is pruned; the 30-hour-old row and the fresh row remain.

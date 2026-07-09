@@ -11,6 +11,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/routetarget"
+	"github.com/example/gitops-dashboard/internal/storage"
 )
 
 const (
@@ -37,16 +38,43 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	}
 
 	targetPrefix := targetName + ": "
+	serviceIDs := make([]string, 0, len(services))
+	routesByService := make(map[string][]string, len(services))
+	hasRoutesByService := make(map[string]bool, len(services))
+	for _, service := range services {
+		if service.ID == "" {
+			continue
+		}
+		serviceIDs = append(serviceIDs, service.ID)
+		routes := httpRoutes(service.Exposure)
+		routesByService[service.ID] = routes
+		hasRoutesByService[service.ID] = len(routes) > 0
+	}
+
+	lookup, err := monitor.store.RouteMonitorLookup(ctx, serviceIDs, targetName, targetPrefix)
+	if err != nil {
+		return err
+	}
+
 	checks := []httpRouteCheck{}
 	overriddenStatuses := []core.StatusResult{}
 	for _, service := range services {
-		routes := httpRoutes(service.Exposure)
-		parentNotApplicable, err := monitor.store.MonitorNotApplicable(ctx, service.ID, targetName)
-		if err != nil {
-			return err
+		if service.ID == "" {
+			continue
 		}
+		routes := routesByService[service.ID]
+		state, ok := lookup[service.ID]
+		if !ok {
+			state = storage.RouteMonitorLookup{}
+		}
+
+		parentNotApplicable := false
+		if _, ok := state.Overrides[targetName]; ok {
+			parentNotApplicable = true
+		}
+
 		if parentNotApplicable {
-			if err := monitor.store.PruneStatusTargets(ctx, service.ID, "", targetPrefix, nil); err != nil {
+			if err := monitor.store.PruneStatusTargetsFromKnown(ctx, service.ID, "", targetPrefix, nil, state.StatusTargets, false); err != nil {
 				return err
 			}
 			overriddenStatuses = append(overriddenStatuses, core.StatusResult{
@@ -60,16 +88,14 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 		}
 
 		keepTargets := routeStatusTargets(targetPrefix, routes)
-		if err := monitor.store.PruneStatusTargets(ctx, service.ID, targetName, targetPrefix, keepTargets); err != nil {
+		if err := monitor.store.PruneStatusTargetsFromKnown(ctx, service.ID, targetName, targetPrefix, keepTargets, state.StatusTargets, false); err != nil {
 			return err
 		}
+
+		hasConfiguredRoutes := hasRoutesByService[service.ID]
 		for _, route := range routes {
 			statusTarget := targetPrefix + route
-			routeNotApplicable, err := monitor.store.MonitorNotApplicable(ctx, service.ID, statusTarget)
-			if err != nil {
-				return err
-			}
-			if routeNotApplicable {
+			if _, ok := state.Overrides[statusTarget]; ok {
 				overriddenStatuses = append(overriddenStatuses, core.StatusResult{
 					ServiceID: service.ID,
 					Target:    statusTarget,
@@ -79,6 +105,19 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 				})
 				continue
 			}
+			if hasConfiguredRoutes {
+				if _, ok := state.Overrides[routetarget.Parent]; ok {
+					overriddenStatuses = append(overriddenStatuses, core.StatusResult{
+						ServiceID: service.ID,
+						Target:    statusTarget,
+						Health:    core.HealthNotApplicable,
+						Message:   "not applicable",
+						CheckedAt: time.Now().UTC(),
+					})
+					continue
+				}
+			}
+
 			checks = append(checks, httpRouteCheck{
 				serviceID: service.ID,
 				target:    statusTarget,

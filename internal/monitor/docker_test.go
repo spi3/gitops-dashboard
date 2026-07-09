@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/storage"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestDockerHealthMapsContainerState(t *testing.T) {
@@ -192,6 +194,66 @@ func TestApplyAgentReportRejectsUnauthorizedTarget(t *testing.T) {
 	}
 	if len(agents) != 0 {
 		t.Fatalf("agents = %#v, want no persisted report", agents)
+	}
+}
+
+func TestRunPrunesStatusHistoryInAgentOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/dashboard.db"
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	statusDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer statusDB.Close()
+	oldCheckedAt := time.Now().Add(-8 * 24 * time.Hour).UTC()
+	err = store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "legacy",
+		Target:    "agent-a",
+		Health:    core.HealthHealthy,
+		Message:   "stale",
+		CheckedAt: oldCheckedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Runtime: config.RuntimeConfig{
+			Docker: []config.DockerTarget{
+				{Name: "agent-a", Kind: "agent"},
+			},
+		},
+		Monitoring: config.MonitoringConfig{
+			DefaultInterval: "10ms",
+		},
+	}
+	monitor := New(cfg, store, slog.Default())
+	monitorCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go monitor.Run(monitorCtx)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		var count int
+		if err := statusDB.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM status_history
+WHERE service_id='legacy' AND target='agent-a'
+`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status history stale rows = %d, want 0 within maintenance interval", count)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

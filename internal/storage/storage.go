@@ -32,8 +32,10 @@ type Store struct {
 var ErrStatusNotFound = errors.New("status result not found")
 
 const (
-	routeMonitorTarget = routetarget.Parent
-	routeTargetPrefix  = routetarget.Prefix
+	routeMonitorTarget          = routetarget.Parent
+	routeTargetPrefix           = routetarget.Prefix
+	statusHistoryWindow         = 7 * 24 * time.Hour
+	routeMonitorLookupBatchSize = 500
 )
 
 type RuntimeServiceSource struct {
@@ -1126,6 +1128,197 @@ func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarg
 	return tx.Commit()
 }
 
+type RouteMonitorLookup struct {
+	Overrides     map[string]struct{}
+	StatusTargets map[string]struct{}
+}
+
+func (store *Store) RouteMonitorLookup(ctx context.Context, serviceIDs []string, exactTarget, targetPrefix string) (map[string]RouteMonitorLookup, error) {
+	serviceIDs = dedupeStrings(serviceIDs)
+	if len(serviceIDs) == 0 {
+		return map[string]RouteMonitorLookup{}, nil
+	}
+
+	result := make(map[string]RouteMonitorLookup, len(serviceIDs))
+	for _, serviceID := range serviceIDs {
+		result[serviceID] = RouteMonitorLookup{
+			Overrides:     map[string]struct{}{},
+			StatusTargets: map[string]struct{}{},
+		}
+	}
+
+	for _, batch := range chunkStrings(serviceIDs, routeMonitorLookupBatchSize) {
+		if err := store.routeMonitorLookupChunk(ctx, batch, exactTarget, targetPrefix, result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func (store *Store) routeMonitorLookupChunk(ctx context.Context, serviceIDs []string, exactTarget, targetPrefix string, result map[string]RouteMonitorLookup) error {
+	placeholders := sqlPlaceholders(len(serviceIDs))
+
+	overrideArgs := make([]any, 0, len(serviceIDs)+2)
+	for _, serviceID := range serviceIDs {
+		overrideArgs = append(overrideArgs, serviceID)
+	}
+	overrideArgs = append(overrideArgs, exactTarget, targetPrefix+"%")
+	overrideRows, err := store.db.QueryContext(ctx, `
+SELECT service_id, target
+FROM monitor_overrides
+WHERE service_id IN (`+placeholders+`) AND not_applicable = 1
+  AND (target = ? OR target LIKE ?)
+`, overrideArgs...)
+	if err != nil {
+		return err
+	}
+	for overrideRows.Next() {
+		var serviceID, target string
+		if err := overrideRows.Scan(&serviceID, &target); err != nil {
+			_ = overrideRows.Close()
+			return err
+		}
+		state, ok := result[serviceID]
+		if !ok {
+			continue
+		}
+		state.Overrides[target] = struct{}{}
+		result[serviceID] = state
+	}
+	if err := overrideRows.Close(); err != nil {
+		return err
+	}
+
+	statusArgs := make([]any, 0, len(serviceIDs)+2)
+	for _, serviceID := range serviceIDs {
+		statusArgs = append(statusArgs, serviceID)
+	}
+	statusArgs = append(statusArgs, exactTarget, targetPrefix+"%")
+	statusRows, err := store.db.QueryContext(ctx, `
+SELECT service_id, target
+FROM status_results
+WHERE service_id IN (`+placeholders+`) AND (target = ? OR target LIKE ?)
+`, statusArgs...)
+	if err != nil {
+		return err
+	}
+	for statusRows.Next() {
+		var serviceID, target string
+		if err := statusRows.Scan(&serviceID, &target); err != nil {
+			_ = statusRows.Close()
+			return err
+		}
+		state, ok := result[serviceID]
+		if !ok {
+			continue
+		}
+		state.StatusTargets[target] = struct{}{}
+		result[serviceID] = state
+	}
+	if err := statusRows.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, exactTarget, prefix string, keep []string, statusTargets map[string]struct{}, keepExact bool) error {
+	keepTargets := make(map[string]struct{}, len(keep))
+	for _, target := range keep {
+		keepTargets[target] = struct{}{}
+	}
+
+	removeTargets := make([]string, 0, len(statusTargets))
+	for target := range statusTargets {
+		if target == exactTarget && exactTarget != "" {
+			if keepExact {
+				continue
+			}
+			removeTargets = append(removeTargets, target)
+			continue
+		}
+		if prefix == "" || !strings.HasPrefix(target, prefix) {
+			continue
+		}
+		if _, keep := keepTargets[target]; keep {
+			continue
+		}
+		removeTargets = append(removeTargets, target)
+	}
+	if len(removeTargets) == 0 {
+		return nil
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := deleteByServiceAndTargets(ctx, tx, "status_results", serviceID, removeTargets); err != nil {
+		return err
+	}
+	if err := deleteByServiceAndTargets(ctx, tx, "status_history", serviceID, removeTargets); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func sqlPlaceholders(count int) string {
+	parts := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		parts = append(parts, "?")
+	}
+	return strings.Join(parts, ",")
+}
+
+func dedupeStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	unique := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		unique = append(unique, item)
+	}
+	return unique
+}
+
+func chunkStrings(items []string, size int) [][]string {
+	if size <= 0 {
+		return [][]string{items}
+	}
+	chunks := make([][]string, 0, (len(items)+size-1)/size)
+	for start := 0; start < len(items); start += size {
+		end := start + size
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[start:end])
+	}
+	return chunks
+}
+
+func deleteByServiceAndTargets(ctx context.Context, tx *sql.Tx, table string, serviceID string, targets []string) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	placeholders := sqlPlaceholders(len(targets))
+	args := make([]any, 0, len(targets)+1)
+	args = append(args, serviceID)
+	for _, target := range targets {
+		args = append(args, target)
+	}
+	query := "DELETE FROM " + table + " WHERE service_id=? AND target IN (" + placeholders + ")"
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("delete %s rows: %w", table, err)
+	}
+	return nil
+}
+
 func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
 	latestByTarget := map[string]map[string]core.StatusResult{}
 	for _, status := range statuses {
@@ -1285,11 +1478,15 @@ VALUES(?, ?, ?, ?, ?)
 	if err != nil {
 		return fmt.Errorf("insert status history %s/%s: %w", status.ServiceID, status.Target, err)
 	}
-	cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339)
-	if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff); err != nil {
+	return tx.Commit()
+}
+
+func (store *Store) PruneStatusHistory(ctx context.Context) error {
+	cutoff := time.Now().UTC().Add(-statusHistoryWindow).Format(time.RFC3339)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff); err != nil {
 		return fmt.Errorf("prune status history: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
 
 type overrideQuerier interface {
@@ -1611,6 +1808,9 @@ CREATE TABLE IF NOT EXISTS status_history (
 
 CREATE INDEX IF NOT EXISTS idx_status_history_lookup
 ON status_history(service_id, target, checked_at);
+
+CREATE INDEX IF NOT EXISTS idx_status_history_checked_at_lookup
+ON status_history(checked_at, service_id, target);
 
 CREATE TABLE IF NOT EXISTS monitor_overrides (
   service_id TEXT NOT NULL,
