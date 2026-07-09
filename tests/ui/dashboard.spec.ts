@@ -528,6 +528,162 @@ test("keeps slash-distinct route controls and override targets", async ({ page }
   });
 });
 
+test.describe("agent report-driven compose service health", () => {
+  const target = "agent-target";
+  const token = "dashboard-agent-token";
+  const serviceName = "worker";
+  const serviceImage = "example/worker:v1.0.0";
+  const healthyContainers = [{
+    Id: "container-worker-1",
+    Names: ["/worker-1"],
+    Image: serviceImage,
+    Labels: {
+      "com.docker.compose.service": serviceName,
+      "com.docker.compose.project": target
+    },
+    State: "running",
+    Status: "Up 2 minutes",
+    RestartCount: 0
+  }];
+  const unhealthyContainers = [{
+    Id: "container-worker-1",
+    Names: ["/worker-1"],
+    Image: serviceImage,
+    Labels: {
+      "com.docker.compose.service": serviceName,
+      "com.docker.compose.project": target
+    },
+    State: "running",
+    Status: "Up 1 minute (unhealthy)",
+    RestartCount: 3
+  }];
+
+  let tempRoot = "";
+  let baseURL = "";
+  let server: ChildProcessWithoutNullStreams | null = null;
+  let fakeDocker: Server | null = null;
+  let serverLogs = "";
+  let agentConfigPath = "";
+  let dockerPort = 0;
+  let containerScenario: "unreported" | "healthy" | "unhealthy" = "unreported";
+  let agentProcess: ChildProcessWithoutNullStreams | null = null;
+
+  const currentContainers = () => {
+    switch (containerScenario) {
+      case "healthy":
+        return healthyContainers;
+      case "unhealthy":
+        return unhealthyContainers;
+      default:
+        return [];
+    }
+  };
+
+  const setContainerScenario = (scenario: "unreported" | "healthy" | "unhealthy") => {
+    containerScenario = scenario;
+  };
+
+  test.beforeAll(async () => {
+    tempRoot = mkdtempSync(path.join(tmpdir(), "gitops-dashboard-agent-ui-"));
+    const fixtureRepo = path.join(tempRoot, "fixture");
+    const dataDir = path.join(tempRoot, "data");
+    const configPath = path.join(tempRoot, "config.yaml");
+    agentConfigPath = path.join(tempRoot, "agent.yaml");
+
+    createAgentFixtureRepo(fixtureRepo, target, serviceName, serviceImage);
+    mkdirSync(dataDir, { recursive: true });
+
+    const serverPort = await freePort();
+    dockerPort = await freePort();
+    fakeDocker = createDynamicFakeDockerServer(currentContainers);
+    await listen(fakeDocker, dockerPort);
+
+    baseURL = `http://127.0.0.1:${serverPort}`;
+    writeFileSync(configPath, [
+      "server:",
+      `  listen: "127.0.0.1:${serverPort}"`,
+      `  dataDir: "${dataDir}"`,
+      `  repoCacheDir: "${path.join(dataDir, "repos")}"`,
+      "auth:",
+      "  mode: dev-no-auth",
+      "  agent:",
+      `    tokens: ["${token}"]`,
+      "monitoring:",
+      "  defaultInterval: 30s",
+      "repositories:",
+      "  - name: fixture",
+      `    url: "file://${fixtureRepo}"`,
+      "    defaultRef: main",
+      "runtime:",
+      "  docker:",
+      `    - name: "${target}"`,
+      "      kind: agent",
+      "  kubernetes: []",
+      ""
+    ].join("\n"));
+    writeFileSync(agentConfigPath, [
+      "agent:",
+      `  serverUrl: "ws://127.0.0.1:${serverPort}/api/agents/connect"`,
+      `  target: "${target}"`,
+      `  token: "${token}"`,
+      "  interval: \"1s\"",
+      "  docker:",
+      `    host: "http://127.0.0.1:${dockerPort}"`,
+      ""
+    ].join("\n"));
+
+    server = spawn(path.join(repoRoot, "gitops-dashboard"), ["-config", configPath], {
+      cwd: repoRoot
+    });
+    server.stdout.on("data", (chunk) => {
+      serverLogs += chunk.toString();
+    });
+    server.stderr.on("data", (chunk) => {
+      serverLogs += chunk.toString();
+    });
+    await waitForServer(baseURL, () => serverLogs);
+  });
+
+  test.afterAll(() => {
+    if (agentProcess) {
+      agentProcess.kill("SIGTERM");
+    }
+    if (server) {
+      server.kill("SIGTERM");
+    }
+    if (fakeDocker) {
+      fakeDocker.close();
+    }
+    if (tempRoot) {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("updates service tile state as agent reports arrive", async ({ page }) => {
+    const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: serviceName, exact: true }) });
+
+    await page.goto(baseURL);
+    await expect(page.locator(".sentence")).toHaveText("Waiting for the first scan");
+    await page.getByRole("button", { name: "Sync repos" }).click();
+    await expect(page.getByRole("heading", { name: "Production" })).toBeVisible();
+    await expect(tile.locator(".stateWord")).toHaveText("No data");
+
+    agentProcess = spawn(path.join(repoRoot, "gitops-dashboard"), ["-mode", "agent", "-config", agentConfigPath], {
+      cwd: repoRoot
+    });
+
+    setContainerScenario("healthy");
+    await waitForServiceHealth(baseURL, serviceName, "healthy");
+    await page.reload();
+    await expect(tile.locator(".stateWord")).toHaveText("Up");
+
+    setContainerScenario("unhealthy");
+    await waitForServiceHealth(baseURL, serviceName, "unhealthy");
+    await page.reload();
+    await expect(tile.locator(".stateWord")).toHaveText("Down");
+  });
+});
+
 function createFixtureRepo(dir: string) {
   mkdirSync(path.join(dir, "prod"), { recursive: true });
   writeFileSync(path.join(dir, "prod", "compose.yaml"), [
@@ -651,6 +807,56 @@ function listen(server: Server, port: number) {
   return new Promise<void>((resolve, reject) => {
     server.on("error", reject);
     server.listen(port, "127.0.0.1", () => resolve());
+  });
+}
+
+function createAgentFixtureRepo(dir: string, target: string, serviceName: string, image: string) {
+  const composePath = path.join(dir, "docker_files", target, "prod");
+  mkdirSync(composePath, { recursive: true });
+  writeFileSync(path.join(composePath, "docker-compose.yaml"), [
+    "services:",
+    `  ${serviceName}:`,
+    `    image: ${image}`,
+    `    labels:`,
+    `      - "com.docker.compose.project=${target}"`,
+    ""
+  ].join("\n"));
+  runGit(dir, "init", "-b", "main");
+  runGit(dir, "config", "user.name", "Playwright");
+  runGit(dir, "config", "user.email", "playwright@example.invalid");
+  runGit(dir, "add", ".");
+  runGit(dir, "commit", "-m", "fixture");
+}
+
+async function waitForServiceHealth(url: string, serviceName: string, expectedHealth: "healthy" | "unhealthy" | "unknown") {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 15_000) {
+    try {
+      const response = await fetch(`${url}/api/summary`);
+      if (response.ok) {
+        const summary = await response.json() as { services?: Array<{ name: string; health: string }> };
+        const service = (summary.services ?? []).find((candidate) => candidate.name === serviceName);
+        if (service?.health === expectedHealth) {
+          return;
+        }
+      }
+    } catch {
+      // ignore transient failures
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`service ${serviceName} did not reach ${expectedHealth}`);
+}
+
+function createDynamicFakeDockerServer(readContainers: () => unknown[]) {
+  return createServer((request, response) => {
+    if (request.url?.startsWith("/containers/json")) {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(readContainers()));
+      return;
+    }
+    response.writeHead(404);
+    response.end("not found");
   });
 }
 
