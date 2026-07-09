@@ -4,12 +4,49 @@ VERSION ?= dev-$(COMMIT)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -X github.com/example/gitops-dashboard/internal/version.Version=$(VERSION) -X github.com/example/gitops-dashboard/internal/version.Commit=$(COMMIT) -X github.com/example/gitops-dashboard/internal/version.BuildDate=$(BUILD_DATE)
 
-.PHONY: build check dev-server dev-ui format lint test ui-build ui-lint ui-test ui-e2e go-test
+.PHONY: build check check-local dev-server dev-ui format format-check lint test ui-build ui-lint ui-test ui-e2e go-test
 
 build: ui-build
 	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go build -buildvcs=false -ldflags "$(LDFLAGS)" ./cmd/gitops-dashboard
 
-check: format lint test build ui-e2e
+check:
+	@set -eu; \
+	tmp=""; \
+	checkout=""; \
+	trap 'if [ -n "$$tmp" ]; then rm -rf "$$tmp"; fi' EXIT; \
+	tmp_base="$${TMPDIR:-/tmp}"; \
+	tmp="$$(mktemp -d "$$tmp_base/gitops-dashboard-check.XXXXXX")"; \
+	checkout="$$tmp/checkout"; \
+	mkdir "$$checkout"; \
+	if [ -z "$$tmp" ] || [ ! -d "$$tmp" ] || [ -z "$$checkout" ] || [ ! -d "$$checkout" ] || [ "$$checkout" = "/" ]; then \
+		echo "invalid check workspace: $$checkout" >&2; \
+		exit 1; \
+	fi; \
+	rsync -a --delete \
+		--exclude '/.agents/' \
+		--exclude '/.cache/' \
+		--exclude '/.codex/' \
+		--exclude '/.env' \
+		--exclude '/.env.*' \
+		--exclude '/.git/' \
+		--exclude '/.gitdb/' \
+		--exclude '/.tmp/' \
+		--exclude '/coverage/' \
+		--exclude '/data/' \
+		--exclude '/dist/' \
+		--exclude '/gitops-dashboard' \
+		--exclude 'internal/ui/dist/' \
+		--exclude '/node_modules/' \
+		--exclude '/playwright-report/' \
+		--exclude '/test-results/' \
+		--exclude '/tmp/' \
+		./ "$$checkout"/; \
+	if [ -d node_modules ]; then \
+		ln -s "$$(pwd)/node_modules" "$$checkout/node_modules"; \
+	fi; \
+	$(MAKE) -C "$$checkout" check-local
+
+check-local: format-check lint test build ui-e2e
 
 dev-server:
 	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go run ./cmd/gitops-dashboard -config examples/config.dev.yaml
@@ -19,6 +56,17 @@ dev-ui:
 
 format:
 	gofmt -w cmd internal
+	npm run format
+
+format-check:
+	@set -eu; \
+	files="$$(mktemp "$${TMPDIR:-/tmp}/gitops-dashboard-gofmt.XXXXXX")"; \
+	trap 'rm -f "$$files"' EXIT; \
+	gofmt -l cmd internal > "$$files"; \
+	if [ -s "$$files" ]; then \
+		cat "$$files"; \
+		exit 1; \
+	fi
 	npm run format
 
 lint: ui-build ui-lint

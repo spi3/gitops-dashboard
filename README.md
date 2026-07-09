@@ -241,13 +241,17 @@ Run all checks:
 make check
 ```
 
-This runs formatting checks, frontend lint/typecheck, Go vet, Go tests,
-production frontend build, Go binary build, and Playwright UI verification.
+This runs the verification suite in a temporary copy of the current tree so
+generated UI assets, the Go binary, and Playwright reports are not written into
+the checkout. It includes read-only formatting checks, frontend lint/typecheck,
+Go vet, Go tests, production frontend build, Go binary build, and Playwright UI
+verification. To rewrite Go formatting explicitly, run `make format`.
 
 Common targets:
 
 ```sh
 make build
+make format
 make test
 make ui-e2e
 ```
