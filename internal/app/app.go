@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -12,12 +13,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/example/gitops-dashboard/internal/auth"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/monitor"
+	"github.com/example/gitops-dashboard/internal/routetarget"
 	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/scanner"
 	"github.com/example/gitops-dashboard/internal/storage"
@@ -35,12 +39,34 @@ type App struct {
 	agentAuth auth.AgentTokenAuthenticator
 	logger    *slog.Logger
 	upgrader  websocket.Upgrader
+	scanAll   func(context.Context) error
+	checkAll  func(context.Context) error
+
+	readinessMu    sync.Mutex
+	readinessCache readinessStatus
+	readinessTTL   time.Duration
+	readinessNow   func() time.Time
+	readinessProbe func(context.Context) error
 }
 
 const (
 	agentTokenHeader           = "X-Agent-Token"
 	agentTokenQuery            = "token"
 	stateChangingRequestHeader = "X-GitOps-Dashboard-CSRF"
+	readinessTimeout           = 2 * time.Second
+	readinessCacheTTL          = 30 * time.Second
+	actionWriteDeadlineMargin  = 30 * time.Second
+	scanGitCommandsPerRepo     = 6
+	scanFinishTimeout          = 30 * time.Second
+	minActionWriteBudget       = 5 * time.Minute
+	readinessJSONSampleLimit   = 5
+	httpRouteRequestAttempts   = 2
+	// syncPingTarget can run scanner.SyncRepo plus scanner.CurrentCommit. In the
+	// existing-repo worst case, that is remote get-url, remote set-url, fetch,
+	// checkout, pull, and rev-parse.
+	pingInventorySyncGitCommands   = 6
+	monitorBudgetSafetyNumerator   = 3
+	monitorBudgetSafetyDenominator = 2
 )
 
 var (
@@ -51,8 +77,11 @@ var (
 )
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	dbPath := filepath.Join(cfg.Server.DataDir, "gitops-dashboard.db")
-	store, err := storage.Open(dbPath)
+	store, err := storage.OpenWithLogger(dbPath, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +112,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	app.scanAll = app.scanner.ScanAll
+	app.checkAll = app.monitor.CheckAll
+	app.readinessTTL = readinessCacheTTL
+	app.readinessNow = time.Now
+	app.readinessProbe = app.storageReadinessProbe
 	return app, nil
 }
 
@@ -168,27 +202,100 @@ func (app *App) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (app *App) ready(w http.ResponseWriter, _ *http.Request) {
+	status := app.cachedReadiness()
+	if status.err != nil {
+		http.Error(w, "not ready: storage", http.StatusServiceUnavailable)
+		return
+	}
+	if len(status.warnings) > 0 {
+		_, _ = w.Write([]byte("ready: startup storage warnings present\n"))
+		return
+	}
 	_, _ = w.Write([]byte("ready\n"))
 }
 
+type readinessStatus struct {
+	checkedAt time.Time
+	err       error
+	warnings  []string
+}
+
+func (app *App) cachedReadiness() readinessStatus {
+	now := app.now()
+	status := readinessStatus{
+		checkedAt: now,
+		warnings:  app.store.StartupWarnings(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), readinessTimeout)
+	defer cancel()
+	if err := app.store.Ping(ctx); err != nil {
+		status.err = err
+		app.logger.Warn("readiness check failed", "error", err)
+		return status
+	}
+	if err := app.store.CheckPersistedJSONFailures(ctx); err != nil {
+		status.err = fmt.Errorf("storage decode registry: %w", err)
+		app.logger.Warn("readiness storage decode registry failed", "error", status.err)
+		return status
+	}
+
+	app.readinessMu.Lock()
+	defer app.readinessMu.Unlock()
+
+	if !app.readinessCache.checkedAt.IsZero() && app.readinessTTL > 0 && now.Sub(app.readinessCache.checkedAt) < app.readinessTTL {
+		cached := app.readinessCache
+		cached.warnings = status.warnings
+		return cached
+	}
+
+	probe := app.readinessProbe
+	if probe == nil {
+		probe = app.storageReadinessProbe
+	}
+	if err := probe(ctx); err != nil {
+		status.err = fmt.Errorf("storage decode probe: %w", err)
+		app.logger.Warn("readiness storage decode probe failed", "error", status.err)
+		return status
+	}
+	app.readinessCache = status
+	return status
+}
+
+func transientReadinessError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (app *App) now() time.Time {
+	if app.readinessNow == nil {
+		return time.Now()
+	}
+	return app.readinessNow()
+}
+
+func (app *App) storageReadinessProbe(ctx context.Context) error {
+	return app.store.ProbePersistedJSON(ctx, readinessJSONSampleLimit)
+}
+
 func (app *App) version(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, version.Current())
+	app.writeJSON(w, version.Current())
 }
 
 func (app *App) summary(w http.ResponseWriter, r *http.Request) {
 	summary, err := app.store.Summary(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		app.logger.Error("summary unavailable", "error", err)
+		http.Error(w, "dashboard storage degraded: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	agents, err := app.store.Agents(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		app.logger.Error("agents unavailable", "error", err)
+		http.Error(w, "dashboard storage degraded: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	summary.Agents = mergeAgents(agents, app.cfg.Runtime.Docker)
 	summary.Version = version.Current()
-	writeJSON(w, summary)
+	app.writeJSON(w, summary)
 }
 
 // mergeAgents combines reported agents with configured agent targets: reported
@@ -229,19 +336,163 @@ func mergeAgents(reported []core.AgentInfo, docker []config.DockerTarget) []core
 }
 
 func (app *App) scan(w http.ResponseWriter, r *http.Request) {
-	if err := app.scanner.ScanAll(r.Context()); err != nil {
+	app.extendWriteDeadline(w, app.scanWriteBudget(), "scan")
+	scanAll := app.scanAll
+	if scanAll == nil {
+		scanAll = app.scanner.ScanAll
+	}
+	if err := scanAll(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	app.writeJSON(w, map[string]string{"status": "ok"})
 }
 
 func (app *App) checkMonitor(w http.ResponseWriter, r *http.Request) {
-	if err := app.monitor.CheckAll(r.Context()); err != nil {
+	app.extendWriteDeadline(w, app.monitorWriteBudget(r.Context()), "monitor")
+	checkAll := app.checkAll
+	if checkAll == nil {
+		checkAll = app.monitor.CheckAll
+	}
+	if err := checkAll(r.Context()); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	app.writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func (app *App) extendWriteDeadline(w http.ResponseWriter, budget time.Duration, action string) {
+	if budget <= 0 {
+		return
+	}
+	deadline := time.Now().Add(budget)
+	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		app.logger.Warn("extend response write deadline failed", "action", action, "deadline", deadline.Format(time.RFC3339), "error", err)
+	}
+}
+
+func (app *App) scanWriteBudget() time.Duration {
+	repositories := len(app.cfg.Repositories)
+	if repositories < 1 {
+		repositories = 1
+	}
+	perRepository := scanGitCommandsPerRepo*scanner.GitCommandTimeout + scanFinishTimeout
+	return actionWriteBudget(time.Duration(repositories) * perRepository)
+}
+
+func actionWriteBudget(timeout time.Duration) time.Duration {
+	if timeout < minActionWriteBudget {
+		timeout = minActionWriteBudget
+	}
+	return timeout + actionWriteDeadlineMargin
+}
+
+func monitorActionWriteBudget(timeout time.Duration) time.Duration {
+	if timeout < minActionWriteBudget {
+		timeout = minActionWriteBudget
+	}
+	// This budget approximates an emergent worst case across storage reads, git
+	// sync, route fallback requests, monitor fan-out waves, and status writes.
+	// Enumeration has repeatedly missed terms, so keep a safety factor to absorb
+	// unknowns before the fixed response-write margin.
+	//
+	// T-020 should consider converting /api/scan and /api/monitor to async
+	// endpoints (202 plus status polling) to eliminate this class of synchronous
+	// response-deadline problem.
+	timeout = timeout * monitorBudgetSafetyNumerator / monitorBudgetSafetyDenominator
+	return timeout + actionWriteDeadlineMargin
+}
+
+func (app *App) monitorWriteBudget(ctx context.Context) time.Duration {
+	var services []core.Service
+	if app.store != nil {
+		var err error
+		services, err = app.store.Services(ctx)
+		if err != nil {
+			logger := app.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Warn("monitor write budget service count unavailable", "error", err)
+		}
+	}
+	return monitorActionWriteBudget(app.monitorSequentialTimeoutBudget(services))
+}
+
+func (app *App) monitorSequentialTimeoutBudget(services []core.Service) time.Duration {
+	// Keep this in step with monitor.CheckAll: Docker and Kubernetes target loops
+	// run first and currently have no configured operation timeout; HTTP targets
+	// then run sequentially, followed by ping targets sequentially. HTTP and ping
+	// checks fan out within a target using semaphores, so each sequential target
+	// gets one timeout budget per concurrency wave.
+	total := time.Duration(0)
+	routeChecks := httpRouteCheckCount(services)
+	for _, target := range app.cfg.Runtime.HTTP {
+		timeout, err := target.TimeoutDuration()
+		if err != nil {
+			continue
+		}
+		if timeout == 0 {
+			timeout = monitor.DefaultHTTPRouteTimeout()
+		}
+		total += time.Duration(timeoutWaves(routeChecks, monitor.HTTPRouteConcurrencyLimit())) * httpRouteRequestAttempts * timeout
+	}
+	for _, target := range app.cfg.Runtime.Ping {
+		total += pingInventorySyncBudget(target)
+		timeout, err := target.TimeoutDuration()
+		if err != nil {
+			continue
+		}
+		if timeout == 0 {
+			timeout = monitor.DefaultPingTimeout()
+		}
+		checks := pingCheckCount(target, services)
+		total += time.Duration(timeoutWaves(checks, monitor.PingConcurrencyLimit())) * timeout
+	}
+	return total
+}
+
+func pingInventorySyncBudget(target config.PingTarget) time.Duration {
+	if strings.TrimSpace(target.Repository) == "" || strings.TrimSpace(target.AnsibleInventory) == "" {
+		return 0
+	}
+	return time.Duration(pingInventorySyncGitCommands) * scanner.GitCommandTimeout
+}
+
+func httpRouteCheckCount(services []core.Service) int {
+	checks := 0
+	for _, service := range services {
+		if service.ID == "" {
+			continue
+		}
+		checks += len(routetarget.Routes(service.Exposure))
+	}
+	return checks
+}
+
+func pingCheckCount(target config.PingTarget, services []core.Service) int {
+	repository := hostinventory.RepositoryName(target)
+	source := hostinventory.Source(target)
+	checks := 0
+	for _, service := range services {
+		if service.Repository == repository && service.Runtime == "host" && service.SourcePath == source {
+			checks++
+		}
+	}
+	if checks == 0 && target.Host != "" {
+		return 1
+	}
+	return checks
+}
+
+func timeoutWaves(checks, concurrency int) int {
+	if checks < 1 {
+		return 1
+	}
+	if concurrency < 1 {
+		return checks
+	}
+	return (checks + concurrency - 1) / concurrency
 }
 
 type monitorOverrideRequest struct {
@@ -268,7 +519,7 @@ func (app *App) monitorOverride(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "ok"})
+	app.writeJSON(w, map[string]string{"status": "ok"})
 }
 
 func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
@@ -425,9 +676,18 @@ func (app *App) staticHandler() http.Handler {
 	})
 }
 
-func writeJSON(w http.ResponseWriter, value any) {
+func (app *App) writeJSON(w http.ResponseWriter, value any) {
+	writeJSON(app.logger, w, value)
+}
+
+func writeJSON(logger *slog.Logger, w http.ResponseWriter, value any) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
-	_ = encoder.Encode(value)
+	if err := encoder.Encode(value); err != nil {
+		logger.Error("write JSON response failed", "error", err)
+	}
 }

@@ -17,6 +17,13 @@ import (
 	"github.com/example/gitops-dashboard/internal/version"
 )
 
+const (
+	serverReadHeaderTimeout = 5 * time.Second
+	serverReadTimeout       = 15 * time.Second
+	serverWriteTimeout      = 2 * time.Minute
+	serverIdleTimeout       = 2 * time.Minute
+)
+
 func main() {
 	var (
 		mode        = flag.String("mode", "server", "server or agent")
@@ -101,11 +108,7 @@ func runServer(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 	defer serverApp.Close()
 	serverApp.RunBackground(ctx)
 
-	server := &http.Server{
-		Addr:              cfg.Server.Listen,
-		Handler:           serverApp.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	server := newHTTPServer(cfg, serverApp.Handler())
 
 	errs := make(chan error, 1)
 	go func() {
@@ -123,5 +126,16 @@ func runServer(ctx context.Context, cfg config.Config, logger *slog.Logger) erro
 			return nil
 		}
 		return fmt.Errorf("listen: %w", err)
+	}
+}
+
+func newHTTPServer(cfg config.Config, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              cfg.Server.Listen,
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 }

@@ -19,6 +19,14 @@ const (
 	httpRouteConcurrency    = 8
 )
 
+func HTTPRouteConcurrencyLimit() int {
+	return httpRouteConcurrency
+}
+
+func DefaultHTTPRouteTimeout() time.Duration {
+	return defaultHTTPRouteTimeout
+}
+
 func (monitor Monitor) checkHTTPRoutes(ctx context.Context, target config.HTTPRouteTarget, services []core.Service) error {
 	timeout, err := target.TimeoutDuration()
 	if err != nil {

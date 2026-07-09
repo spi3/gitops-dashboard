@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,6 +28,11 @@ type Store struct {
 	redactionRawValues []string
 	redactionTokenSet  map[string]struct{}
 	redactionTokens    []string
+	logger             *slog.Logger
+	startupWarnings    []string
+	decodeMu           sync.Mutex
+	decodeFailures     map[decodeFailureKey]decodeFailure
+	jsonProbeCursors   map[persistedJSONColumnKey]int64
 }
 
 var ErrStatusNotFound = errors.New("status result not found")
@@ -43,7 +49,34 @@ type RuntimeServiceSource struct {
 	SourcePath string
 }
 
+type decodeFailureKey struct {
+	table  string
+	column string
+	key    string
+}
+
+type decodeFailure struct {
+	table      string
+	column     string
+	rowID      int64
+	key        string
+	displayKey string
+	err        string
+	observedAt time.Time
+}
+
+type persistedJSONColumnKey struct {
+	table  string
+	column string
+}
+
+const statusResultJSONKeySeparator = "\x1f"
+
 func Open(path string) (*Store, error) {
+	return OpenWithLogger(path, nil)
+}
+
+func OpenWithLogger(path string, logger *slog.Logger) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
@@ -51,7 +84,10 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	store := &Store{db: db}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	store := &Store{db: db, logger: logger}
 	if err := store.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -60,11 +96,34 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.seedPersistedJSONDecodeFailures(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return store, nil
 }
 
 func (store *Store) Close() error {
 	return store.db.Close()
+}
+
+func (store *Store) Ping(ctx context.Context) error {
+	if store == nil || store.db == nil {
+		return errors.New("sqlite store is not open")
+	}
+	if err := store.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("sqlite ping: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) StartupWarnings() []string {
+	if store == nil || len(store.startupWarnings) == 0 {
+		return nil
+	}
+	warnings := make([]string, len(store.startupWarnings))
+	copy(warnings, store.startupWarnings)
+	return warnings
 }
 
 func (store *Store) AddRedactionValues(values ...string) {
@@ -214,50 +273,402 @@ func (store *Store) stripPersistedRouteUserinfo(ctx context.Context) (bool, erro
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	exposureChanged, err := stripServiceExposureUserinfo(ctx, tx)
+	changed, err := store.scanStartupPersistedJSON(ctx, tx)
 	if err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	return exposureChanged, nil
+	return changed, nil
 }
 
-func stripServiceExposureUserinfo(ctx context.Context, tx *sql.Tx) (bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT rowid, exposure_json FROM services`)
+type startupJSONColumn struct {
+	table   string
+	column  string
+	keyExpr string
+	handle  func(data, table, column, key string) (string, bool, error)
+}
+
+func startupJSONColumns() []startupJSONColumn {
+	stringSlice := func(data, table, column, key string) (string, bool, error) {
+		var values []string
+		return "", false, fromJSON(data, &values, table, column, key)
+	}
+	exposure := func(data, table, column, key string) (string, bool, error) {
+		var values []string
+		if err := fromJSON(data, &values, table, column, key); err != nil {
+			return "", false, err
+		}
+		sanitized := sanitizeExposure(values)
+		if sameStrings(values, sanitized) {
+			return "", false, nil
+		}
+		return toJSON(sanitized), true, nil
+	}
+	observedImages := func(data, table, column, key string) (string, bool, error) {
+		var values []core.ObservedImage
+		return "", false, fromJSON(data, &values, table, column, key)
+	}
+	containers := func(data, table, column, key string) (string, bool, error) {
+		var values []core.ContainerStatus
+		return "", false, fromJSON(data, &values, table, column, key)
+	}
+
+	return []startupJSONColumn{
+		{table: "services", column: "images_json", keyExpr: "id", handle: stringSlice},
+		{table: "services", column: "ports_json", keyExpr: "id", handle: stringSlice},
+		{table: "services", column: "dependencies_json", keyExpr: "id", handle: stringSlice},
+		{table: "services", column: "storage_json", keyExpr: "id", handle: stringSlice},
+		{table: "services", column: "exposure_json", keyExpr: "id", handle: exposure},
+		{table: "services", column: "config_json", keyExpr: "id", handle: stringSlice},
+		{table: "services", column: "warnings_json", keyExpr: "id", handle: stringSlice},
+		{table: "status_results", column: "observed_images_json", keyExpr: "service_id || char(31) || target", handle: observedImages},
+		{table: "agents", column: "status_json", keyExpr: "target", handle: containers},
+	}
+}
+
+func (store *Store) scanStartupPersistedJSON(ctx context.Context, tx *sql.Tx) (bool, error) {
+	changed := false
+	for _, column := range startupJSONColumns() {
+		columnChanged, skipped, err := store.scanStartupJSONColumn(ctx, tx, column)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || columnChanged
+		if skipped == 0 {
+			continue
+		}
+		warning := fmt.Sprintf("startup validation skipped %d corrupt %s.%s row(s)", skipped, column.table, column.column)
+		store.startupWarnings = append(store.startupWarnings, warning)
+		store.logger.Warn(
+			"startup validation skipped corrupt persisted JSON rows",
+			"table", column.table,
+			"column", column.column,
+			"count", skipped,
+		)
+	}
+	return changed, nil
+}
+
+func (store *Store) scanStartupJSONColumn(ctx context.Context, tx *sql.Tx, column startupJSONColumn) (bool, int, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT rowid, %s, %s FROM %s", column.keyExpr, column.column, column.table))
 	if err != nil {
-		return false, fmt.Errorf("query service exposure URL userinfo: %w", err)
+		return false, 0, fmt.Errorf("query startup JSON validation target %s.%s: %w", column.table, column.column, err)
 	}
 	type rowValue struct {
 		rowID int64
+		key   string
 		value string
 	}
 	var updates []rowValue
+	skippedDecodeErrors := 0
 	for rows.Next() {
 		var current rowValue
-		if err := rows.Scan(&current.rowID, &current.value); err != nil {
+		if err := rows.Scan(&current.rowID, &current.key, &current.value); err != nil {
 			_ = rows.Close()
-			return false, err
+			return false, skippedDecodeErrors, err
 		}
-		var exposure []string
-		if err := json.Unmarshal([]byte(current.value), &exposure); err != nil {
+		displayKey := store.persistedJSONDisplayKey(column.table, current.key)
+		updatedValue, valueChanged, err := column.handle(current.value, column.table, column.column, displayKey)
+		if err != nil {
+			skippedDecodeErrors++
+			store.recordDecodeFailure(column.table, column.column, current.rowID, current.key, displayKey, err)
+			attrs := []any{
+				"table", column.table,
+				"key", displayKey,
+				"column", column.column,
+				"error", err,
+			}
+			if column.table == "services" {
+				attrs = append(attrs, "service_id", displayKey)
+			}
+			store.logger.Warn("skipping corrupt persisted JSON during startup validation", attrs...)
 			continue
 		}
-		sanitized := sanitizeExposure(exposure)
-		if !sameStrings(exposure, sanitized) {
-			updates = append(updates, rowValue{rowID: current.rowID, value: toJSON(sanitized)})
+		if valueChanged {
+			updates = append(updates, rowValue{rowID: current.rowID, value: updatedValue})
 		}
 	}
 	if err := rows.Close(); err != nil {
-		return false, err
+		return false, skippedDecodeErrors, err
 	}
 	for _, update := range updates {
-		if _, err := tx.ExecContext(ctx, `UPDATE services SET exposure_json=? WHERE rowid=?`, update.value, update.rowID); err != nil {
-			return false, fmt.Errorf("strip URL userinfo from services.exposure_json: %w", err)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE %s SET %s=? WHERE rowid=?", column.table, column.column), update.value, update.rowID); err != nil {
+			return false, skippedDecodeErrors, fmt.Errorf("update startup JSON target %s.%s: %w", column.table, column.column, err)
 		}
 	}
-	return len(updates) > 0, nil
+	return len(updates) > 0, skippedDecodeErrors, nil
+}
+
+func (store *Store) ProbePersistedJSON(ctx context.Context, sampleLimit int) error {
+	if err := store.CheckPersistedJSONFailures(ctx); err != nil {
+		return err
+	}
+	if sampleLimit < 1 {
+		sampleLimit = 1
+	}
+	for _, column := range startupJSONColumns() {
+		if err := store.probePersistedJSONColumn(ctx, column, sampleLimit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) probePersistedJSONColumn(ctx context.Context, column startupJSONColumn, sampleLimit int) error {
+	cursorKey := persistedJSONColumnKey{table: column.table, column: column.column}
+	lastRowID := store.persistedJSONProbeCursor(cursorKey)
+	samples, err := store.persistedJSONProbeRows(ctx, column, "rowid > ?", []any{lastRowID}, sampleLimit)
+	if err != nil {
+		return err
+	}
+	if len(samples) < sampleLimit {
+		wrapped, err := store.persistedJSONProbeRows(ctx, column, "rowid <= ?", []any{lastRowID}, sampleLimit-len(samples))
+		if err != nil {
+			return err
+		}
+		samples = append(samples, wrapped...)
+	}
+	for _, sample := range samples {
+		if err := store.decodePersistedJSON(sample.value, column, sample.rowID, sample.key); err != nil {
+			return err
+		}
+	}
+	if len(samples) > 0 {
+		store.setPersistedJSONProbeCursor(cursorKey, samples[len(samples)-1].rowID)
+	}
+	return nil
+}
+
+type persistedJSONProbeRow struct {
+	rowID int64
+	key   string
+	value string
+}
+
+func (store *Store) persistedJSONProbeRows(ctx context.Context, column startupJSONColumn, where string, args []any, limit int) ([]persistedJSONProbeRow, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	query := fmt.Sprintf("SELECT rowid, %s, %s FROM %s WHERE %s ORDER BY rowid LIMIT ?", column.keyExpr, column.column, column.table, where)
+	args = append(args, limit)
+	rows, err := store.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query persisted JSON probe target %s.%s: %w", column.table, column.column, err)
+	}
+	defer rows.Close()
+	var samples []persistedJSONProbeRow
+	for rows.Next() {
+		var sample persistedJSONProbeRow
+		if err := rows.Scan(&sample.rowID, &sample.key, &sample.value); err != nil {
+			return nil, err
+		}
+		samples = append(samples, sample)
+	}
+	return samples, rows.Err()
+}
+
+func (store *Store) persistedJSONProbeCursor(key persistedJSONColumnKey) int64 {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	return store.jsonProbeCursors[key]
+}
+
+func (store *Store) setPersistedJSONProbeCursor(key persistedJSONColumnKey, rowID int64) {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	if store.jsonProbeCursors == nil {
+		store.jsonProbeCursors = map[persistedJSONColumnKey]int64{}
+	}
+	store.jsonProbeCursors[key] = rowID
+}
+
+func (store *Store) CheckPersistedJSONFailures(ctx context.Context) error {
+	failures := store.persistedJSONFailures()
+	if len(failures) == 0 {
+		return nil
+	}
+	columns := startupJSONColumnLookup()
+	for _, failure := range failures {
+		column, ok := columns[persistedJSONColumnKey{table: failure.table, column: failure.column}]
+		if !ok {
+			store.clearDecodeFailure(failure.table, failure.column, failure.key)
+			continue
+		}
+		err := store.validateDecodeFailure(ctx, failure, column)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) seedPersistedJSONDecodeFailures(ctx context.Context) error {
+	store.resetDecodeFailures()
+	for _, column := range startupJSONColumns() {
+		if err := store.seedPersistedJSONDecodeFailuresColumn(ctx, column); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *Store) seedPersistedJSONDecodeFailuresColumn(ctx context.Context, column startupJSONColumn) error {
+	rows, err := store.db.QueryContext(ctx, fmt.Sprintf("SELECT rowid, %s, %s FROM %s ORDER BY rowid", column.keyExpr, column.column, column.table))
+	if err != nil {
+		return fmt.Errorf("query persisted JSON registry seed target %s.%s: %w", column.table, column.column, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rowID int64
+		var key, value string
+		if err := rows.Scan(&rowID, &key, &value); err != nil {
+			return err
+		}
+		_ = store.decodePersistedJSON(value, column, rowID, key)
+	}
+	return rows.Err()
+}
+
+func startupJSONColumnLookup() map[persistedJSONColumnKey]startupJSONColumn {
+	columns := startupJSONColumns()
+	lookup := make(map[persistedJSONColumnKey]startupJSONColumn, len(columns))
+	for _, column := range columns {
+		lookup[persistedJSONColumnKey{table: column.table, column: column.column}] = column
+	}
+	return lookup
+}
+
+func (store *Store) validateDecodeFailure(ctx context.Context, failure decodeFailure, column startupJSONColumn) error {
+	where, args, ok := persistedJSONLookup(column.table, failure.key)
+	if !ok {
+		store.clearDecodeFailure(failure.table, failure.column, failure.key)
+		return nil
+	}
+	var key, value string
+	var rowID int64
+	err := store.db.QueryRowContext(
+		ctx,
+		fmt.Sprintf("SELECT rowid, %s, %s FROM %s WHERE %s", column.keyExpr, column.column, column.table, where),
+		args...,
+	).Scan(&rowID, &key, &value)
+	if errors.Is(err, sql.ErrNoRows) {
+		store.clearDecodeFailure(failure.table, failure.column, failure.key)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := store.decodePersistedJSON(value, column, rowID, key); err != nil {
+		return fmt.Errorf("persisted JSON decode failure table=%s column=%s key=%s: %s", failure.table, failure.column, failure.displayKey, store.redact(err.Error()))
+	}
+	return nil
+}
+
+func persistedJSONLookup(table, key string) (string, []any, bool) {
+	switch table {
+	case "services":
+		return "id=?", []any{key}, true
+	case "status_results":
+		serviceID, target, ok := splitStatusResultJSONKey(key)
+		if !ok {
+			return "", nil, false
+		}
+		return "service_id=? AND target=?", []any{serviceID, target}, true
+	case "agents":
+		return "target=?", []any{key}, true
+	default:
+		return "", nil, false
+	}
+}
+
+func statusResultJSONKey(serviceID, target string) string {
+	return serviceID + statusResultJSONKeySeparator + target
+}
+
+func splitStatusResultJSONKey(key string) (string, string, bool) {
+	serviceID, target, ok := strings.Cut(key, statusResultJSONKeySeparator)
+	return serviceID, target, ok
+}
+
+func (store *Store) decodePersistedJSON(data string, column startupJSONColumn, rowID int64, key string) error {
+	displayKey := store.persistedJSONDisplayKey(column.table, key)
+	if _, _, err := column.handle(data, column.table, column.column, displayKey); err != nil {
+		store.recordDecodeFailure(column.table, column.column, rowID, key, displayKey, err)
+		return err
+	}
+	store.clearDecodeFailure(column.table, column.column, key)
+	return nil
+}
+
+func (store *Store) fromPersistedJSON(data string, value any, table, column string, rowID int64, key string) error {
+	displayKey := store.persistedJSONDisplayKey(table, key)
+	if err := fromJSON(data, value, table, column, displayKey); err != nil {
+		store.recordDecodeFailure(table, column, rowID, key, displayKey, err)
+		return err
+	}
+	store.clearDecodeFailure(table, column, key)
+	return nil
+}
+
+func (store *Store) recordDecodeFailure(table, column string, rowID int64, key, displayKey string, err error) {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	if store.decodeFailures == nil {
+		store.decodeFailures = map[decodeFailureKey]decodeFailure{}
+	}
+	failureKey := decodeFailureKey{table: table, column: column, key: key}
+	store.decodeFailures[failureKey] = decodeFailure{
+		table:      table,
+		column:     column,
+		rowID:      rowID,
+		key:        key,
+		displayKey: displayKey,
+		err:        store.redact(err.Error()),
+		observedAt: time.Now().UTC(),
+	}
+}
+
+func (store *Store) clearDecodeFailure(table, column, key string) {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	delete(store.decodeFailures, decodeFailureKey{table: table, column: column, key: key})
+}
+
+func (store *Store) resetDecodeFailures() {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	store.decodeFailures = map[decodeFailureKey]decodeFailure{}
+}
+
+func (store *Store) persistedJSONFailures() []decodeFailure {
+	store.decodeMu.Lock()
+	defer store.decodeMu.Unlock()
+	failures := make([]decodeFailure, 0, len(store.decodeFailures))
+	for _, failure := range store.decodeFailures {
+		failures = append(failures, failure)
+	}
+	sort.Slice(failures, func(i, j int) bool {
+		if failures[i].table != failures[j].table {
+			return failures[i].table < failures[j].table
+		}
+		if failures[i].column != failures[j].column {
+			return failures[i].column < failures[j].column
+		}
+		return failures[i].displayKey < failures[j].displayKey
+	})
+	return failures
+}
+
+func (store *Store) persistedJSONDisplayKey(table, key string) string {
+	if table == "status_results" {
+		serviceID, target, ok := splitStatusResultJSONKey(key)
+		if ok {
+			key = serviceID + "/" + target
+		}
+	}
+	return store.redact(routetarget.StripUserinfo(key))
 }
 
 func (store *Store) canonicalizeStoredRouteTargets(ctx context.Context) (bool, error) {
@@ -982,7 +1393,7 @@ FROM scans ORDER BY started_at DESC LIMIT 50
 
 func (store *Store) Services(ctx context.Context) ([]core.Service, error) {
 	rows, err := store.db.QueryContext(ctx, `
-SELECT id, name, repository, source_commit, source_path, runtime, kind, namespace,
+SELECT rowid, id, name, repository, source_commit, source_path, runtime, kind, namespace,
        compose_project, resource_name, environment, health, images_json, ports_json, dependencies_json,
        storage_json, exposure_json, config_json, warnings_json
 FROM services ORDER BY repository, runtime, name
@@ -994,22 +1405,37 @@ FROM services ORDER BY repository, runtime, name
 	var services []core.Service
 	for rows.Next() {
 		var service core.Service
+		var rowID int64
 		var health string
 		var images, ports, dependencies, storageRefs, exposure, configRefs, warnings string
-		err := rows.Scan(&service.ID, &service.Name, &service.Repository, &service.SourceCommit,
+		err := rows.Scan(&rowID, &service.ID, &service.Name, &service.Repository, &service.SourceCommit,
 			&service.SourcePath, &service.Runtime, &service.Kind, &service.Namespace, &service.ComposeProject, &service.ResourceName,
 			&service.Environment, &health, &images, &ports, &dependencies, &storageRefs, &exposure, &configRefs, &warnings)
 		if err != nil {
 			return nil, err
 		}
 		service.Health = core.HealthState(health)
-		fromJSON(images, &service.Images)
-		fromJSON(ports, &service.Ports)
-		fromJSON(dependencies, &service.Dependencies)
-		fromJSON(storageRefs, &service.Storage)
-		fromJSON(exposure, &service.Exposure)
-		fromJSON(configRefs, &service.ConfigRefs)
-		fromJSON(warnings, &service.Warnings)
+		if err := store.fromPersistedJSON(images, &service.Images, "services", "images_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(ports, &service.Ports, "services", "ports_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(dependencies, &service.Dependencies, "services", "dependencies_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(storageRefs, &service.Storage, "services", "storage_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(exposure, &service.Exposure, "services", "exposure_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(configRefs, &service.ConfigRefs, "services", "config_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
+		if err := store.fromPersistedJSON(warnings, &service.Warnings, "services", "warnings_json", rowID, service.ID); err != nil {
+			return nil, err
+		}
 		service = normalizeService(service)
 		services = append(services, service)
 	}
@@ -1022,7 +1448,7 @@ func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, err
 		return nil, err
 	}
 	rows, err := store.db.QueryContext(ctx, `
-SELECT service_id, target, health, message, checked_at, observed_images_json
+SELECT rowid, service_id, target, health, message, checked_at, observed_images_json
 FROM status_results ORDER BY checked_at DESC
 `)
 	if err != nil {
@@ -1032,13 +1458,16 @@ FROM status_results ORDER BY checked_at DESC
 	var statuses []core.StatusResult
 	for rows.Next() {
 		var status core.StatusResult
+		var rowID int64
 		var health, checkedAt, observedImages string
-		if err := rows.Scan(&status.ServiceID, &status.Target, &health, &status.Message, &checkedAt, &observedImages); err != nil {
+		if err := rows.Scan(&rowID, &status.ServiceID, &status.Target, &health, &status.Message, &checkedAt, &observedImages); err != nil {
 			return nil, err
 		}
 		status.Health = core.HealthState(health)
 		status.Message = store.redact(status.Message)
-		fromJSON(observedImages, &status.ObservedImages)
+		if err := store.fromPersistedJSON(observedImages, &status.ObservedImages, "status_results", "observed_images_json", rowID, statusResultJSONKey(status.ServiceID, status.Target)); err != nil {
+			return nil, err
+		}
 		if status.ObservedImages == nil {
 			status.ObservedImages = []core.ObservedImage{}
 		}
@@ -1065,7 +1494,7 @@ func (store *Store) SetMonitorNotApplicable(ctx context.Context, serviceID, targ
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	resolved, err := resolveMonitorOverrideTarget(ctx, tx, serviceID, target)
+	resolved, err := resolveMonitorOverrideTarget(ctx, store, tx, serviceID, target)
 	if err != nil {
 		return err
 	}
@@ -1138,9 +1567,9 @@ type resolvedMonitorOverrideTarget struct {
 	syntheticRouteParent bool
 }
 
-func resolveMonitorOverrideTarget(ctx context.Context, tx *sql.Tx, serviceID, target string) (resolvedMonitorOverrideTarget, error) {
+func resolveMonitorOverrideTarget(ctx context.Context, store *Store, tx *sql.Tx, serviceID, target string) (resolvedMonitorOverrideTarget, error) {
 	resolved := resolvedMonitorOverrideTarget{target: strings.TrimSpace(target)}
-	routes, err := serviceMonitorRoutes(ctx, tx, serviceID)
+	routes, err := serviceMonitorRoutes(ctx, store, tx, serviceID)
 	if err != nil {
 		return resolved, err
 	}
@@ -1170,9 +1599,10 @@ type serviceQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func serviceMonitorRoutes(ctx context.Context, queryer serviceQuerier, serviceID string) ([]string, error) {
+func serviceMonitorRoutes(ctx context.Context, store *Store, queryer serviceQuerier, serviceID string) ([]string, error) {
+	var rowID int64
 	var exposureJSON string
-	err := queryer.QueryRowContext(ctx, `SELECT exposure_json FROM services WHERE id=?`, serviceID).Scan(&exposureJSON)
+	err := queryer.QueryRowContext(ctx, `SELECT rowid, exposure_json FROM services WHERE id=?`, serviceID).Scan(&rowID, &exposureJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1180,7 +1610,9 @@ func serviceMonitorRoutes(ctx context.Context, queryer serviceQuerier, serviceID
 		return nil, err
 	}
 	var exposure []string
-	fromJSON(exposureJSON, &exposure)
+	if err := store.fromPersistedJSON(exposureJSON, &exposure, "services", "exposure_json", rowID, serviceID); err != nil {
+		return nil, err
+	}
 	return monitorRoutesFromExposure(exposure), nil
 }
 
@@ -1194,7 +1626,7 @@ func (store *Store) MonitorNotApplicable(ctx context.Context, serviceID, target 
 	if serviceID == "" || target == "" {
 		return false, nil
 	}
-	exact, parent, err := monitorOverrideState(ctx, store.db, serviceID, target)
+	exact, parent, err := monitorOverrideState(ctx, store, store.db, serviceID, target)
 	if err != nil {
 		return false, err
 	}
@@ -1583,7 +2015,7 @@ func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	exactOverride, parentOverride, err := monitorOverrideState(ctx, tx, status.ServiceID, status.Target)
+	exactOverride, parentOverride, err := monitorOverrideState(ctx, store, tx, status.ServiceID, status.Target)
 	if err != nil {
 		return err
 	}
@@ -1638,7 +2070,7 @@ type overrideQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func monitorOverrideState(ctx context.Context, queryer overrideQuerier, serviceID, target string) (bool, bool, error) {
+func monitorOverrideState(ctx context.Context, store *Store, queryer overrideQuerier, serviceID, target string) (bool, bool, error) {
 	target = canonicalStatusTarget(target)
 	childTarget := routetarget.IsChildTarget(target)
 	query := `
@@ -1678,7 +2110,7 @@ WHERE service_id=? AND not_applicable=1 AND target IN (?, ?)
 		return false, false, err
 	}
 	if parentOverride {
-		routes, err := serviceMonitorRoutes(ctx, queryer, serviceID)
+		routes, err := serviceMonitorRoutes(ctx, store, queryer, serviceID)
 		if err != nil {
 			return false, false, err
 		}
@@ -1697,7 +2129,7 @@ func canonicalStatusTarget(target string) string {
 
 func (store *Store) parentRouteOverrideServices(ctx context.Context) (map[string]bool, error) {
 	rows, err := store.db.QueryContext(ctx, `
-SELECT s.id, s.exposure_json
+SELECT s.rowid, s.id, s.exposure_json
 FROM services s
 JOIN monitor_overrides o ON o.service_id=s.id
 WHERE o.target=? AND o.not_applicable=1
@@ -1708,13 +2140,16 @@ WHERE o.target=? AND o.not_applicable=1
 	defer rows.Close()
 	services := map[string]bool{}
 	for rows.Next() {
+		var rowID int64
 		var serviceID string
 		var exposureJSON string
-		if err := rows.Scan(&serviceID, &exposureJSON); err != nil {
+		if err := rows.Scan(&rowID, &serviceID, &exposureJSON); err != nil {
 			return nil, err
 		}
 		var exposure []string
-		fromJSON(exposureJSON, &exposure)
+		if err := store.fromPersistedJSON(exposureJSON, &exposure, "services", "exposure_json", rowID, serviceID); err != nil {
+			return nil, err
+		}
 		if len(monitorRoutesFromExposure(exposure)) > 0 {
 			services[serviceID] = true
 		}
@@ -1843,7 +2278,7 @@ ON CONFLICT(target) DO UPDATE SET last_seen_at=excluded.last_seen_at, status_jso
 
 func (store *Store) Agents(ctx context.Context) ([]core.AgentInfo, error) {
 	rows, err := store.db.QueryContext(ctx, `
-SELECT target, last_seen_at, status_json FROM agents ORDER BY target
+SELECT rowid, target, last_seen_at, status_json FROM agents ORDER BY target
 `)
 	if err != nil {
 		return nil, err
@@ -1852,11 +2287,14 @@ SELECT target, last_seen_at, status_json FROM agents ORDER BY target
 	var agents []core.AgentInfo
 	for rows.Next() {
 		var agent core.AgentInfo
+		var rowID int64
 		var statusJSON string
-		if err := rows.Scan(&agent.Target, &agent.LastSeenAt, &statusJSON); err != nil {
+		if err := rows.Scan(&rowID, &agent.Target, &agent.LastSeenAt, &statusJSON); err != nil {
 			return nil, err
 		}
-		fromJSON(statusJSON, &agent.Containers)
+		if err := store.fromPersistedJSON(statusJSON, &agent.Containers, "agents", "status_json", rowID, agent.Target); err != nil {
+			return nil, err
+		}
 		if agent.Containers == nil {
 			agent.Containers = []core.ContainerStatus{}
 		}
@@ -1873,11 +2311,14 @@ func toJSON(value any) string {
 	return string(data)
 }
 
-func fromJSON(data string, value any) {
-	if data == "" {
-		return
+func fromJSON(data string, value any, table, column, key string) error {
+	if strings.TrimSpace(data) == "" {
+		return fmt.Errorf("decode persisted JSON table=%s key=%s column=%s: empty JSON value", table, key, column)
 	}
-	_ = json.Unmarshal([]byte(data), value)
+	if err := json.Unmarshal([]byte(data), value); err != nil {
+		return fmt.Errorf("decode persisted JSON table=%s key=%s column=%s: %w", table, key, column, err)
+	}
+	return nil
 }
 
 const migrations = `

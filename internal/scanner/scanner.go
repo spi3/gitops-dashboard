@@ -31,6 +31,8 @@ type Scanner struct {
 	logger *slog.Logger
 }
 
+const GitCommandTimeout = 2 * time.Minute
+
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Scanner {
 	return Scanner{cfg: cfg, store: store, logger: logger}
 }
@@ -497,7 +499,7 @@ func normalizedName(value string) string {
 }
 
 func gitOutput(ctx context.Context, dir string, redactor sanitizer.Redactor, env []string, args ...string) (string, error) {
-	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	runCtx, cancel := context.WithTimeout(ctx, GitCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "git", args...)
 	cmd.Dir = dir

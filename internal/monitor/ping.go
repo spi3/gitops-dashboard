@@ -23,6 +23,14 @@ const (
 	pingConcurrency    = 16
 )
 
+func PingConcurrencyLimit() int {
+	return pingConcurrency
+}
+
+func DefaultPingTimeout() time.Duration {
+	return defaultPingTimeout
+}
+
 type pingFunc func(context.Context, string, time.Duration) error
 
 func (monitor Monitor) SyncPingTargets(ctx context.Context) error {

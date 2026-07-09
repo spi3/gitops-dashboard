@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,6 +99,201 @@ func TestStorePersistsSummary(t *testing.T) {
 		if values == nil {
 			t.Fatalf("%s field is nil, want empty slice", name)
 		}
+	}
+}
+
+func TestSummaryReturnsDecodeErrorWithRowContext(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "abc123", []core.Service{{
+		ID:           "svc",
+		Name:         "api",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "prod/compose.yaml",
+		Runtime:      "compose",
+		Health:       core.HealthUnknown,
+		Images:       []string{"example/api:v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", "svc"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.Summary(ctx)
+	if err == nil {
+		t.Fatal("Summary returned nil error, want decode failure")
+	}
+	for _, want := range []string{"decode persisted JSON", "table=services", "key=svc", "column=images_json"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	}
+}
+
+func TestProbePersistedJSONRotatesBoundedRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := []core.Service{
+		{
+			ID:           "svc-a",
+			Name:         "api-a",
+			Repository:   "repo",
+			SourceCommit: "abc123",
+			SourcePath:   "prod/compose.yaml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+			Images:       []string{"example/api-a:v1"},
+		},
+		{
+			ID:           "svc-b",
+			Name:         "api-b",
+			Repository:   "repo",
+			SourceCommit: "abc123",
+			SourcePath:   "prod/compose.yaml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+			Images:       []string{"example/api-b:v1"},
+		},
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "abc123", services, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", "svc-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ProbePersistedJSON(ctx, 1); err != nil {
+		t.Fatalf("one-row persisted JSON probe error = %v, want bounded sample to skip second row", err)
+	}
+	err = store.ProbePersistedJSON(ctx, 1)
+	if err == nil {
+		t.Fatal("rotated one-row persisted JSON probe returned nil error, want sampled decode failure")
+	}
+	for _, want := range []string{"decode persisted JSON", "table=services", "key=svc-b", "column=images_json"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err.Error(), want)
+		}
+	}
+}
+
+func TestOpenSkipsCorruptPersistedJSONDuringStartupScan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, migrations); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO services(
+	id, name, repository, source_commit, source_path, runtime, kind, namespace,
+	compose_project, resource_name, environment, health, images_json, ports_json, dependencies_json,
+	storage_json, exposure_json, config_json, warnings_json
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, "svc-corrupt", "api", "repo", "abc123", "prod/compose.yaml", "compose", "", "", "", "", "production", string(core.HealthUnknown), "{", "[]", "[]", "[]", "[]", "[]", "[]"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO agents(target, last_seen_at, status_json)
+VALUES(?, ?, ?)
+`, "agent-corrupt", time.Now().UTC().Format(time.RFC3339), "{"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	credentialedTarget := "routes: https://user:P%40ss@app.example.test:443"
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at, observed_images_json)
+VALUES(?, ?, ?, ?, ?, ?)
+`, "svc-corrupt", credentialedTarget, string(core.HealthError), "failed", time.Now().UTC().Format(time.RFC3339), "{"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	store, err := OpenWithLogger(dbPath, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("OpenWithLogger failed on corrupt persisted JSON: %v", err)
+	}
+	defer store.Close()
+	warnings := store.StartupWarnings()
+	if len(warnings) != 3 {
+		t.Fatalf("startup warnings = %#v", warnings)
+	}
+	for _, want := range []string{
+		"startup validation skipped 1 corrupt services.images_json row",
+		"startup validation skipped 1 corrupt status_results.observed_images_json row",
+		"startup validation skipped 1 corrupt agents.status_json row",
+	} {
+		if !strings.Contains(strings.Join(warnings, "\n"), want) {
+			t.Fatalf("startup warnings = %#v, want %q", warnings, want)
+		}
+	}
+	logText := logs.String()
+	for _, want := range []string{
+		"skipping corrupt persisted JSON during startup validation",
+		"service_id=svc-corrupt",
+		"column=images_json",
+		"key=svc-corrupt/routes: https://app.example.test:443",
+		"column=observed_images_json",
+		"key=agent-corrupt",
+		"column=status_json",
+		"count=1",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("logs = %q, want %q", logText, want)
+		}
+	}
+	for _, leaked := range []string{"user:P%40ss", "P%40ss", "https://user:"} {
+		if strings.Contains(logText, leaked) || strings.Contains(strings.Join(warnings, "\n"), leaked) {
+			t.Fatalf("startup validation leaked credential fragment %q\nlogs=%q\nwarnings=%#v", leaked, logText, warnings)
+		}
+	}
+	if _, err := store.Summary(ctx); err == nil || !strings.Contains(err.Error(), "column=images_json") {
+		t.Fatalf("Summary error = %v, want strict images_json decode failure", err)
+	}
+	if _, err := store.Agents(ctx); err == nil || !strings.Contains(err.Error(), "column=status_json") {
+		t.Fatalf("Agents error = %v, want strict status_json decode failure", err)
 	}
 }
 

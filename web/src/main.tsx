@@ -236,7 +236,8 @@ function App() {
     try {
       const response = await fetch("/api/summary");
       if (!response.ok) {
-        throw new Error(`summary request failed: ${response.status}`);
+        const detail = (await response.text()).trim();
+        throw new Error(detail ? `summary request failed: ${response.status}: ${detail}` : `summary request failed: ${response.status}`);
       }
       setSummary(await response.json() as DashboardSummary);
       setError("");

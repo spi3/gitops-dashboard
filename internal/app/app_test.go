@@ -1,7 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +18,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/storage"
 )
 
 func TestMergeAgentsCombinesReportedAndConfigured(t *testing.T) {
@@ -120,6 +125,837 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("frontend status = %d", res.Code)
+	}
+}
+
+func TestReadyzReportsClosedDatabase(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	handler := app.Handler()
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200", res.Code)
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	if body := res.Body.String(); !strings.Contains(body, "not ready: storage") {
+		t.Fatalf("readyz body = %q, want generic storage readiness reason", body)
+	} else if strings.Contains(body, "sqlite ping") || strings.Contains(body, "database is closed") {
+		t.Fatalf("readyz body = %q, want no storage internals", body)
+	}
+}
+
+func TestReadyzReportsStorageDecodeFailure(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	if err := app.store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := app.store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.FinishScan(ctx, scanID, "repo", "abc123", []core.Service{{
+		ID:           "svc",
+		Name:         "api",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "prod/compose.yaml",
+		Runtime:      "compose",
+		Health:       core.HealthUnknown,
+		Images:       []string{"example/api:v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", "svc"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200", res.Code)
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	if !strings.Contains(body, "not ready: storage") {
+		t.Fatalf("readyz body = %q, want generic storage failure", body)
+	}
+	for _, leaked := range []string{"table=services", "key=svc", "column=images_json"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("readyz body leaked %q: %q", leaked, body)
+		}
+	}
+	for _, want := range []string{"storage decode probe", "table=services", "key=svc", "column=images_json"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("readiness logs = %q, want %q", logs.String(), want)
+		}
+	}
+}
+
+func TestReadyzRejectsEmptyPersistedJSON(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	if err := app.store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := app.store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.FinishScan(ctx, scanID, "repo", "abc123", []core.Service{{
+		ID:           "svc-empty",
+		Name:         "api",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "prod/compose.yaml",
+		Runtime:      "compose",
+		Health:       core.HealthUnknown,
+		Images:       []string{"example/api:v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "   ", "svc-empty"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty-json readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "not ready: storage") {
+		t.Fatalf("empty-json readyz body = %q, want generic storage failure", res.Body.String())
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, `["example/api:v2"]`, "svc-empty"); err != nil {
+		t.Fatal(err)
+	}
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healed empty-json readyz status = %d, want 200; body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestReadyzUsesDecodeFailureRegistryPastSample(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	if err := app.store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := app.store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := make([]core.Service, 0, readinessJSONSampleLimit+1)
+	for i := 0; i < readinessJSONSampleLimit+1; i++ {
+		id := fmt.Sprintf("svc-%02d", i)
+		services = append(services, core.Service{
+			ID:           id,
+			Name:         id,
+			Repository:   "repo",
+			SourceCommit: "abc123",
+			SourcePath:   "prod/compose.yaml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+			Images:       []string{"example/" + id + ":v1"},
+		})
+	}
+	if err := app.store.FinishScan(ctx, scanID, "repo", "abc123", services, nil); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	corruptID := fmt.Sprintf("svc-%02d", readinessJSONSampleLimit)
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", corruptID); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("initial readyz status = %d, want 200 with corrupt row past first sample; body=%q", res.Code, res.Body.String())
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/summary", nil))
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("summary status = %d, want strict decode 500; body=%q", res.Code, res.Body.String())
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("registry readyz status = %d, want 503 despite cached sample success; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "not ready: storage") {
+		t.Fatalf("registry readyz body = %q, want generic storage failure", res.Body.String())
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, `["example/svc-05:v2"]`, corruptID); err != nil {
+		t.Fatal(err)
+	}
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healed readyz status = %d, want immediate recovery; body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestReadyzUsesStartupDecodeFailureRegistryPastSample(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "gitops-dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := make([]core.Service, 0, readinessJSONSampleLimit+1)
+	for i := 0; i < readinessJSONSampleLimit+1; i++ {
+		id := fmt.Sprintf("boot-svc-%02d", i)
+		services = append(services, core.Service{
+			ID:           id,
+			Name:         id,
+			Repository:   "repo",
+			SourceCommit: "abc123",
+			SourcePath:   "prod/compose.yaml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+			Images:       []string{"example/" + id + ":v1"},
+		})
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "abc123", services, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `DELETE FROM services WHERE id=?`, "boot-svc-00"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE services SET exposure_json=? WHERE id=?`, `["https://user:pass@app.example.test"]`, "boot-svc-01"); err != nil {
+		t.Fatal(err)
+	}
+	corruptID := fmt.Sprintf("boot-svc-%02d", readinessJSONSampleLimit)
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", corruptID); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler()
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("startup registry readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "not ready: storage") {
+		t.Fatalf("startup registry readyz body = %q, want generic storage failure", res.Body.String())
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, `["example/boot-svc:v2"]`, corruptID); err != nil {
+		t.Fatal(err)
+	}
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healed startup registry readyz status = %d, want 200; body=%q", res.Code, res.Body.String())
+	}
+}
+
+func TestReadyzUsesLiveProbeWithAdvisoryStartupWarnings(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "gitops-dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "abc123", []core.Service{{
+		ID:           "svc",
+		Name:         "api",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "prod/compose.yaml",
+		Runtime:      "compose",
+		Health:       core.HealthUnknown,
+		Images:       []string{"example/api:v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", "svc"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	now := time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC)
+	app.readinessNow = func() time.Time { return now }
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("corrupt readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	if body := res.Body.String(); !strings.Contains(body, "not ready: storage") {
+		t.Fatalf("corrupt readyz body = %q, want generic storage failure", body)
+	}
+	for _, leaked := range []string{"storage decode probe", "column=images_json", "services.images_json", "key=svc"} {
+		if strings.Contains(res.Body.String(), leaked) {
+			t.Fatalf("corrupt readyz body leaked %q: %q", leaked, res.Body.String())
+		}
+	}
+
+	db, err = sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(), `UPDATE services SET images_json=? WHERE id=?`, `["example/api:v2"]`, "svc"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(readinessCacheTTL + time.Second)
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("healed readyz status = %d, want 200; body=%q", res.Code, res.Body.String())
+	}
+	for _, want := range []string{"ready:", "startup storage warnings present"} {
+		if !strings.Contains(res.Body.String(), want) {
+			t.Fatalf("healed readyz body = %q, want %q", res.Body.String(), want)
+		}
+	}
+	if strings.Contains(res.Body.String(), "services.images_json") {
+		t.Fatalf("healed readyz body exposed startup warning details: %q", res.Body.String())
+	}
+}
+
+func TestReadyzCachesDecodedStorageProbe(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	probeCalls := 0
+	app.readinessProbe = func(context.Context) error {
+		probeCalls++
+		return nil
+	}
+
+	handler := app.Handler()
+	for i := 0; i < 2; i++ {
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if res.Code != http.StatusOK {
+			t.Fatalf("readyz[%d] status = %d, want 200; body=%q", i, res.Code, res.Body.String())
+		}
+		if res.Body.String() != "ready\n" {
+			t.Fatalf("readyz[%d] body = %q, want ready", i, res.Body.String())
+		}
+	}
+	if probeCalls != 1 {
+		t.Fatalf("readiness probe calls = %d, want 1 cached decoded storage probe", probeCalls)
+	}
+}
+
+func TestReadyzPingsStorageBeforeReturningCachedDecodeProbe(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	probeCalls := 0
+	app.readinessProbe = func(context.Context) error {
+		probeCalls++
+		return nil
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("first readyz status = %d, want 200; body=%q", res.Code, res.Body.String())
+	}
+	if probeCalls != 1 {
+		t.Fatalf("readiness probe calls = %d, want initial decode probe", probeCalls)
+	}
+	if err := app.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("closed-db readyz status = %d, want 503 despite cached decode probe; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "not ready: storage") {
+		t.Fatalf("closed-db readyz body = %q, want generic storage failure", res.Body.String())
+	}
+	if probeCalls != 1 {
+		t.Fatalf("readiness probe calls = %d, want cached decode probe not rerun", probeCalls)
+	}
+}
+
+func TestReadyzDoesNotCacheCanceledProbe(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	probeCalls := 0
+	app.readinessProbe = func(context.Context) error {
+		probeCalls++
+		if probeCalls == 1 {
+			return context.Canceled
+		}
+		return nil
+	}
+
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("first readyz status = %d, want 503; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "not ready: storage") {
+		t.Fatalf("first readyz body = %q, want generic storage failure", res.Body.String())
+	}
+
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("second readyz status = %d, want 200; body=%q", res.Code, res.Body.String())
+	}
+	if probeCalls != 2 {
+		t.Fatalf("readiness probe calls = %d, want canceled probe to be retried", probeCalls)
+	}
+}
+
+func TestScanExtendsWriteDeadline(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	app.scanAll = func(context.Context) error {
+		time.Sleep(150 * time.Millisecond)
+		return nil
+	}
+	server := httptest.NewUnstartedServer(app.Handler())
+	server.Config.WriteTimeout = 25 * time.Millisecond
+	server.Start()
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/scan", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addStateChangingHeader(req)
+	res, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("scan request failed before response: %v", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("scan status = %d, body=%q", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"status": "ok"`) {
+		t.Fatalf("scan body = %q, want ok status", body)
+	}
+}
+
+func TestMonitorWriteBudgetUsesConfiguredTimeouts(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		cfg      config.Config
+		services []core.Service
+		want     time.Duration
+	}{
+		{
+			name: "default floor",
+			cfg:  config.Config{},
+			want: 8 * time.Minute,
+		},
+		{
+			name: "single http timeout above floor",
+			cfg: config.Config{Runtime: config.RuntimeConfig{
+				HTTP: []config.HTTPRouteTarget{{
+					Name:    "routes",
+					Timeout: "10m",
+				}},
+			}},
+			services: []core.Service{{
+				ID:       "svc",
+				Exposure: []string{"https://app.example.test"},
+			}},
+			want: 30*time.Minute + actionWriteDeadlineMargin,
+		},
+		{
+			name: "sequential http targets add together",
+			cfg: config.Config{Runtime: config.RuntimeConfig{
+				HTTP: []config.HTTPRouteTarget{
+					{
+						Name:    "routes-a",
+						Timeout: "10m",
+					},
+					{
+						Name:    "routes-b",
+						Timeout: "10m",
+					},
+				},
+			}},
+			services: []core.Service{{
+				ID:       "svc",
+				Exposure: []string{"https://app.example.test"},
+			}},
+			want: 60*time.Minute + actionWriteDeadlineMargin,
+		},
+		{
+			name: "http routes add concurrency waves",
+			cfg: config.Config{Runtime: config.RuntimeConfig{
+				HTTP: []config.HTTPRouteTarget{{
+					Name:    "routes",
+					Timeout: "10m",
+				}},
+			}},
+			services: []core.Service{{
+				ID:       "svc",
+				Exposure: sixteenHTTPRoutes(),
+			}},
+			want: 60*time.Minute + actionWriteDeadlineMargin,
+		},
+		{
+			name: "repo backed ping inventory adds sync budget",
+			cfg: config.Config{Runtime: config.RuntimeConfig{
+				Ping: []config.PingTarget{{
+					Name:             "hosts",
+					Repository:       "repo",
+					AnsibleInventory: "inventory/hosts.yml",
+					Timeout:          "12m",
+				}},
+			}},
+			want: 36*time.Minute + actionWriteDeadlineMargin,
+		},
+		{
+			name: "sequential ping and http targets add together",
+			cfg: config.Config{Runtime: config.RuntimeConfig{
+				HTTP: []config.HTTPRouteTarget{{
+					Name:    "routes",
+					Timeout: "10m",
+				}},
+				Ping: []config.PingTarget{{
+					Name:    "hosts",
+					Host:    "host.example.test",
+					Timeout: "12m",
+				}},
+			}},
+			services: []core.Service{{
+				ID:       "svc",
+				Exposure: []string{"https://app.example.test"},
+			}},
+			want: 48*time.Minute + actionWriteDeadlineMargin,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			app := &App{cfg: tt.cfg}
+			got := monitorActionWriteBudget(app.monitorSequentialTimeoutBudget(tt.services))
+			if got != tt.want {
+				t.Fatalf("monitor write budget = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func sixteenHTTPRoutes() []string {
+	routes := make([]string, 0, 16)
+	for i := 0; i < 16; i++ {
+		routes = append(routes, fmt.Sprintf("https://app-%02d.example.test", i))
+	}
+	return routes
+}
+
+func TestSummaryLogsDecodeError(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	if err := app.store.EnsureRepositories(ctx, []config.RepositoryConfig{{
+		Name:       "repo",
+		URL:        "https://example.invalid/repo.git",
+		DefaultRef: "main",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	scanID, err := app.store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.store.FinishScan(ctx, scanID, "repo", "abc123", []core.Service{{
+		ID:           "svc",
+		Name:         "api",
+		Repository:   "repo",
+		SourceCommit: "abc123",
+		SourcePath:   "prod/compose.yaml",
+		Runtime:      "compose",
+		Health:       core.HealthUnknown,
+		Images:       []string{"example/api:v1"},
+	}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE services SET images_json=? WHERE id=?`, "{", "svc"); err != nil {
+		t.Fatal(err)
+	}
+
+	res := httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/summary", nil))
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("summary status = %d, want 500; body=%q", res.Code, res.Body.String())
+	}
+	for _, want := range []string{"dashboard storage degraded", "table=services", "key=svc", "column=images_json"} {
+		if !strings.Contains(res.Body.String(), want) {
+			t.Fatalf("summary body = %q, want %q", res.Body.String(), want)
+		}
+	}
+	for _, want := range []string{"summary unavailable", "table=services", "key=svc", "column=images_json"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("logs = %q, want %q", logs.String(), want)
+		}
 	}
 }
 
