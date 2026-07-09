@@ -1,4 +1,4 @@
-package agent
+package dockerapi
 
 import (
 	"context"
@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-type dockerContainer struct {
+const DefaultHost = "unix:///var/run/docker.sock"
+
+type Container struct {
 	ID           string            `json:"Id"`
 	Names        []string          `json:"Names"`
 	Image        string            `json:"Image"`
@@ -21,13 +23,18 @@ type dockerContainer struct {
 	State        string            `json:"State"`
 	Status       string            `json:"Status"`
 	RestartCount int               `json:"RestartCount"`
+	Health       string            `json:"Health"`
 }
 
-func listDockerContainers(ctx context.Context, host string) ([]dockerContainer, error) {
+type ImageInspect struct {
+	RepoDigests []string `json:"RepoDigests"`
+}
+
+func ListContainers(ctx context.Context, host string) ([]Container, error) {
 	if host == "" {
-		host = "unix:///var/run/docker.sock"
+		host = DefaultHost
 	}
-	client, baseURL, err := dockerHTTPClient(host)
+	client, baseURL, err := HTTPClient(host)
 	if err != nil {
 		return nil, err
 	}
@@ -43,39 +50,35 @@ func listDockerContainers(ctx context.Context, host string) ([]dockerContainer, 
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("docker api status %s", resp.Status)
 	}
-	var containers []dockerContainer
+	var containers []Container
 	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
 		return nil, err
 	}
 	return containers, nil
 }
 
-type dockerImageInspector struct {
+type ImageInspector struct {
 	client  *http.Client
 	baseURL string
 	cache   map[string][]string
 }
 
-type dockerImageInspect struct {
-	RepoDigests []string `json:"RepoDigests"`
-}
-
-func newDockerImageInspector(host string) (*dockerImageInspector, error) {
+func NewImageInspector(host string) (*ImageInspector, error) {
 	if host == "" {
-		host = "unix:///var/run/docker.sock"
+		host = DefaultHost
 	}
-	client, baseURL, err := dockerHTTPClient(host)
+	client, baseURL, err := HTTPClient(host)
 	if err != nil {
 		return nil, err
 	}
-	return &dockerImageInspector{
+	return &ImageInspector{
 		client:  client,
 		baseURL: baseURL,
 		cache:   map[string][]string{},
 	}, nil
 }
 
-func (inspector *dockerImageInspector) repoDigests(ctx context.Context, container dockerContainer) []string {
+func (inspector *ImageInspector) RepoDigests(ctx context.Context, container Container) []string {
 	if inspector == nil {
 		return container.RepoDigests
 	}
@@ -87,14 +90,14 @@ func (inspector *dockerImageInspector) repoDigests(ctx context.Context, containe
 		return container.RepoDigests
 	}
 	if digests, ok := inspector.cache[key]; ok {
-		return mergeDockerRepoDigests(container.RepoDigests, digests)
+		return MergeRepoDigests(container.RepoDigests, digests)
 	}
 	digests := inspector.inspectRepoDigests(ctx, key)
 	inspector.cache[key] = digests
-	return mergeDockerRepoDigests(container.RepoDigests, digests)
+	return MergeRepoDigests(container.RepoDigests, digests)
 }
 
-func (inspector *dockerImageInspector) inspectRepoDigests(ctx context.Context, key string) []string {
+func (inspector *ImageInspector) inspectRepoDigests(ctx context.Context, key string) []string {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inspector.baseURL+"/images/"+url.PathEscape(key)+"/json", nil)
 	if err != nil {
 		return nil
@@ -107,14 +110,14 @@ func (inspector *dockerImageInspector) inspectRepoDigests(ctx context.Context, k
 	if resp.StatusCode >= 300 {
 		return nil
 	}
-	var image dockerImageInspect
+	var image ImageInspect
 	if err := json.NewDecoder(resp.Body).Decode(&image); err != nil {
 		return nil
 	}
 	return image.RepoDigests
 }
 
-func mergeDockerRepoDigests(values ...[]string) []string {
+func MergeRepoDigests(values ...[]string) []string {
 	seen := map[string]struct{}{}
 	var result []string
 	for _, list := range values {
@@ -133,7 +136,7 @@ func mergeDockerRepoDigests(values ...[]string) []string {
 	return result
 }
 
-func liveDockerContainer(state, status string) bool {
+func LiveContainer(state, status string) bool {
 	switch strings.ToLower(strings.TrimSpace(state)) {
 	case "running", "restarting", "paused":
 		return true
@@ -145,7 +148,7 @@ func liveDockerContainer(state, status string) bool {
 	}
 }
 
-func dockerHTTPClient(host string) (*http.Client, string, error) {
+func HTTPClient(host string) (*http.Client, string, error) {
 	parsed, err := url.Parse(host)
 	if err != nil {
 		return nil, "", err

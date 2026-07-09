@@ -27,6 +27,21 @@ type KubernetesResource struct {
 	Warnings     []string
 }
 
+type kubeDocument struct {
+	APIVersion string            `yaml:"apiVersion"`
+	Kind       string            `yaml:"kind"`
+	Metadata   kubeMetadata      `yaml:"metadata"`
+	Spec       yaml.Node         `yaml:"spec"`
+	Data       map[string]string `yaml:"data"`
+	Warnings   []string          `yaml:"-"`
+}
+
+type kubeMetadata struct {
+	Name      string            `yaml:"name"`
+	Namespace string            `yaml:"namespace"`
+	Labels    map[string]string `yaml:"labels"`
+}
+
 func (resource KubernetesResource) IsWorkload() bool {
 	switch resource.Kind {
 	case "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "HelmRelease":
@@ -44,17 +59,22 @@ func ParseKubernetes(path string) ([]KubernetesResource, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	var resources []KubernetesResource
 	for {
-		var raw any
-		if err := decoder.Decode(&raw); err != nil {
+		var node yaml.Node
+		if err := decoder.Decode(&node); err != nil {
 			if err.Error() == "EOF" {
 				break
 			}
 			return nil, err
 		}
-		doc := mapValue(raw)
-		if len(doc) == 0 {
+		docNode := documentContentNode(node)
+		if docNode.Kind != yaml.MappingNode {
 			continue
 		}
+		kind := stringValueFromYAMLNode(mappingValue(docNode, "kind"))
+		if !supportedKubernetesKind(kind) {
+			continue
+		}
+		doc := decodeKubeDocument(docNode, kind)
 		resource, ok := parseKubeDoc(doc)
 		if ok {
 			resources = append(resources, resource)
@@ -63,17 +83,77 @@ func ParseKubernetes(path string) ([]KubernetesResource, error) {
 	return resources, nil
 }
 
-func parseKubeDoc(doc map[string]any) (KubernetesResource, bool) {
-	kind, _ := doc["kind"].(string)
+func supportedKubernetesKind(kind string) bool {
+	switch kind {
+	case "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "HelmRelease", "Service", "Ingress", "PersistentVolumeClaim", "Namespace", "ConfigMap", "Secret":
+		return true
+	default:
+		return false
+	}
+}
+
+func documentContentNode(node yaml.Node) yaml.Node {
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		return *node.Content[0]
+	}
+	return node
+}
+
+func decodeKubeDocument(docNode yaml.Node, kind string) kubeDocument {
+	doc := kubeDocument{
+		APIVersion: stringValueFromYAMLNode(mappingValue(docNode, "apiVersion")),
+		Kind:       kind,
+		Spec:       mappingValue(docNode, "spec"),
+	}
+	metadataNode := mappingValue(docNode, "metadata")
+	decodeKubeField(metadataNode, &doc.Metadata, &doc.Warnings, kind, "metadata")
+	applyKubeMetadataFallback(metadataNode, &doc.Metadata)
+	switch kind {
+	case "ConfigMap", "Secret":
+		decodeKubeField(mappingValue(docNode, "data"), &doc.Data, &doc.Warnings, kind, "data")
+	}
+	sort.Strings(doc.Warnings)
+	return doc
+}
+
+func decodeKubeField(node yaml.Node, value any, warnings *[]string, kind, field string) {
+	if node.Kind == 0 {
+		return
+	}
+	if err := node.Decode(value); err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("unsupported Kubernetes %s %s shape: %v", kind, field, err))
+	}
+}
+
+func applyKubeMetadataFallback(node yaml.Node, metadata *kubeMetadata) {
+	node = resolveAlias(node)
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+	if name := stringValueFromYAMLNode(mappingValue(node, "name")); name != "" {
+		metadata.Name = name
+	}
+	if namespace := stringValueFromYAMLNode(mappingValue(node, "namespace")); namespace != "" {
+		metadata.Namespace = namespace
+	}
+	if metadata.Labels == nil {
+		var labels map[string]string
+		if labelsNode := mappingValue(node, "labels"); labelsNode.Kind != 0 && labelsNode.Decode(&labels) == nil {
+			metadata.Labels = labels
+		}
+	}
+}
+
+func parseKubeDoc(doc kubeDocument) (KubernetesResource, bool) {
+	kind := doc.Kind
 	if kind == "" {
 		return KubernetesResource{}, false
 	}
-	meta := mapValue(doc["metadata"])
-	name, _ := meta["name"].(string)
+	name := doc.Metadata.Name
 	if name == "" {
 		return KubernetesResource{}, false
 	}
-	namespace, _ := meta["namespace"].(string)
+	namespace := doc.Metadata.Namespace
 	if namespace == "" {
 		namespace = "default"
 	}
@@ -81,7 +161,8 @@ func parseKubeDoc(doc map[string]any) (KubernetesResource, bool) {
 		Kind:      kind,
 		Name:      name,
 		Namespace: namespace,
-		Labels:    stringMap(meta["labels"]),
+		Labels:    doc.Metadata.Labels,
+		Warnings:  append([]string{}, doc.Warnings...),
 	}
 	switch kind {
 	case "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob":
@@ -89,12 +170,14 @@ func parseKubeDoc(doc map[string]any) (KubernetesResource, bool) {
 	case "HelmRelease":
 		resource.parseHelmRelease(doc)
 	case "Service":
-		resource.Ports = portsFromService(doc)
-		resource.Selector = stringMap(mapValue(doc["spec"])["selector"])
-		resource.Exposure = serviceExposure(doc)
+		spec := serviceSpec(doc.Spec, &resource.Warnings, kind)
+		resource.Ports = portsFromService(spec)
+		resource.Selector = spec.Selector
+		resource.Exposure = serviceExposure(spec)
 		resource.Exposure = append(resource.Exposure, fmt.Sprintf("service/%s", name))
 	case "Ingress":
-		resource.Backends, resource.Exposure = ingressRoutes(doc)
+		spec := ingressSpec(doc.Spec, &resource.Warnings, kind)
+		resource.Backends, resource.Exposure = ingressRoutes(spec)
 	case "PersistentVolumeClaim":
 		resource.Storage = append(resource.Storage, name)
 	case "Namespace", "ConfigMap", "Secret":
@@ -107,54 +190,103 @@ func parseKubeDoc(doc map[string]any) (KubernetesResource, bool) {
 	return resource, true
 }
 
-func (resource *KubernetesResource) parseWorkload(doc map[string]any) {
-	spec := mapValue(doc["spec"])
-	template := mapValue(spec["template"])
-	if resource.Kind == "CronJob" {
-		jobSpec := mapValue(mapValue(spec["jobTemplate"])["spec"])
-		template = mapValue(jobSpec["template"])
-	}
-	resource.Labels = mergeStringMaps(resource.Labels, stringMap(mapValue(template["metadata"])["labels"]))
-	podSpec := podSpecForWorkload(resource.Kind, doc)
-	containers := append(listValue(podSpec["initContainers"]), listValue(podSpec["containers"])...)
+type kubePodTemplate struct {
+	Metadata kubeMetadata `yaml:"metadata"`
+	Spec     kubePodSpec  `yaml:"spec"`
+}
+
+type kubeWorkloadSpec struct {
+	Template kubePodTemplate `yaml:"template"`
+}
+
+type kubeCronJobSpec struct {
+	JobTemplate struct {
+		Spec struct {
+			Template kubePodTemplate `yaml:"template"`
+		} `yaml:"spec"`
+	} `yaml:"jobTemplate"`
+}
+
+type kubePodSpec struct {
+	InitContainers []kubeContainer `yaml:"initContainers"`
+	Containers     []kubeContainer `yaml:"containers"`
+	Volumes        []kubeVolume    `yaml:"volumes"`
+}
+
+type kubeContainer struct {
+	Image          string              `yaml:"image"`
+	Ports          []kubeContainerPort `yaml:"ports"`
+	ReadinessProbe yaml.Node           `yaml:"readinessProbe"`
+	LivenessProbe  yaml.Node           `yaml:"livenessProbe"`
+	EnvFrom        []kubeEnvFrom       `yaml:"envFrom"`
+	Env            []kubeEnvVar        `yaml:"env"`
+}
+
+type kubeContainerPort struct {
+	ContainerPort yaml.Node `yaml:"containerPort"`
+}
+
+type kubeEnvFrom struct {
+	ConfigMapRef *kubeNamedRef `yaml:"configMapRef"`
+	SecretRef    *kubeNamedRef `yaml:"secretRef"`
+}
+
+type kubeEnvVar struct {
+	ValueFrom kubeEnvValueFrom `yaml:"valueFrom"`
+}
+
+type kubeEnvValueFrom struct {
+	ConfigMapKeyRef *kubeNamedRef `yaml:"configMapKeyRef"`
+	SecretKeyRef    *kubeNamedRef `yaml:"secretKeyRef"`
+}
+
+type kubeNamedRef struct {
+	Name string `yaml:"name"`
+}
+
+type kubeVolume struct {
+	PersistentVolumeClaim *struct {
+		ClaimName string `yaml:"claimName"`
+	} `yaml:"persistentVolumeClaim"`
+}
+
+func (resource *KubernetesResource) parseWorkload(doc kubeDocument) {
+	template := podTemplateForWorkload(resource.Kind, doc.Spec, &resource.Warnings)
+	resource.Labels = mergeStringMaps(resource.Labels, template.Metadata.Labels)
+	podSpec := template.Spec
+	containers := append(podSpec.InitContainers, podSpec.Containers...)
 	for _, item := range containers {
-		container := mapValue(item)
-		if image, ok := container["image"].(string); ok {
-			resource.Images = append(resource.Images, image)
+		if item.Image != "" {
+			resource.Images = append(resource.Images, item.Image)
 		}
-		for _, port := range listValue(container["ports"]) {
-			portMap := mapValue(port)
-			if value, ok := portMap["containerPort"]; ok {
-				resource.Ports = append(resource.Ports, fmt.Sprint(value))
+		for _, port := range item.Ports {
+			if value := stringValueFromYAMLNode(port.ContainerPort); value != "" {
+				resource.Ports = append(resource.Ports, value)
 			}
 		}
 		if resource.Kind != "Job" && resource.Kind != "CronJob" {
-			if _, ok := container["readinessProbe"]; !ok {
+			if item.ReadinessProbe.Kind == 0 {
 				resource.Warnings = append(resource.Warnings, "missing readiness probe")
 			}
-			if _, ok := container["livenessProbe"]; !ok {
+			if item.LivenessProbe.Kind == 0 {
 				resource.Warnings = append(resource.Warnings, "missing liveness probe")
 			}
 		}
-		for _, envFrom := range listValue(container["envFrom"]) {
-			envMap := mapValue(envFrom)
-			for key := range envMap {
-				ref := mapValue(envMap[key])
-				if name, ok := ref["name"].(string); ok {
-					resource.ConfigRefs = append(resource.ConfigRefs, key+"/"+name)
-				}
+		for _, envFrom := range item.EnvFrom {
+			if envFrom.ConfigMapRef != nil && envFrom.ConfigMapRef.Name != "" {
+				resource.ConfigRefs = append(resource.ConfigRefs, "configMapRef/"+envFrom.ConfigMapRef.Name)
+			}
+			if envFrom.SecretRef != nil && envFrom.SecretRef.Name != "" {
+				resource.ConfigRefs = append(resource.ConfigRefs, "secretRef/"+envFrom.SecretRef.Name)
 			}
 		}
-		for _, env := range listValue(container["env"]) {
+		for _, env := range item.Env {
 			resource.ConfigRefs = append(resource.ConfigRefs, envValueRefs(env)...)
 		}
 	}
-	for _, volume := range listValue(podSpec["volumes"]) {
-		volumeMap := mapValue(volume)
-		if claim := mapValue(volumeMap["persistentVolumeClaim"]); len(claim) > 0 {
-			if name, ok := claim["claimName"].(string); ok {
-				resource.Storage = append(resource.Storage, name)
-			}
+	for _, volume := range podSpec.Volumes {
+		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName != "" {
+			resource.Storage = append(resource.Storage, volume.PersistentVolumeClaim.ClaimName)
 		}
 	}
 	sort.Strings(resource.Dependencies)
@@ -165,82 +297,101 @@ func (resource *KubernetesResource) parseWorkload(doc map[string]any) {
 	sort.Strings(resource.Warnings)
 }
 
-func podSpecForWorkload(kind string, doc map[string]any) map[string]any {
-	spec := mapValue(doc["spec"])
+func podTemplateForWorkload(kind string, specNode yaml.Node, warnings *[]string) kubePodTemplate {
 	if kind == "CronJob" {
-		jobTemplate := mapValue(spec["jobTemplate"])
-		jobSpec := mapValue(jobTemplate["spec"])
-		template := mapValue(jobSpec["template"])
-		return mapValue(template["spec"])
+		var spec kubeCronJobSpec
+		decodeKubeSpec(specNode, &spec, warnings, kind)
+		return spec.JobTemplate.Spec.Template
 	}
-	template := mapValue(spec["template"])
-	return mapValue(template["spec"])
+	var spec kubeWorkloadSpec
+	decodeKubeSpec(specNode, &spec, warnings, kind)
+	return spec.Template
 }
 
-func envValueRefs(value any) []string {
-	env := mapValue(value)
-	valueFrom := mapValue(env["valueFrom"])
+func envValueRefs(env kubeEnvVar) []string {
 	var result []string
-	for key, raw := range valueFrom {
-		ref := mapValue(raw)
-		if name, ok := ref["name"].(string); ok {
-			result = append(result, key+"/"+name)
-		}
+	if env.ValueFrom.ConfigMapKeyRef != nil && env.ValueFrom.ConfigMapKeyRef.Name != "" {
+		result = append(result, "configMapKeyRef/"+env.ValueFrom.ConfigMapKeyRef.Name)
+	}
+	if env.ValueFrom.SecretKeyRef != nil && env.ValueFrom.SecretKeyRef.Name != "" {
+		result = append(result, "secretKeyRef/"+env.ValueFrom.SecretKeyRef.Name)
 	}
 	sort.Strings(result)
 	return result
 }
 
-func (resource *KubernetesResource) parseHelmRelease(doc map[string]any) {
-	spec := mapValue(doc["spec"])
-	chart := mapValue(spec["chart"])
-	chartSpec := mapValue(chart["spec"])
-	if name, ok := chartSpec["chart"].(string); ok && name != "" {
-		resource.Dependencies = append(resource.Dependencies, "chart/"+name)
+type kubeObjectRef struct {
+	Kind string `yaml:"kind"`
+	Name string `yaml:"name"`
+}
+
+type kubeHelmReleaseSpec struct {
+	Chart struct {
+		Spec struct {
+			Chart     string        `yaml:"chart"`
+			SourceRef kubeObjectRef `yaml:"sourceRef"`
+		} `yaml:"spec"`
+	} `yaml:"chart"`
+	ValuesFrom []kubeObjectRef `yaml:"valuesFrom"`
+}
+
+func (resource *KubernetesResource) parseHelmRelease(doc kubeDocument) {
+	var spec kubeHelmReleaseSpec
+	decodeKubeSpec(doc.Spec, &spec, &resource.Warnings, resource.Kind)
+	if spec.Chart.Spec.Chart != "" {
+		resource.Dependencies = append(resource.Dependencies, "chart/"+spec.Chart.Spec.Chart)
 	}
-	sourceRef := mapValue(chartSpec["sourceRef"])
-	sourceKind, _ := sourceRef["kind"].(string)
-	sourceName, _ := sourceRef["name"].(string)
-	if sourceKind != "" && sourceName != "" {
-		resource.ConfigRefs = append(resource.ConfigRefs, sourceKind+"/"+sourceName)
+	sourceRef := spec.Chart.Spec.SourceRef
+	if sourceRef.Kind != "" && sourceRef.Name != "" {
+		resource.ConfigRefs = append(resource.ConfigRefs, sourceRef.Kind+"/"+sourceRef.Name)
 	}
-	for _, item := range listValue(spec["valuesFrom"]) {
-		valueRef := mapValue(item)
-		kind, _ := valueRef["kind"].(string)
-		name, _ := valueRef["name"].(string)
-		if kind != "" && name != "" {
-			resource.ConfigRefs = append(resource.ConfigRefs, kind+"/"+name)
+	for _, valueRef := range spec.ValuesFrom {
+		if valueRef.Kind != "" && valueRef.Name != "" {
+			resource.ConfigRefs = append(resource.ConfigRefs, valueRef.Kind+"/"+valueRef.Name)
 		}
 	}
+	sort.Strings(resource.Warnings)
 	sort.Strings(resource.ConfigRefs)
 	sort.Strings(resource.Dependencies)
 }
 
-func portsFromService(doc map[string]any) []string {
+type kubeServiceSpec struct {
+	Selector       map[string]string `yaml:"selector"`
+	Type           string            `yaml:"type"`
+	LoadBalancerIP string            `yaml:"loadBalancerIP"`
+	ExternalIPs    []string          `yaml:"externalIPs"`
+	Ports          []kubeServicePort `yaml:"ports"`
+}
+
+type kubeServicePort struct {
+	Port yaml.Node `yaml:"port"`
+}
+
+func serviceSpec(specNode yaml.Node, warnings *[]string, kind string) kubeServiceSpec {
+	var spec kubeServiceSpec
+	decodeKubeSpec(specNode, &spec, warnings, kind)
+	return spec
+}
+
+func portsFromService(spec kubeServiceSpec) []string {
 	var result []string
-	for _, port := range listValue(mapValue(doc["spec"])["ports"]) {
-		portMap := mapValue(port)
-		if value, ok := portMap["port"]; ok {
-			result = append(result, fmt.Sprint(value))
+	for _, port := range spec.Ports {
+		if value := stringValueFromYAMLNode(port.Port); value != "" {
+			result = append(result, value)
 		}
 	}
 	return result
 }
 
-func serviceExposure(doc map[string]any) []string {
-	spec := mapValue(doc["spec"])
+func serviceExposure(spec kubeServiceSpec) []string {
 	var addresses []string
-	if ip := stringValue(spec["loadBalancerIP"]); ip != "" {
-		addresses = append(addresses, ip)
+	if spec.LoadBalancerIP != "" {
+		addresses = append(addresses, spec.LoadBalancerIP)
 	}
-	for _, value := range listValue(spec["externalIPs"]) {
-		if ip := stringValue(value); ip != "" {
-			addresses = append(addresses, ip)
-		}
-	}
+	addresses = append(addresses, spec.ExternalIPs...)
 	var ports []string
-	for _, port := range listValue(spec["ports"]) {
-		if value := stringValue(mapValue(port)["port"]); value != "" {
+	for _, port := range spec.Ports {
+		if value := stringValueFromYAMLNode(port.Port); value != "" {
 			ports = append(ports, value)
 		}
 	}
@@ -257,46 +408,82 @@ func serviceExposure(doc map[string]any) []string {
 	return uniqueSorted(result)
 }
 
-func ingressRoutes(doc map[string]any) ([]string, []string) {
+type kubeIngressSpec struct {
+	Rules          []kubeIngressRule  `yaml:"rules"`
+	TLS            []kubeIngressTLS   `yaml:"tls"`
+	DefaultBackend kubeIngressBackend `yaml:"defaultBackend"`
+}
+
+type kubeIngressRule struct {
+	Host string          `yaml:"host"`
+	HTTP kubeIngressHTTP `yaml:"http"`
+}
+
+type kubeIngressHTTP struct {
+	Paths []kubeIngressPath `yaml:"paths"`
+}
+
+type kubeIngressPath struct {
+	Path    string             `yaml:"path"`
+	Backend kubeIngressBackend `yaml:"backend"`
+	Service kubeIngressService `yaml:"service"`
+}
+
+type kubeIngressBackend struct {
+	Service kubeIngressService `yaml:"service"`
+}
+
+type kubeIngressService struct {
+	Name string `yaml:"name"`
+}
+
+type kubeIngressTLS struct {
+	Hosts []string `yaml:"hosts"`
+}
+
+func ingressSpec(specNode yaml.Node, warnings *[]string, kind string) kubeIngressSpec {
+	var spec kubeIngressSpec
+	decodeKubeSpec(specNode, &spec, warnings, kind)
+	return spec
+}
+
+func ingressRoutes(spec kubeIngressSpec) ([]string, []string) {
 	var backends []string
 	var routes []string
-	tlsHosts := ingressTLSHosts(doc)
-	for _, rule := range listValue(mapValue(doc["spec"])["rules"]) {
-		ruleMap := mapValue(rule)
-		if host, ok := ruleMap["host"].(string); ok {
-			for _, path := range listValue(mapValue(ruleMap["http"])["paths"]) {
-				pathMap := mapValue(path)
-				backends = append(backends, backendServiceName(pathMap)...)
-				routePath := stringValue(pathMap["path"])
-				routes = append(routes, ingressAccessRoute(host, routePath, tlsHosts[host]))
-			}
+	tlsHosts := ingressTLSHosts(spec)
+	for _, rule := range spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			backends = append(backends, backendServiceName(path)...)
+			routes = append(routes, ingressAccessRoute(rule.Host, path.Path, tlsHosts[rule.Host]))
 		}
 	}
-	if defaultBackend := mapValue(mapValue(doc["spec"])["defaultBackend"]); len(defaultBackend) > 0 {
-		backends = append(backends, backendServiceName(defaultBackend)...)
+	if spec.DefaultBackend.Service.Name != "" {
+		backends = append(backends, spec.DefaultBackend.Service.Name)
 	}
 	return uniqueSorted(backends), uniqueSorted(routes)
 }
 
-func ingressTLSHosts(doc map[string]any) map[string]bool {
+func ingressTLSHosts(spec kubeIngressSpec) map[string]bool {
 	result := map[string]bool{}
-	for _, tls := range listValue(mapValue(doc["spec"])["tls"]) {
-		for _, host := range listValue(mapValue(tls)["hosts"]) {
-			if value := stringValue(host); value != "" {
-				result[value] = true
+	for _, tls := range spec.TLS {
+		for _, host := range tls.Hosts {
+			if host != "" {
+				result[host] = true
 			}
 		}
 	}
 	return result
 }
 
-func backendServiceName(path map[string]any) []string {
-	service := mapValue(mapValue(path["backend"])["service"])
-	if len(service) == 0 {
-		service = mapValue(path["service"])
+func backendServiceName(path kubeIngressPath) []string {
+	if path.Backend.Service.Name != "" {
+		return []string{path.Backend.Service.Name}
 	}
-	if name := stringValue(service["name"]); name != "" {
-		return []string{name}
+	if path.Service.Name != "" {
+		return []string{path.Service.Name}
 	}
 	return nil
 }
@@ -314,16 +501,35 @@ func ingressAccessRoute(host, path string, hasTLS bool) string {
 	return "http://" + host + path
 }
 
-func configMapRoutes(doc map[string]any) []string {
+func configMapRoutes(doc kubeDocument) []string {
 	var result []string
-	for _, value := range mapValue(doc["data"]) {
-		text, ok := value.(string)
-		if !ok {
-			continue
-		}
+	for _, text := range doc.Data {
 		result = append(result, routesFromEmbeddedYAML(text)...)
 	}
 	return uniqueSorted(result)
+}
+
+func decodeKubeSpec(spec yaml.Node, value any, warnings *[]string, kind string) {
+	if spec.Kind == 0 {
+		return
+	}
+	if err := spec.Decode(value); err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("unsupported Kubernetes %s spec shape: %v", kind, err))
+	}
+}
+
+func stringValueFromYAMLNode(node yaml.Node) string {
+	if node.Kind == 0 {
+		return ""
+	}
+	if node.Kind == yaml.ScalarNode {
+		return node.Value
+	}
+	var value any
+	if err := node.Decode(&value); err != nil {
+		return ""
+	}
+	return stringValue(value)
 }
 
 func routesFromEmbeddedYAML(value string) []string {

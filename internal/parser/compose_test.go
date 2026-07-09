@@ -62,6 +62,96 @@ services:
 	}
 }
 
+func TestParseComposeResolvesAnchoredAliases(t *testing.T) {
+	t.Parallel()
+	inlinePath := filepath.Join(t.TempDir(), "inline.yaml")
+	if err := os.WriteFile(inlinePath, []byte(`
+services:
+  web:
+    image: example/web:v1
+    ports:
+      - "127.0.0.1:8080:80"
+    labels:
+      - "traefik.http.routers.web.rule=Host('web.example.test')"
+    environment:
+      LOG_LEVEL: debug
+      SECRET_TOKEN: redacted
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasPath := filepath.Join(t.TempDir(), "alias.yaml")
+	if err := os.WriteFile(aliasPath, []byte(`
+x-ports: &ports
+  - "127.0.0.1:8080:80"
+x-labels: &labels
+  - "traefik.http.routers.web.rule=Host('web.example.test')"
+x-env: &env
+  LOG_LEVEL: debug
+  SECRET_TOKEN: redacted
+services:
+  web:
+    image: example/web:v1
+    ports: *ports
+    labels: *labels
+    environment: *env
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	inlineProject, err := ParseCompose(inlinePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasProject, err := ParseCompose(aliasPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inlineProject.Services) != 1 || len(aliasProject.Services) != 1 {
+		t.Fatalf("services inline=%#v alias=%#v, want one each", inlineProject.Services, aliasProject.Services)
+	}
+	inlineService := inlineProject.Services[0]
+	aliasService := aliasProject.Services[0]
+	if !sameStringSlice(aliasService.Ports, inlineService.Ports) {
+		t.Fatalf("aliased ports = %v, want %v", aliasService.Ports, inlineService.Ports)
+	}
+	if !sameStringSlice(aliasService.EnvVars, inlineService.EnvVars) {
+		t.Fatalf("aliased env vars = %v, want %v", aliasService.EnvVars, inlineService.EnvVars)
+	}
+	if !sameStringSlice(aliasService.Exposure, inlineService.Exposure) {
+		t.Fatalf("aliased exposure = %v, want %v", aliasService.Exposure, inlineService.Exposure)
+	}
+	if !sameStringSlice(aliasService.Warnings, inlineService.Warnings) {
+		t.Fatalf("aliased warnings = %v, want %v", aliasService.Warnings, inlineService.Warnings)
+	}
+}
+
+func TestParseComposeAliasCycleDoesNotHang(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "compose.yaml")
+	if err := os.WriteFile(path, []byte(`
+x-loop: &loop
+  - *loop
+services:
+  web:
+    image: example/web:v1
+    ports: *loop
+    labels: *loop
+    environment: *loop
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project, err := ParseCompose(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(project.Services) != 1 {
+		t.Fatalf("services = %#v, want one service", project.Services)
+	}
+	if len(project.Services[0].Exposure) != 0 {
+		t.Fatalf("exposure = %v, want no routes from recursive alias", project.Services[0].Exposure)
+	}
+}
+
 func TestParseComposeTreatsProjectNameInterpolationAsUnknown(t *testing.T) {
 	t.Parallel()
 
@@ -113,4 +203,16 @@ func contains(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }

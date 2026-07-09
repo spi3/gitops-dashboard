@@ -14,6 +14,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/dockerapi"
 	"github.com/example/gitops-dashboard/internal/storage"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -787,7 +788,7 @@ func TestDockerCheckInspectsRepoDigestsForImageComparison(t *testing.T) {
 			})
 		case strings.HasPrefix(r.URL.Path, "/images/"):
 			inspectCalls++
-			_ = json.NewEncoder(w).Encode(dockerImageInspect{
+			_ = json.NewEncoder(w).Encode(dockerapi.ImageInspect{
 				RepoDigests: []string{"example/api@sha256:release"},
 			})
 		default:
@@ -872,7 +873,7 @@ func TestDockerObservedImagesIgnoreStoppedMatchingContainers(t *testing.T) {
 			})
 		case strings.HasPrefix(r.URL.Path, "/images/"):
 			inspectedImages[strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/images/"), "/json")]++
-			_ = json.NewEncoder(w).Encode(dockerImageInspect{
+			_ = json.NewEncoder(w).Encode(dockerapi.ImageInspect{
 				RepoDigests: []string{"example/api@sha256:current"},
 			})
 		default:
@@ -1054,7 +1055,7 @@ func TestApplyAgentReportProjectsContainerHealthToServiceStatus(t *testing.T) {
 
 func TestDockerHTTPClientRejectsInvalidHost(t *testing.T) {
 	t.Parallel()
-	if _, _, err := dockerHTTPClient("not-a-host"); err == nil {
+	if _, _, err := dockerapi.HTTPClient("not-a-host"); err == nil {
 		t.Fatal("expected invalid host error")
 	}
 }

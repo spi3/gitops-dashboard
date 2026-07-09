@@ -9,6 +9,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/dockerapi"
 	"github.com/gorilla/websocket"
 )
 
@@ -51,11 +52,11 @@ func sendOnce(ctx context.Context, cfg config.Config) error {
 }
 
 func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessage, error) {
-	containers, err := listDockerContainers(ctx, cfg.Docker.Host)
+	containers, err := dockerapi.ListContainers(ctx, cfg.Docker.Host)
 	if err != nil {
 		return core.AgentMessage{}, err
 	}
-	imageInspector, err := newDockerImageInspector(cfg.Docker.Host)
+	imageInspector, err := dockerapi.NewImageInspector(cfg.Docker.Host)
 	if err != nil {
 		imageInspector = nil
 	}
@@ -66,8 +67,8 @@ func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessa
 			name = item.Names[0]
 		}
 		repoDigests := item.RepoDigests
-		if imageInspector != nil && liveDockerContainer(item.State, item.Status) {
-			repoDigests = imageInspector.repoDigests(ctx, item)
+		if imageInspector != nil && dockerapi.LiveContainer(item.State, item.Status) {
+			repoDigests = imageInspector.RepoDigests(ctx, item)
 		}
 		message.Containers = append(message.Containers, core.ContainerStatus{
 			ID:           item.ID,

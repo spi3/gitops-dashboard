@@ -10,6 +10,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/dockerapi"
 )
 
 func TestCollectDockerInspectsRepoDigests(t *testing.T) {
@@ -19,7 +20,7 @@ func TestCollectDockerInspectsRepoDigests(t *testing.T) {
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/containers/json":
-			_ = json.NewEncoder(w).Encode([]dockerContainer{
+			_ = json.NewEncoder(w).Encode([]dockerapi.Container{
 				{
 					ID:      "container-1",
 					Names:   []string{"/stack-api-1"},
@@ -52,7 +53,7 @@ func TestCollectDockerInspectsRepoDigests(t *testing.T) {
 			})
 		case strings.HasPrefix(r.URL.Path, "/images/"):
 			inspectCalls++
-			_ = json.NewEncoder(w).Encode(dockerImageInspect{
+			_ = json.NewEncoder(w).Encode(dockerapi.ImageInspect{
 				RepoDigests: []string{"example/api@sha256:release"},
 			})
 		default:
@@ -102,7 +103,7 @@ func TestCollectDockerInfersContainerHealthAndRestartCount(t *testing.T) {
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/containers/json":
-			_ = json.NewEncoder(w).Encode([]dockerContainer{
+			_ = json.NewEncoder(w).Encode([]dockerapi.Container{
 				{
 					ID:           "container-healthy",
 					Names:        []string{"/stack-web-1"},

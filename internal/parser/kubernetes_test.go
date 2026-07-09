@@ -3,6 +3,7 @@ package parser
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -143,6 +144,75 @@ func TestParseKubernetesSkipsNonObjectDocuments(t *testing.T) {
 	}
 }
 
+func TestParseKubernetesSkipsValuesLikeYAMLBeforeStrictDecode(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "values.yaml")
+	if err := os.WriteFile(path, []byte(`
+metadata:
+  - not
+  - kubernetes
+data:
+  nested:
+    value: true
+grafana:
+  ingress:
+    hosts:
+      - grafana.example.test
+---
+apiVersion: example.test/v1
+kind: Widget
+metadata:
+  - not
+  - an
+  - object
+spec:
+  chart: ignored
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resources, err := ParseKubernetes(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 0 {
+		t.Fatalf("resources = %#v, want unsupported YAML skipped", resources)
+	}
+}
+
+func TestParseKubernetesWarnsForMalformedSupportedMetadata(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "deployment.yaml")
+	if err := os.WriteFile(path, []byte(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    - not-a-label-map
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: example/api:v1
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resources, err := ParseKubernetes(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 1 {
+		t.Fatalf("resources = %#v, want deployment resource", resources)
+	}
+	if resources[0].Kind != "Deployment" || resources[0].Name != "api" {
+		t.Fatalf("resource = %#v, want named deployment", resources[0])
+	}
+	if !containsWarning(resources[0].Warnings, "metadata") {
+		t.Fatalf("warnings = %v, want malformed metadata warning", resources[0].Warnings)
+	}
+}
+
 func TestParseKubernetesCronJobAndHelmRelease(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gitops.yaml")
@@ -213,6 +283,15 @@ spec:
 	if len(helmRelease.ConfigRefs) != 2 {
 		t.Fatalf("helm config refs = %v, want source and values refs", helmRelease.ConfigRefs)
 	}
+}
+
+func containsWarning(values []string, text string) bool {
+	for _, value := range values {
+		if strings.Contains(value, text) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestParseKubernetesConfigMapRoutes(t *testing.T) {
