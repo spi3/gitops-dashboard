@@ -16,6 +16,14 @@ func Target(route string) string {
 	return Prefix + route
 }
 
+func TargetForName(name, route string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = Parent
+	}
+	return name + ": " + route
+}
+
 func Routes(exposure []string) []string {
 	routes := []string{}
 	seen := map[string]bool{}
@@ -46,23 +54,40 @@ func IsChildTarget(target string) bool {
 }
 
 func RouteFromTarget(target string) (string, bool) {
+	return RouteFromTargetForName(target, Parent)
+}
+
+func RouteFromTargetForName(target, name string) (string, bool) {
 	value := strings.TrimSpace(target)
-	if !strings.HasPrefix(value, Prefix) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = Parent
+	}
+	prefix := name + ": "
+	if !strings.HasPrefix(value, prefix) {
 		return "", false
 	}
-	return Normalize(strings.TrimSpace(strings.TrimPrefix(value, Prefix)))
+	return Normalize(strings.TrimSpace(strings.TrimPrefix(value, prefix)))
 }
 
 func CanonicalTarget(target string) (string, bool) {
+	return CanonicalTargetForName(target, Parent)
+}
+
+func CanonicalTargetForName(target, name string) (string, bool) {
 	value := strings.TrimSpace(target)
-	if value == Parent {
-		return Parent, true
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = Parent
 	}
-	route, ok := RouteFromTarget(value)
+	if value == name {
+		return name, true
+	}
+	route, ok := RouteFromTargetForName(value, name)
 	if !ok {
 		return value, false
 	}
-	return Target(route), true
+	return TargetForName(name, route), true
 }
 
 func Normalize(candidate string) (string, bool) {
@@ -109,10 +134,8 @@ func canonicalURL(raw string, parsed *url.URL) string {
 }
 
 func canonicalAuthority(authority string, parsed *url.URL, scheme string) string {
-	userinfo := ""
 	hostport := authority
 	if userinfoEnd := strings.LastIndex(hostport, "@"); userinfoEnd >= 0 {
-		userinfo = hostport[:userinfoEnd+1]
 		hostport = hostport[userinfoEnd+1:]
 	}
 	host := strings.ToLower(strings.Trim(parsed.Hostname(), "[]"))
@@ -124,7 +147,27 @@ func canonicalAuthority(authority string, parsed *url.URL, scheme string) string
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
-	return userinfo + host + afterHost
+	return host + afterHost
+}
+
+func StripUserinfo(raw string) string {
+	value := strings.TrimSpace(raw)
+	schemeEnd := strings.Index(value, "://")
+	if schemeEnd < 0 {
+		return value
+	}
+	authorityStart := schemeEnd + len("://")
+	rest := value[authorityStart:]
+	authorityEnd := strings.IndexAny(rest, "/?#")
+	if authorityEnd < 0 {
+		authorityEnd = len(rest)
+	}
+	authority := rest[:authorityEnd]
+	userinfoEnd := strings.LastIndex(authority, "@")
+	if userinfoEnd < 0 {
+		return value
+	}
+	return value[:authorityStart] + authority[userinfoEnd+1:] + rest[authorityEnd:]
 }
 
 func authorityAfterHost(hostport string, parsedHost string) string {

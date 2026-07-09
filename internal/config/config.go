@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/routetarget"
 	"gopkg.in/yaml.v3"
 )
 
@@ -93,9 +94,20 @@ type KubernetesTarget struct {
 }
 
 type HTTPRouteTarget struct {
-	Name     string `yaml:"name"`
-	Interval string `yaml:"interval"`
-	Timeout  string `yaml:"timeout"`
+	Name     string             `yaml:"name"`
+	Interval string             `yaml:"interval"`
+	Timeout  string             `yaml:"timeout"`
+	Egress   EgressPolicyConfig `yaml:"egress"`
+}
+
+type EgressPolicyConfig struct {
+	Allow EgressPolicyRules `yaml:"allow"`
+	Deny  EgressPolicyRules `yaml:"deny"`
+}
+
+type EgressPolicyRules struct {
+	Domains []string `yaml:"domains"`
+	CIDRs   []string `yaml:"cidrs"`
 }
 
 type PingTarget struct {
@@ -360,6 +372,9 @@ func (cfg Config) Validate() error {
 		if _, err := target.TimeoutDuration(); err != nil {
 			return err
 		}
+		if _, err := target.EgressPolicy(); err != nil {
+			return err
+		}
 	}
 	repositoryNames := map[string]struct{}{}
 	for _, repo := range cfg.Repositories {
@@ -455,6 +470,19 @@ func (target HTTPRouteTarget) IntervalDuration() (time.Duration, error) {
 
 func (target HTTPRouteTarget) TimeoutDuration() (time.Duration, error) {
 	return optionalPositiveDuration(target.Timeout, "runtime.http.timeout")
+}
+
+func (target HTTPRouteTarget) EgressPolicy() (routetarget.EgressPolicy, error) {
+	policy, err := routetarget.NewEgressPolicy(routetarget.EgressPolicyConfig{
+		AllowDomains: target.Egress.Allow.Domains,
+		AllowCIDRs:   target.Egress.Allow.CIDRs,
+		DenyDomains:  target.Egress.Deny.Domains,
+		DenyCIDRs:    target.Egress.Deny.CIDRs,
+	})
+	if err != nil {
+		return routetarget.EgressPolicy{}, fmt.Errorf("runtime.http.egress: %w", err)
+	}
+	return policy, nil
 }
 
 func (target PingTarget) EffectiveName() string {

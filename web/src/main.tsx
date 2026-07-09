@@ -737,6 +737,7 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
           {targets.length ? targets.map((target) => {
             const last = target.uptime?.samples[target.uptime.samples.length - 1] ?? null;
             const ignored = target.status?.health === "not_applicable";
+            const blocked = isPolicyBlocked(target.status);
             const busy = busyMonitorOverride === monitorOverrideKey(service.id, target.target);
             return (
               <div className={targetBlockClass(target, ignored)} key={target.target}>
@@ -752,7 +753,9 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
                   <span className="targetMeta">{targetDetailMeta(target)}</span>
                 </div>
                 {target.uptime ? <PulseStrip samples={target.uptime.samples} slots={drawerSlots} wide /> : null}
-                {ignored ? (
+                {blocked ? (
+                  <p className="targetNote">{target.status?.message ?? "blocked by policy"}</p>
+                ) : ignored ? (
                   <p className="targetNote">
                     {statusWord.not_applicable}{target.status?.message ? ` — ${target.status.message}` : ""}
                   </p>
@@ -765,14 +768,16 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
                     {statusWord[target.status.health]}{target.status.message ? ` — ${target.status.message}` : ""} {"·"} {relativeTime(target.status.checkedAt)}
                   </p>
                 ) : null}
-                <button
-                  className="targetToggle"
-                  disabled={busy}
-                  onClick={() => onSetMonitorNotApplicable(service.id, target.target, !ignored)}
-                  type="button"
-                >
-                  {busy ? "Saving..." : ignored ? "Enable monitor" : "Mark not applicable"}
-                </button>
+                {blocked ? null : (
+                  <button
+                    className="targetToggle"
+                    disabled={busy}
+                    onClick={() => onSetMonitorNotApplicable(service.id, target.target, !ignored)}
+                    type="button"
+                  >
+                    {busy ? "Saving..." : ignored ? "Enable monitor" : "Mark not applicable"}
+                  </button>
+                )}
               </div>
             );
           }) : (
@@ -1265,6 +1270,9 @@ function isServiceRoutesParentStatus(status: StatusResult | undefined, hasConfig
 }
 
 function targetDetailMeta(target: MonitorTargetDetail): string {
+  if (isPolicyBlocked(target.status)) {
+    return "blocked by policy";
+  }
   if (target.status?.health === "not_applicable") {
     return "not applicable";
   }
@@ -1278,6 +1286,10 @@ function targetDetailMeta(target: MonitorTargetDetail): string {
     return "all routes";
   }
   return "no checks yet";
+}
+
+function isPolicyBlocked(status: StatusResult | null | undefined): boolean {
+  return status?.health === "not_applicable" && status.message.startsWith("blocked by policy");
 }
 
 function targetBlockClass(target: MonitorTargetDetail, ignored: boolean): string {
@@ -1458,7 +1470,7 @@ function shortDigest(digest: string): string {
 
 function accessTargets(service: Service) {
   const targets = new Map<string, { href: string; label: string }>();
-  for (const route of service.exposure.filter(isAccessRoute)) {
+  for (const route of service.exposure.map(stripRouteUserinfo).filter(isAccessRoute)) {
     const href = hrefForRoute(route);
     const key = href.replace(/\/$/, "");
     if (!targets.has(key)) {
@@ -1469,6 +1481,7 @@ function accessTargets(service: Service) {
 }
 
 function isAccessRoute(value: string) {
+  value = stripRouteUserinfo(value);
   const host = hostForRoute(value);
   if (isClusterInternalHost(host)) {
     return false;
@@ -1483,6 +1496,7 @@ function isAccessRoute(value: string) {
 }
 
 function hrefForRoute(value: string) {
+  value = stripRouteUserinfo(value);
   if (/^(https?|ssh):\/\//.test(value)) {
     return value;
   }
@@ -1492,10 +1506,12 @@ function hrefForRoute(value: string) {
 }
 
 function labelForRoute(value: string) {
+  value = stripRouteUserinfo(value);
   return value.replace(/^(https?|ssh):\/\//, "").replace(/\/$/, "");
 }
 
 function hostForRoute(value: string) {
+  value = stripRouteUserinfo(value);
   if (/^(https?|ssh):\/\//.test(value)) {
     try {
       return new URL(value).hostname;
@@ -1504,6 +1520,10 @@ function hostForRoute(value: string) {
     }
   }
   return value.split(/[/:]/, 1)[0] ?? "";
+}
+
+function stripRouteUserinfo(value: string) {
+  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*@)([^/?#]*)(.*)$/i, "$1$3$4");
 }
 
 function isClusterInternalHost(host: string) {

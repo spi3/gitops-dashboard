@@ -56,6 +56,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	store.AddRedactionValues(repositoryRedactionValues(cfg.Repositories)...)
+	if err := store.CanonicalizeHTTPRouteTargets(context.Background(), cfg.Runtime.HTTP); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	if err := store.RedactPersistedSensitiveValues(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, err

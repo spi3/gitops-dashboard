@@ -36,6 +36,11 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	if targetName == "" {
 		targetName = "routes"
 	}
+	policy, err := target.EgressPolicy()
+	if err != nil {
+		return err
+	}
+	client = policyHTTPClient(client, policy)
 
 	targetPrefix := targetName + ": "
 	serviceIDs := make([]string, 0, len(services))
@@ -106,7 +111,7 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 				continue
 			}
 			if hasConfiguredRoutes {
-				if _, ok := state.Overrides[routetarget.Parent]; ok {
+				if _, ok := state.Overrides[targetName]; ok {
 					overriddenStatuses = append(overriddenStatuses, core.StatusResult{
 						ServiceID: service.ID,
 						Target:    statusTarget,
@@ -118,10 +123,23 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 				}
 			}
 
+			decision := policy.Check(route)
+			if err := routePolicyDecisionError(decision); err != nil {
+				overriddenStatuses = append(overriddenStatuses, core.StatusResult{
+					ServiceID: service.ID,
+					Target:    statusTarget,
+					Health:    core.HealthNotApplicable,
+					Message:   err.Error(),
+					CheckedAt: time.Now().UTC(),
+				})
+				continue
+			}
+
 			checks = append(checks, httpRouteCheck{
 				serviceID: service.ID,
 				target:    statusTarget,
 				route:     route,
+				policy:    policy,
 			})
 		}
 	}
@@ -170,12 +188,23 @@ func (monitor Monitor) checkHTTPRoutesWithClient(ctx context.Context, target con
 	return nil
 }
 
+func checkHTTPRouteWithPolicy(ctx context.Context, client *http.Client, route string, policy routetarget.EgressPolicy) (core.HealthState, string) {
+	decision := policy.Check(route)
+	if err := routePolicyDecisionError(decision); err != nil {
+		return core.HealthNotApplicable, err.Error()
+	}
+	return checkHTTPRoute(ctx, policyHTTPClient(client, policy), route)
+}
+
 func checkHTTPRoute(ctx context.Context, client *http.Client, route string) (core.HealthState, string) {
 	statusCode, status, method, err := doRouteRequest(ctx, client, http.MethodHead, route)
 	if err == nil && statusCode == http.StatusMethodNotAllowed {
 		statusCode, status, method, err = doRouteRequest(ctx, client, http.MethodGet, route)
 	}
 	if err != nil {
+		if message, ok := routePolicyStatus(err); ok {
+			return core.HealthNotApplicable, message
+		}
 		return core.HealthError, fmt.Sprintf("%s failed: %s", route, err)
 	}
 	message := fmt.Sprintf("%s %s -> %s", method, route, status)
@@ -220,6 +249,7 @@ type httpRouteCheck struct {
 	serviceID string
 	target    string
 	route     string
+	policy    routetarget.EgressPolicy
 }
 
 func routeStatusTargets(prefix string, routes []string) []string {
@@ -236,4 +266,11 @@ func httpRoutes(exposure []string) []string {
 
 func normalizeHTTPRoute(candidate string) (string, bool) {
 	return routetarget.Normalize(candidate)
+}
+
+func blockedByPolicyMessage(rule string) string {
+	if rule == "" {
+		return "blocked by policy"
+	}
+	return "blocked by policy: " + rule
 }

@@ -35,6 +35,10 @@ func Redact(value string, tokens ...string) string {
 	return New(tokens...).Redact(value)
 }
 
+func StripURLUserinfo(value string) string {
+	return redactURLUserinfo(value)
+}
+
 func (redactor Redactor) Redact(value string) string {
 	value = strings.ReplaceAll(value, "\n", " ")
 	value = strings.ReplaceAll(value, "\r", " ")

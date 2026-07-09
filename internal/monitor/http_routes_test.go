@@ -287,6 +287,157 @@ func TestHTTPRouteCheckPerRouteOverrideSkipsOnlyThatRoute(t *testing.T) {
 	}
 }
 
+func TestHTTPRouteCheckRecordsPolicyBlocksAndHonorsPolicyChanges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	services := []core.Service{{
+		ID:       "app",
+		Exposure: []string{"http://10.10.10.20", "http://169.254.169.254/latest/meta-data"},
+	}}
+	var requests atomic.Int64
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return routeResponse(req, http.StatusOK), nil
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{
+		Name: "routes",
+		Egress: config.EgressPolicyConfig{
+			Deny: config.EgressPolicyRules{CIDRs: []string{"10.0.0.0/8"}},
+		},
+	}, services, client); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("HTTP requests = %d, want 0 while routes are blocked", requests.Load())
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTarget := map[string]core.StatusResult{}
+	for _, status := range statuses {
+		byTarget[status.Target] = status
+	}
+	privateStatus := byTarget["routes: http://10.10.10.20"]
+	if privateStatus.Health != core.HealthNotApplicable || !strings.Contains(privateStatus.Message, "blocked by policy: deny cidr 10.0.0.0/8") {
+		t.Fatalf("private status = %#v, want configured CIDR policy block", privateStatus)
+	}
+	linkLocalStatus := byTarget["routes: http://169.254.169.254/latest/meta-data"]
+	if linkLocalStatus.Health != core.HealthNotApplicable || !strings.Contains(linkLocalStatus.Message, "blocked by policy: default deny cidr 169.254.0.0/16") {
+		t.Fatalf("link-local status = %#v, want default policy block", linkLocalStatus)
+	}
+
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{
+		Name: "routes",
+		Egress: config.EgressPolicyConfig{
+			Allow: config.EgressPolicyRules{CIDRs: []string{"10.0.0.0/8", "169.254.0.0/16"}},
+		},
+	}, services, client); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("HTTP requests after policy opt-in = %d, want 2", requests.Load())
+	}
+	statuses, err = store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byTarget = map[string]core.StatusResult{}
+	for _, status := range statuses {
+		byTarget[status.Target] = status
+	}
+	if byTarget["routes: http://10.10.10.20"].Health != core.HealthHealthy {
+		t.Fatalf("private status after policy change = %#v, want healthy", byTarget["routes: http://10.10.10.20"])
+	}
+	if byTarget["routes: http://169.254.169.254/latest/meta-data"].Health != core.HealthHealthy {
+		t.Fatalf("link-local status after opt-in = %#v, want healthy", byTarget["routes: http://169.254.169.254/latest/meta-data"])
+	}
+}
+
+func TestHTTPRoutePolicyBlockClearsStaleUptime(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	service := core.Service{
+		ID:          "app",
+		Name:        "app",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Environment: "production",
+		Health:      core.HealthUnknown,
+		Exposure:    []string{"http://10.10.10.20"},
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	const target = "routes: http://10.10.10.20"
+	if err := store.UpsertStatus(ctx, core.StatusResult{
+		ServiceID: "app",
+		Target:    target,
+		Health:    core.HealthHealthy,
+		Message:   "route ok",
+		CheckedAt: time.Now().UTC().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	uptime, err := store.UptimeStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uptime) != 1 || uptime[0].Target != target {
+		t.Fatalf("pre-block uptime = %#v, want healthy route history", uptime)
+	}
+
+	var requests atomic.Int64
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return routeResponse(req, http.StatusOK), nil
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{
+		Name: "routes",
+		Egress: config.EgressPolicyConfig{
+			Deny: config.EgressPolicyRules{CIDRs: []string{"10.0.0.0/8"}},
+		},
+	}, []core.Service{service}, client); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("HTTP requests = %d, want policy block before probe", requests.Load())
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stat := range summary.Uptime {
+		if stat.ServiceID == "app" && stat.Target == target {
+			t.Fatalf("blocked route remained in summary uptime: %#v", summary.Uptime)
+		}
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Target != target || statuses[0].Health != core.HealthNotApplicable || !strings.Contains(statuses[0].Message, "blocked by policy") {
+		t.Fatalf("blocked status = %#v, want explicit policy not_applicable", statuses)
+	}
+}
+
 func TestNormalizeHTTPRoute(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -299,6 +450,7 @@ func TestNormalizeHTTPRoute(t *testing.T) {
 		{name: "trailing slash", candidate: "https://app.example.test/", want: "https://app.example.test", ok: true},
 		{name: "non-root trailing slash", candidate: "https://app.example.test/admin/", want: "https://app.example.test/admin/", ok: true},
 		{name: "default https port", candidate: "https://app.example.test:443", want: "https://app.example.test", ok: true},
+		{name: "userinfo stripped", candidate: "https://user:pass@app.example.test:443/admin", want: "https://app.example.test/admin", ok: true},
 		{name: "non-root default https port", candidate: "https://app.example.test:443/admin/", want: "https://app.example.test/admin/", ok: true},
 		{name: "escaped slash", candidate: "https://app.example.test/a%2Fb", want: "https://app.example.test/a%2Fb", ok: true},
 		{name: "escaped space", candidate: "https://app.example.test/a%20b", want: "https://app.example.test/a%20b", ok: true},

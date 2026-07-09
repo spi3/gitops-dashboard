@@ -84,6 +84,67 @@ runtime:
 	}
 }
 
+func TestLoadConfigLoadsHTTPRouteEgressPolicy(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  http:
+    - name: routes
+      egress:
+        allow:
+          domains:
+            - example.test
+          cidrs:
+            - 10.0.0.0/8
+        deny:
+          domains:
+            - metadata.example.test
+          cidrs:
+            - 127.0.0.0/8
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := cfg.Runtime.HTTP[0].EgressPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := policy.Check("https://app.example.test"); !decision.Allowed {
+		t.Fatalf("domain route decision = %#v, want allowed", decision)
+	}
+	if decision := policy.Check("http://127.0.0.1"); decision.Allowed || !strings.Contains(decision.Rule, "deny cidr 127.0.0.0/8") {
+		t.Fatalf("loopback route decision = %#v, want deny CIDR", decision)
+	}
+}
+
+func TestLoadConfigRejectsInvalidHTTPRouteEgressPolicy(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+runtime:
+  http:
+    - name: routes
+      egress:
+        deny:
+          cidrs:
+            - not-a-cidr
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "runtime.http.egress") || !strings.Contains(errText, "not-a-cidr") {
+		t.Fatalf("error = %q, want egress validation context", errText)
+	}
+}
+
 func TestLoadConfigLoadsPingRuntime(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.yaml")

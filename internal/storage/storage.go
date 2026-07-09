@@ -194,31 +194,139 @@ func (store *Store) migrate(ctx context.Context) error {
 	if err := store.ensureColumn(ctx, "status_results", "observed_images_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
-	if err := store.canonicalizeStoredRouteTargets(ctx); err != nil {
+	changed, err := store.stripPersistedRouteUserinfo(ctx)
+	if err != nil {
 		return err
+	}
+	targetChanged, err := store.canonicalizeStoredRouteTargets(ctx)
+	if err != nil {
+		return err
+	}
+	if changed || targetChanged {
+		return store.compactRedactedPages(ctx)
 	}
 	return nil
 }
 
-func (store *Store) canonicalizeStoredRouteTargets(ctx context.Context) error {
+func (store *Store) stripPersistedRouteUserinfo(ctx context.Context) (bool, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	exposureChanged, err := stripServiceExposureUserinfo(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return exposureChanged, nil
+}
+
+func stripServiceExposureUserinfo(ctx context.Context, tx *sql.Tx) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT rowid, exposure_json FROM services`)
+	if err != nil {
+		return false, fmt.Errorf("query service exposure URL userinfo: %w", err)
+	}
+	type rowValue struct {
+		rowID int64
+		value string
+	}
+	var updates []rowValue
+	for rows.Next() {
+		var current rowValue
+		if err := rows.Scan(&current.rowID, &current.value); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		var exposure []string
+		if err := json.Unmarshal([]byte(current.value), &exposure); err != nil {
+			continue
+		}
+		sanitized := sanitizeExposure(exposure)
+		if !sameStrings(exposure, sanitized) {
+			updates = append(updates, rowValue{rowID: current.rowID, value: toJSON(sanitized)})
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE services SET exposure_json=? WHERE rowid=?`, update.value, update.rowID); err != nil {
+			return false, fmt.Errorf("strip URL userinfo from services.exposure_json: %w", err)
+		}
+	}
+	return len(updates) > 0, nil
+}
+
+func (store *Store) canonicalizeStoredRouteTargets(ctx context.Context) (bool, error) {
+	return store.canonicalizeStoredRouteTargetsForNames(ctx, []string{routeMonitorTarget})
+}
+
+func (store *Store) CanonicalizeHTTPRouteTargets(ctx context.Context, targets []config.HTTPRouteTarget) error {
+	changed, err := store.canonicalizeStoredRouteTargetsForNames(ctx, httpRouteTargetNames(targets))
 	if err != nil {
 		return err
 	}
+	if !changed {
+		return nil
+	}
+	return store.compactRedactedPages(ctx)
+}
+
+func (store *Store) canonicalizeStoredRouteTargetsForNames(ctx context.Context, targetNames []string) (bool, error) {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
 	defer func() { _ = tx.Rollback() }()
-	if err := canonicalizeMonitorOverrides(ctx, tx); err != nil {
-		return err
+	changed := false
+	for _, targetName := range targetNames {
+		monitorOverridesChanged, err := canonicalizeMonitorOverrides(ctx, tx, targetName)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || monitorOverridesChanged
+		statusResultsChanged, err := canonicalizeStatusResults(ctx, tx, targetName)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || statusResultsChanged
+		statusHistoryChanged, err := canonicalizeStatusHistory(ctx, tx, targetName)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || statusHistoryChanged
+		if err := enforceActiveRouteOverrideStatuses(ctx, tx, targetName); err != nil {
+			return false, err
+		}
 	}
-	if err := canonicalizeStatusResults(ctx, tx); err != nil {
-		return err
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
-	if err := canonicalizeStatusHistory(ctx, tx); err != nil {
-		return err
+	return changed, nil
+}
+
+func httpRouteTargetNames(targets []config.HTTPRouteTarget) []string {
+	names := make([]string, 0, len(targets)+1)
+	names = append(names, routeMonitorTarget)
+	for _, target := range targets {
+		name := strings.TrimSpace(target.Name)
+		if name == "" {
+			name = routeMonitorTarget
+		}
+		names = append(names, name)
 	}
-	if err := enforceActiveRouteOverrideStatuses(ctx, tx); err != nil {
-		return err
+	return dedupeStrings(names)
+}
+
+func routeTargetPrefixForName(targetName string) string {
+	targetName = strings.TrimSpace(targetName)
+	if targetName == "" {
+		targetName = routeMonitorTarget
 	}
-	return tx.Commit()
+	return targetName + ": "
 }
 
 type monitorOverrideRouteAlias struct {
@@ -229,31 +337,34 @@ type monitorOverrideRouteAlias struct {
 	canonical     string
 }
 
-func canonicalizeMonitorOverrides(ctx context.Context, tx *sql.Tx) error {
+func canonicalizeMonitorOverrides(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
+	targetPrefix := routeTargetPrefixForName(targetName)
 	rows, err := tx.QueryContext(ctx, `
 SELECT service_id, target, not_applicable, updated_at
 FROM monitor_overrides
 WHERE target LIKE ?
-`, routeTargetPrefix+"%")
+`, targetPrefix+"%")
 	if err != nil {
-		return fmt.Errorf("query route override aliases: %w", err)
+		return false, fmt.Errorf("query route override aliases: %w", err)
 	}
 	var aliases []monitorOverrideRouteAlias
+	sensitiveChanged := false
 	for rows.Next() {
 		var alias monitorOverrideRouteAlias
 		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.notApplicable, &alias.updatedAt); err != nil {
 			_ = rows.Close()
-			return err
+			return false, err
 		}
-		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
 		if !ok || canonical == alias.target {
 			continue
 		}
+		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
 		alias.canonical = canonical
 		aliases = append(aliases, alias)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 	for _, alias := range aliases {
 		var existingNotApplicable int
@@ -269,10 +380,10 @@ WHERE service_id=? AND target=?
 UPDATE monitor_overrides SET target=?
 WHERE service_id=? AND target=?
 `, alias.canonical, alias.serviceID, alias.target); err != nil {
-				return fmt.Errorf("canonicalize route override %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("canonicalize route override %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 		case err != nil:
-			return err
+			return false, err
 		default:
 			mergedNotApplicable := existingNotApplicable
 			if alias.notApplicable > mergedNotApplicable {
@@ -286,17 +397,17 @@ WHERE service_id=? AND target=?
 UPDATE monitor_overrides SET not_applicable=?, updated_at=?
 WHERE service_id=? AND target=?
 `, mergedNotApplicable, mergedUpdatedAt, alias.serviceID, alias.canonical); err != nil {
-				return fmt.Errorf("merge route override %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("merge route override %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 			if _, err := tx.ExecContext(ctx, `
 DELETE FROM monitor_overrides
 WHERE service_id=? AND target=?
 `, alias.serviceID, alias.target); err != nil {
-				return fmt.Errorf("delete route override alias %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("delete route override alias %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 		}
 	}
-	return nil
+	return sensitiveChanged, nil
 }
 
 type statusResultRouteAlias struct {
@@ -308,31 +419,34 @@ type statusResultRouteAlias struct {
 	canonical string
 }
 
-func canonicalizeStatusResults(ctx context.Context, tx *sql.Tx) error {
+func canonicalizeStatusResults(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
+	targetPrefix := routeTargetPrefixForName(targetName)
 	rows, err := tx.QueryContext(ctx, `
 SELECT service_id, target, health, message, checked_at
 FROM status_results
 WHERE target LIKE ?
-`, routeTargetPrefix+"%")
+`, targetPrefix+"%")
 	if err != nil {
-		return fmt.Errorf("query route status aliases: %w", err)
+		return false, fmt.Errorf("query route status aliases: %w", err)
 	}
 	var aliases []statusResultRouteAlias
+	sensitiveChanged := false
 	for rows.Next() {
 		var alias statusResultRouteAlias
 		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.health, &alias.message, &alias.checkedAt); err != nil {
 			_ = rows.Close()
-			return err
+			return false, err
 		}
-		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
 		if !ok || canonical == alias.target {
 			continue
 		}
+		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
 		alias.canonical = canonical
 		aliases = append(aliases, alias)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 	for _, alias := range aliases {
 		var existing statusResultRouteAlias
@@ -347,10 +461,10 @@ WHERE service_id=? AND target=?
 UPDATE status_results SET target=?
 WHERE service_id=? AND target=?
 `, alias.canonical, alias.serviceID, alias.target); err != nil {
-				return fmt.Errorf("canonicalize route status %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("canonicalize route status %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 		case err != nil:
-			return err
+			return false, err
 		default:
 			chosen := existing
 			if shouldReplaceCanonicalStatus(alias, existing) {
@@ -360,17 +474,17 @@ WHERE service_id=? AND target=?
 UPDATE status_results SET health=?, message=?, checked_at=?
 WHERE service_id=? AND target=?
 `, chosen.health, chosen.message, chosen.checkedAt, alias.serviceID, alias.canonical); err != nil {
-				return fmt.Errorf("merge route status %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("merge route status %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 			if _, err := tx.ExecContext(ctx, `
 DELETE FROM status_results
 WHERE service_id=? AND target=?
 `, alias.serviceID, alias.target); err != nil {
-				return fmt.Errorf("delete route status alias %s/%s: %w", alias.serviceID, alias.target, err)
+				return false, fmt.Errorf("delete route status alias %s/%s: %w", alias.serviceID, alias.target, err)
 			}
 		}
 	}
-	return nil
+	return sensitiveChanged, nil
 }
 
 func shouldReplaceCanonicalStatus(candidate, existing statusResultRouteAlias) bool {
@@ -391,41 +505,44 @@ type statusHistoryRouteAlias struct {
 	canonical string
 }
 
-func canonicalizeStatusHistory(ctx context.Context, tx *sql.Tx) error {
+func canonicalizeStatusHistory(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
+	targetPrefix := routeTargetPrefixForName(targetName)
 	rows, err := tx.QueryContext(ctx, `
 SELECT id, target
 FROM status_history
 WHERE target LIKE ?
-`, routeTargetPrefix+"%")
+`, targetPrefix+"%")
 	if err != nil {
-		return fmt.Errorf("query route history aliases: %w", err)
+		return false, fmt.Errorf("query route history aliases: %w", err)
 	}
 	var aliases []statusHistoryRouteAlias
+	sensitiveChanged := false
 	for rows.Next() {
 		var alias statusHistoryRouteAlias
 		if err := rows.Scan(&alias.id, &alias.target); err != nil {
 			_ = rows.Close()
-			return err
+			return false, err
 		}
-		canonical, ok := routetarget.CanonicalTarget(alias.target)
+		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
 		if !ok || canonical == alias.target {
 			continue
 		}
+		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
 		alias.canonical = canonical
 		aliases = append(aliases, alias)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return false, err
 	}
 	for _, alias := range aliases {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE status_history SET target=?
 WHERE id=?
 `, alias.canonical, alias.id); err != nil {
-			return fmt.Errorf("canonicalize route history %d/%s: %w", alias.id, alias.target, err)
+			return false, fmt.Errorf("canonicalize route history %d/%s: %w", alias.id, alias.target, err)
 		}
 	}
-	return nil
+	return sensitiveChanged, nil
 }
 
 type activeRouteOverride struct {
@@ -434,12 +551,13 @@ type activeRouteOverride struct {
 	updatedAt string
 }
 
-func enforceActiveRouteOverrideStatuses(ctx context.Context, tx *sql.Tx) error {
+func enforceActiveRouteOverrideStatuses(ctx context.Context, tx *sql.Tx, targetName string) error {
+	targetPrefix := routeTargetPrefixForName(targetName)
 	rows, err := tx.QueryContext(ctx, `
 SELECT service_id, target, updated_at
 FROM monitor_overrides
 WHERE target LIKE ? AND not_applicable=1
-`, routeTargetPrefix+"%")
+`, targetPrefix+"%")
 	if err != nil {
 		return fmt.Errorf("query active route overrides: %w", err)
 	}
@@ -1423,6 +1541,7 @@ func normalizeService(service core.Service) core.Service {
 	if service.Exposure == nil {
 		service.Exposure = []string{}
 	}
+	service.Exposure = sanitizeExposure(service.Exposure)
 	service.MonitorRoutes = monitorRoutesFromExposure(service.Exposure)
 	if service.ConfigRefs == nil {
 		service.ConfigRefs = []string{}
@@ -1431,6 +1550,26 @@ func normalizeService(service core.Service) core.Service {
 		service.Warnings = []string{}
 	}
 	return service
+}
+
+func sanitizeExposure(exposure []string) []string {
+	sanitized := make([]string, len(exposure))
+	for i, value := range exposure {
+		sanitized[i] = routetarget.StripUserinfo(value)
+	}
+	return sanitized
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) error {
@@ -1469,6 +1608,11 @@ ON CONFLICT(service_id, target) DO UPDATE SET
 		return fmt.Errorf("upsert status %s/%s: %w", status.ServiceID, status.Target, err)
 	}
 	if status.Health == core.HealthNotApplicable {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM status_history WHERE service_id=? AND target=?
+`, status.ServiceID, status.Target); err != nil {
+			return fmt.Errorf("clear not applicable status history %s/%s: %w", status.ServiceID, status.Target, err)
+		}
 		return tx.Commit()
 	}
 	_, err = tx.ExecContext(ctx, `

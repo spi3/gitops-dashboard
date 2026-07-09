@@ -482,6 +482,50 @@ test("keys route controls from backend canonical monitor routes", async ({ page 
   await expect(routeTargets.getByText("https://app.example.test:443", { exact: true })).toHaveCount(0);
 });
 
+test("strips route userinfo from drawer links and monitor targets", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithUserinfoRoutes())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "userinfo-routes", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("Up");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer).not.toContainText("probe-user");
+  await expect(drawer).not.toContainText("s3cr3t");
+  await expect(drawer.getByRole("link", { name: /app\.example\.test\/admin/ })).toHaveAttribute("href", "https://app.example.test/admin");
+
+  const routeTargets = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTargets).toHaveCount(1);
+  await expect(routeTargets.locator(".targetHead strong")).toHaveText("https://app.example.test/admin");
+});
+
+test("shows policy-blocked route statuses in the drawer", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithPolicyBlockedRoute())
+    });
+  });
+
+  await page.goto(baseURL);
+  const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "policy-blocked", exact: true }) });
+  await expect(tile.locator(".stateWord")).toHaveText("No data");
+
+  await tile.click();
+  const drawer = page.getByRole("dialog");
+  const routeTarget = drawer.locator(".targetBlock.routeTarget");
+  await expect(routeTarget.locator(".targetHead strong")).toHaveText("http://169.254.169.254/latest/meta-data");
+  await expect(routeTarget.locator(".targetMeta")).toHaveText("blocked by policy");
+  await expect(routeTarget.locator(".targetNote")).toContainText("default deny cidr 169.254.0.0/16");
+  await expect(routeTarget.getByRole("button")).toHaveCount(0);
+});
+
 test("keeps slash-distinct route controls and override targets", async ({ page }) => {
   const overrideRequests: MonitorOverrideRequest[] = [];
   await page.route("**/api/summary", async (route) => {
@@ -1189,6 +1233,56 @@ function summaryWithCanonicalMonitorRoutes() {
       target,
       health: "healthy",
       message: "route ok",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithUserinfoRoutes() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-userinfo-routes", "userinfo-routes", "healthy"),
+    exposure: ["https://probe-user:s3cr3t@app.example.test/admin"],
+    monitorRoutes: ["https://app.example.test/admin"]
+  };
+  const target = "routes: https://app.example.test/admin";
+  return summaryShell([service], [
+    {
+      serviceId: "svc-userinfo-routes",
+      target,
+      uptimePercent: 100,
+      checkCount: 1,
+      samples: [{
+        health: "healthy",
+        checkedAt: new Date(now - 60_000).toISOString(),
+        message: "route ok"
+      }]
+    }
+  ], [
+    {
+      serviceId: "svc-userinfo-routes",
+      target,
+      health: "healthy",
+      message: "route ok",
+      checkedAt: new Date(now).toISOString()
+    }
+  ]);
+}
+
+function summaryWithPolicyBlockedRoute() {
+  const now = Date.now();
+  const service = {
+    ...baseService("svc-policy-blocked", "policy-blocked", "unknown"),
+    exposure: ["http://169.254.169.254/latest/meta-data"],
+    monitorRoutes: ["http://169.254.169.254/latest/meta-data"]
+  };
+  const target = "routes: http://169.254.169.254/latest/meta-data";
+  return summaryShell([service], [], [
+    {
+      serviceId: "svc-policy-blocked",
+      target,
+      health: "not_applicable",
+      message: "blocked by policy: default deny cidr 169.254.0.0/16",
       checkedAt: new Date(now).toISOString()
     }
   ]);
