@@ -289,27 +289,53 @@ func dockerStatus(ctx context.Context, service core.Service, target string, cont
 	matches := matchingDockerContainers(service, containers)
 	observedImages := observedDockerImages(ctx, target, matches, imageInspector)
 	for _, container := range matches {
-		if strings.EqualFold(container.State, "running") {
-			switch strings.ToLower(strings.TrimSpace(container.Health)) {
-			case "unhealthy":
-				return core.HealthUnhealthy, container.Status, observedImages
-			case "starting":
-				return core.HealthDegraded, container.Status, observedImages
-			case "healthy":
-				return core.HealthHealthy, container.Status, observedImages
-			}
-			status := strings.ToLower(container.Status)
-			if strings.Contains(status, "(unhealthy)") {
-				return core.HealthUnhealthy, container.Status, observedImages
-			}
-			if strings.Contains(status, "(health: starting)") {
-				return core.HealthDegraded, container.Status, observedImages
-			}
-			return core.HealthHealthy, container.Status, observedImages
+		health := strings.ToLower(strings.TrimSpace(container.Health))
+		if health == "" {
+			health = containerHealthFromStatus(strings.ToLower(strings.TrimSpace(container.State)), strings.ToLower(strings.TrimSpace(container.Status)))
 		}
-		return core.HealthUnhealthy, container.Status, observedImages
+		switch health {
+		case "healthy", "none":
+			return core.HealthHealthy, container.Status, observedImages
+		case "starting":
+			return core.HealthDegraded, container.Status, observedImages
+		case "unhealthy":
+			return core.HealthUnhealthy, container.Status, observedImages
+		default:
+			if strings.EqualFold(container.State, "restarting") {
+				return core.HealthDegraded, container.Status, observedImages
+			}
+			return core.HealthUnhealthy, container.Status, observedImages
+		}
 	}
 	return core.HealthUnknown, "container not found", nil
+}
+
+func containerHealthFromStatus(state, status string) string {
+	switch state {
+	case "running":
+		if health := parseStatusHealth(status); health != "" {
+			return health
+		}
+		return "healthy"
+	case "restarting", "paused":
+		return "starting"
+	case "exited":
+		return "unhealthy"
+	}
+	return parseStatusHealth(status)
+}
+
+func parseStatusHealth(status string) string {
+	switch {
+	case strings.Contains(status, "(health: unhealthy)") || strings.Contains(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(status, "(health: starting)") || strings.Contains(status, "(starting)"):
+		return "starting"
+	case strings.Contains(status, "(health: none)") || strings.Contains(status, "(health: no healthcheck)"):
+		return "none"
+	default:
+		return ""
+	}
 }
 
 func matchingDockerContainers(service core.Service, containers []dockerContainer) []dockerContainer {
@@ -533,15 +559,16 @@ func composeProjectName(service core.Service) string {
 }
 
 type dockerContainer struct {
-	ID          string            `json:"Id"`
-	Names       []string          `json:"Names"`
-	Image       string            `json:"Image"`
-	ImageID     string            `json:"ImageID"`
-	RepoDigests []string          `json:"RepoDigests"`
-	Labels      map[string]string `json:"Labels"`
-	State       string            `json:"State"`
-	Status      string            `json:"Status"`
-	Health      string            `json:"Health"`
+	ID           string            `json:"Id"`
+	Names        []string          `json:"Names"`
+	Image        string            `json:"Image"`
+	ImageID      string            `json:"ImageID"`
+	RepoDigests  []string          `json:"RepoDigests"`
+	Labels       map[string]string `json:"Labels"`
+	State        string            `json:"State"`
+	Status       string            `json:"Status"`
+	RestartCount int               `json:"RestartCount"`
+	Health       string            `json:"Health"`
 }
 
 func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
@@ -552,15 +579,16 @@ func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
 			names = []string{status.Name}
 		}
 		containers = append(containers, dockerContainer{
-			ID:          status.ID,
-			Names:       names,
-			Image:       status.Image,
-			ImageID:     status.ImageID,
-			RepoDigests: status.RepoDigests,
-			Labels:      status.Labels,
-			State:       status.State,
-			Status:      status.Status,
-			Health:      status.Health,
+			ID:           status.ID,
+			Names:        names,
+			Image:        status.Image,
+			ImageID:      status.ImageID,
+			RepoDigests:  status.RepoDigests,
+			Labels:       status.Labels,
+			State:        status.State,
+			Status:       status.Status,
+			Health:       status.Health,
+			RestartCount: status.RestartCount,
 		})
 	}
 	return containers

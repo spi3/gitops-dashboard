@@ -18,10 +18,60 @@ const fixtureContainers = [
     Names: ["/fixture-web-1"],
     Image: "example/web:v1",
     State: "running",
-    Status: "Up 5 minutes"
+    Status: "Up 5 minutes",
+    RestartCount: 1
+  },
+  {
+    Id: "container-api",
+    Names: ["/fixture-api-1"],
+    Image: "example/api:v2",
+    State: "running",
+    Status: "Up 2 minutes (unhealthy)",
+    RestartCount: 5
+  },
+  {
+    Id: "container-cache",
+    Names: ["/fixture-cache-1"],
+    Image: "example/cache:v3",
+    State: "running",
+    Status: "Up 1 minute (health: starting)",
+    RestartCount: 0
+  },
+  {
+    Id: "container-paused",
+    Names: ["/fixture-paused-1"],
+    Image: "example/paused:v4",
+    State: "paused",
+    Status: "Up 2 minutes",
+    RestartCount: 2
   }
 ];
-const expectedRunningCount = fixtureContainers.filter((container) => container.State === "running").length;
+const inferContainerHealth = (container: { State: string; Status: string }) => {
+  const state = container.State.toLowerCase();
+  const status = container.Status.toLowerCase();
+  if (state === "running") {
+    if (status.includes("(unhealthy)") || status.includes("(health: unhealthy)")) {
+      return "unhealthy";
+    }
+    if (status.includes("(starting)") || status.includes("(health: starting)")) {
+      return "starting";
+    }
+    if (status.includes("(health: none)") || status.includes("(health: no healthcheck)")) {
+      return "none";
+    }
+    return "healthy";
+  }
+  if (state === "restarting") {
+    return "starting";
+  }
+  if (state === "paused") {
+    return "degraded";
+  }
+  return "unhealthy";
+};
+const expectedRunningCount = fixtureContainers.filter((container) =>
+  container.State === "running" && inferContainerHealth(container) === "healthy"
+).length;
 const expectedContainerTally = `${expectedRunningCount} of ${fixtureContainers.length} running`;
 
 const agentToken = "e2e-agent-token";
@@ -176,9 +226,25 @@ test("agents tab shows connected and never-connected agents without losing the s
   await reportingCard.click();
   const drawer = page.getByRole("dialog");
   await expect(drawer.getByRole("heading", { name: reportingTarget })).toBeVisible();
-  await expect(drawer.locator(".containerName strong")).toHaveText(fixtureContainers[0].Names[0]);
-  await expect(drawer.locator(".containerImage")).toHaveText(fixtureContainers[0].Image);
+  const healthyContainerRow = drawer.getByRole("listitem").filter({ hasText: fixtureContainers[0].Names[0] });
+  await expect(healthyContainerRow.locator(".containerName strong")).toHaveText(fixtureContainers[0].Names[0]);
+  await expect(healthyContainerRow.locator(".containerImage")).toHaveText(fixtureContainers[0].Image);
   await expect(drawer.locator(".containerList li")).toHaveCount(fixtureContainers.length);
+  await expect(drawer.getByRole("listitem").filter({ hasText: fixtureContainers[1].Names[0] }).locator(".stateWord")).toHaveText(
+    "Unhealthy"
+  );
+  await expect(drawer.getByRole("listitem").filter({ hasText: fixtureContainers[1].Names[0] }).locator(".containerRestarts")).toHaveText(
+    "5 restarts"
+  );
+  await expect(
+    drawer.getByRole("listitem").filter({ hasText: fixtureContainers[2].Names[0] }).locator(".stateWord")
+  ).toHaveText("Starting");
+  await expect(
+    drawer.getByRole("listitem").filter({ hasText: fixtureContainers[2].Names[0] }).locator(".containerRestarts")
+  ).toHaveText("0 restarts");
+  const pausedContainerRow = drawer.getByRole("listitem").filter({ hasText: fixtureContainers[3].Names[0] });
+  await expect(pausedContainerRow.locator(".stateWord")).toHaveText("Paused");
+  await expect(pausedContainerRow.locator(".stateWord")).toHaveClass(/degraded/);
   await page.keyboard.press("Escape");
   await expect(drawer).toBeHidden();
 

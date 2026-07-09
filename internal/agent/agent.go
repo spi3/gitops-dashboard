@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
@@ -69,15 +70,64 @@ func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessa
 			repoDigests = imageInspector.repoDigests(ctx, item)
 		}
 		message.Containers = append(message.Containers, core.ContainerStatus{
-			ID:          item.ID,
-			Name:        name,
-			Image:       item.Image,
-			ImageID:     item.ImageID,
-			RepoDigests: repoDigests,
-			Labels:      core.FilterDockerComposeLabels(item.Labels),
-			State:       item.State,
-			Status:      item.Status,
+			ID:           item.ID,
+			Name:         name,
+			Image:        item.Image,
+			ImageID:      item.ImageID,
+			RepoDigests:  repoDigests,
+			Labels:       core.FilterDockerComposeLabels(item.Labels),
+			State:        item.State,
+			Status:       item.Status,
+			Health:       inferContainerHealth(item.State, item.Status),
+			RestartCount: item.RestartCount,
 		})
 	}
 	return message, nil
+}
+
+func inferContainerHealth(state, status string) string {
+	normalizedState := strings.ToLower(strings.TrimSpace(state))
+	normalizedStatus := strings.ToLower(strings.TrimSpace(status))
+	switch normalizedState {
+	case "restarting":
+		return "starting"
+	case "running":
+		if health := containerHealthFromStatus(normalizedStatus); health != "" {
+			return health
+		}
+		return "healthy"
+	case "paused":
+		return "starting"
+	case "":
+		if strings.HasPrefix(normalizedStatus, "up") {
+			if health := containerHealthFromStatus(normalizedStatus); health != "" {
+				return health
+			}
+			return "healthy"
+		}
+		if strings.HasPrefix(normalizedStatus, "restarting") {
+			return "starting"
+		}
+	}
+	if normalizedState == "exited" {
+		return "unhealthy"
+	}
+
+	if health := containerHealthFromStatus(normalizedStatus); health == "unhealthy" || health == "starting" || health == "none" {
+		return health
+	}
+	return "unhealthy"
+}
+
+func containerHealthFromStatus(status string) string {
+	switch {
+	case strings.Contains(status, "(health: unhealthy)") || strings.Contains(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(status, "(health: starting)") || strings.Contains(status, "(starting)"):
+		return "starting"
+	case strings.Contains(status, "(health: none)") || strings.Contains(status, "(health: no healthcheck)"):
+		return "none"
+	default:
+		return ""
+	}
 }

@@ -66,6 +66,16 @@ func TestDockerHealthUsesHealthcheckState(t *testing.T) {
 	if health != core.HealthDegraded {
 		t.Fatalf("health=%s, want degraded", health)
 	}
+	health, _ = dockerHealth(service, []dockerContainer{{
+		Names:  []string{"/stack-web-1"},
+		Image:  "example/web:v1",
+		Labels: map[string]string{dockerComposeServiceLabel: "web"},
+		State:  "paused",
+		Status: "Up 1 minute",
+	}})
+	if health != core.HealthDegraded {
+		t.Fatalf("health=%s, want degraded for paused state", health)
+	}
 }
 
 func TestApplyAgentReportPersistsMatchingComposeStatuses(t *testing.T) {
@@ -850,6 +860,133 @@ func TestDockerObservedImagesIgnoreStoppedMatchingContainers(t *testing.T) {
 	}
 	if inspectedImages["sha256:current"] != 1 {
 		t.Fatalf("inspected images = %#v, want one current image inspect", inspectedImages)
+	}
+}
+
+func TestApplyAgentReportProjectsContainerHealthToServiceStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	services := []core.Service{
+		{
+			ID:           "serenity-healthy",
+			Name:         "web",
+			Repository:   "kube",
+			SourceCommit: "abc123",
+			SourcePath:   "docker_files/serenity/web/docker-compose.yml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+		},
+		{
+			ID:           "serenity-starting",
+			Name:         "worker",
+			Repository:   "kube",
+			SourceCommit: "abc123",
+			SourcePath:   "docker_files/serenity/worker/docker-compose.yml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+		},
+		{
+			ID:           "serenity-bad",
+			Name:         "api",
+			Repository:   "kube",
+			SourceCommit: "abc123",
+			SourcePath:   "docker_files/serenity/api/docker-compose.yml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+		},
+		{
+			ID:           "serenity-restarting",
+			Name:         "batch",
+			Repository:   "kube",
+			SourceCommit: "abc123",
+			SourcePath:   "docker_files/serenity/batch/docker-compose.yml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+		},
+		{
+			ID:           "serenity-paused",
+			Name:         "cache",
+			Repository:   "kube",
+			SourceCommit: "abc123",
+			SourcePath:   "docker_files/serenity/cache/docker-compose.yml",
+			Runtime:      "compose",
+			Health:       core.HealthUnknown,
+		},
+	}
+	scanID, err := store.StartScan(ctx, "kube")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "kube", "abc123", services, nil); err != nil {
+		t.Fatal(err)
+	}
+	monitor := New(config.Config{}, store, slog.Default())
+	err = monitor.ApplyAgentReport(ctx, core.AgentMessage{
+		Target:    "serenity",
+		CheckedAt: time.Date(2026, 7, 8, 14, 0, 0, 0, time.UTC),
+		Containers: []core.ContainerStatus{
+			{
+				Name:   "/stack-web-1",
+				Image:  "example/web:v1",
+				State:  "running",
+				Status: "Up 2 minutes",
+			},
+			{
+				Name:   "/stack-worker-1",
+				Image:  "example/worker:v1",
+				State:  "running",
+				Status: "Up 2 minutes (health: starting)",
+			},
+			{
+				Name:   "/stack-api-1",
+				Image:  "example/api:v1",
+				State:  "running",
+				Status: "Up 2 minutes (unhealthy)",
+			},
+			{
+				Name:   "/stack-batch-1",
+				Image:  "example/batch:v1",
+				State:  "restarting",
+				Status: "Restarting (1) 4 seconds ago",
+			},
+			{
+				Name:   "/stack-cache-1",
+				Image:  "example/cache:v1",
+				State:  "paused",
+				Status: "Up 1 minute",
+			},
+		},
+	}, []string{"serenity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byService := map[string]core.StatusResult{}
+	for _, status := range statuses {
+		byService[status.ServiceID] = status
+	}
+	if byService["serenity-healthy"].Health != core.HealthHealthy {
+		t.Fatalf("serenity-healthy status = %#v, want healthy", byService["serenity-healthy"])
+	}
+	if byService["serenity-starting"].Health != core.HealthDegraded {
+		t.Fatalf("serenity-starting status = %#v, want degraded", byService["serenity-starting"])
+	}
+	if byService["serenity-bad"].Health != core.HealthUnhealthy {
+		t.Fatalf("serenity-bad status = %#v, want unhealthy", byService["serenity-bad"])
+	}
+	if byService["serenity-restarting"].Health != core.HealthDegraded {
+		t.Fatalf("serenity-restarting status = %#v, want degraded", byService["serenity-restarting"])
+	}
+	if byService["serenity-paused"].Health != core.HealthDegraded {
+		t.Fatalf("serenity-paused status = %#v, want degraded", byService["serenity-paused"])
 	}
 }
 

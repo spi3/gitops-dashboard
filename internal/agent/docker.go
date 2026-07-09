@@ -12,14 +12,15 @@ import (
 )
 
 type dockerContainer struct {
-	ID          string            `json:"Id"`
-	Names       []string          `json:"Names"`
-	Image       string            `json:"Image"`
-	ImageID     string            `json:"ImageID"`
-	RepoDigests []string          `json:"RepoDigests"`
-	Labels      map[string]string `json:"Labels"`
-	State       string            `json:"State"`
-	Status      string            `json:"Status"`
+	ID           string            `json:"Id"`
+	Names        []string          `json:"Names"`
+	Image        string            `json:"Image"`
+	ImageID      string            `json:"ImageID"`
+	RepoDigests  []string          `json:"RepoDigests"`
+	Labels       map[string]string `json:"Labels"`
+	State        string            `json:"State"`
+	Status       string            `json:"Status"`
+	RestartCount int               `json:"RestartCount"`
 }
 
 func listDockerContainers(ctx context.Context, host string) ([]dockerContainer, error) {

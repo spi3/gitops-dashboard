@@ -928,9 +928,7 @@ function AgentDrawer({ agent, onClose }: { agent: AgentInfo; onClose: () => void
                     </div>
                     <span className={`stateWord ${containerTone(container)}`}>{containerWord(container)}</span>
                   </div>
-                  {container.restartCount > 0 ? (
-                    <p className="containerRestarts">{container.restartCount} {plural(container.restartCount, "restart")}</p>
-                  ) : null}
+                  <p className="containerRestarts">{container.restartCount} {plural(container.restartCount, "restart")}</p>
                 </li>
               ))}
             </ul>
@@ -966,7 +964,7 @@ function agentConnection(agent: AgentInfo): AgentConnection {
 }
 
 function isContainerRunning(container: ContainerStatus): boolean {
-  return container.state === "running" && container.health !== "unhealthy";
+  return container.state === "running" && container.health !== "unhealthy" && container.health !== "starting";
 }
 
 function agentCardTone(connection: AgentConnection, containers: ContainerStatus[]): Health {
@@ -1010,10 +1008,16 @@ function containerTally(containers: ContainerStatus[]): string {
 }
 
 function containerTone(container: ContainerStatus): Health {
+  if (container.health === "starting") {
+    return "degraded";
+  }
   if (!isContainerRunning(container)) {
+    if (container.state === "paused" || container.state === "restarting") {
+      return "degraded";
+    }
     return "unhealthy";
   }
-  return container.health === "starting" ? "degraded" : "healthy";
+  return "healthy";
 }
 
 function containerWord(container: ContainerStatus): string {
@@ -1025,6 +1029,9 @@ function containerWord(container: ContainerStatus): string {
   }
   if (container.health === "starting") {
     return "Starting";
+  }
+  if (container.health === "none") {
+    return "No healthcheck";
   }
   return "Running";
 }
