@@ -75,7 +75,7 @@ func TestKubernetesStatusMappingWithFakeClient(t *testing.T) {
 	if err := monitor.checkKubernetesWithClient(ctx, config.KubernetesTarget{Name: "cluster"}, services, client); err != nil {
 		t.Fatal(err)
 	}
-	if kubeHealth(map[string]any{"status": map[string]any{"replicas": int64(2), "readyReplicas": int64(1)}}) != core.HealthDegraded {
+	if health, _ := kubeHealth("Deployment", map[string]any{"status": map[string]any{"replicas": int64(2), "readyReplicas": int64(1)}}); health != core.HealthDegraded {
 		t.Fatal("expected degraded health for partially ready workload")
 	}
 	if _, ok := gvrForKind("Deployment"); !ok {
@@ -93,6 +93,108 @@ func TestKubernetesStatusMappingWithFakeClient(t *testing.T) {
 	}
 	if statuses[0].ObservedImages[0].RepoDigests[0].Digest != "sha256:release" {
 		t.Fatalf("observed image digests = %#v, want pod status imageID digest", statuses[0].ObservedImages)
+	}
+}
+
+func TestKubernetesWorkloadHealthByKind(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		kind   string
+		object map[string]any
+		want   core.HealthState
+	}{
+		{
+			name:   "healthy DaemonSet",
+			kind:   "DaemonSet",
+			object: testDaemonSet("node-agent", "prod", map[string]string{"app": "node-agent"}, 3, 3, 3, 3, 0).Object,
+			want:   core.HealthHealthy,
+		},
+		{
+			name:   "unhealthy DaemonSet",
+			kind:   "DaemonSet",
+			object: testDaemonSet("node-agent", "prod", map[string]string{"app": "node-agent"}, 3, 0, 0, 0, 0).Object,
+			want:   core.HealthUnhealthy,
+		},
+		{
+			name:   "healthy StatefulSet",
+			kind:   "StatefulSet",
+			object: testStatefulSet("db", "prod", map[string]string{"app": "db"}, 2, 2).Object,
+			want:   core.HealthHealthy,
+		},
+		{
+			name:   "degraded StatefulSet",
+			kind:   "StatefulSet",
+			object: testStatefulSet("db", "prod", map[string]string{"app": "db"}, 3, 1).Object,
+			want:   core.HealthDegraded,
+		},
+		{
+			name:   "completed Job",
+			kind:   "Job",
+			object: testJob("backup", "prod", int64(1), int64(1), 0, 0, "Complete").Object,
+			want:   core.HealthHealthy,
+		},
+		{
+			name:   "failed Job",
+			kind:   "Job",
+			object: testJob("backup", "prod", int64(1), 0, int64(1), 0, "Failed").Object,
+			want:   core.HealthUnhealthy,
+		},
+		{
+			name:   "successful CronJob",
+			kind:   "CronJob",
+			object: testCronJob("backup", "prod", "2026-07-08T10:00:00Z", "2026-07-08T10:01:00Z", 0).Object,
+			want:   core.HealthHealthy,
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, message := kubeHealth(tc.kind, tc.object)
+			if got != tc.want {
+				t.Fatalf("health = %s, want %s; message=%q", got, tc.want, message)
+			}
+		})
+	}
+}
+
+func TestKubernetesUnsupportedKindPersistsNotApplicable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	services := []core.Service{{
+		ID:           "svc",
+		Name:         "plex-release",
+		Runtime:      "kubernetes",
+		Kind:         "HelmRelease",
+		Namespace:    "plex",
+		ResourceName: "plex-release",
+	}}
+	client := fake.NewSimpleDynamicClient(runtime.NewScheme())
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkKubernetesWithClient(ctx, config.KubernetesTarget{Name: "cluster"}, services, client); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gvrForKind("HelmRelease"); ok {
+		t.Fatal("HelmRelease should be explicit not supported, not queried as a native workload")
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %#v, want one explicit unsupported status", statuses)
+	}
+	if statuses[0].Health != core.HealthNotApplicable {
+		t.Fatalf("health = %s, want not_applicable", statuses[0].Health)
+	}
+	if !strings.Contains(statuses[0].Message, "not supported") || !strings.Contains(statuses[0].Message, "HelmRelease") {
+		t.Fatalf("message = %q, want unsupported HelmRelease explanation", statuses[0].Message)
 	}
 }
 
@@ -319,6 +421,98 @@ func testDeployment(name, namespace string, selector map[string]string, replicas
 			"replicas":          replicas,
 			"readyReplicas":     replicas,
 			"availableReplicas": replicas,
+		},
+	}}
+}
+
+func testStatefulSet(name, namespace string, selector map[string]string, replicas, readyReplicas int64) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "StatefulSet",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": map[string]any{
+			"replicas": replicas,
+			"selector": map[string]any{
+				"matchLabels": stringMapAny(selector),
+			},
+		},
+		"status": map[string]any{
+			"replicas":      replicas,
+			"readyReplicas": readyReplicas,
+		},
+	}}
+}
+
+func testDaemonSet(name, namespace string, selector map[string]string, desired, ready, available, updated, misscheduled int64) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "DaemonSet",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": map[string]any{
+			"selector": map[string]any{
+				"matchLabels": stringMapAny(selector),
+			},
+		},
+		"status": map[string]any{
+			"desiredNumberScheduled": desired,
+			"numberReady":            ready,
+			"numberAvailable":        available,
+			"updatedNumberScheduled": updated,
+			"numberMisscheduled":     misscheduled,
+		},
+	}}
+}
+
+func testJob(name, namespace string, completions, succeeded, failed, active int64, conditionType string) *unstructured.Unstructured {
+	conditions := []any{}
+	if conditionType != "" {
+		conditions = append(conditions, map[string]any{
+			"type":   conditionType,
+			"status": "True",
+		})
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": map[string]any{
+			"completions": completions,
+		},
+		"status": map[string]any{
+			"succeeded":  succeeded,
+			"failed":     failed,
+			"active":     active,
+			"conditions": conditions,
+		},
+	}}
+}
+
+func testCronJob(name, namespace, lastSchedule, lastSuccessful string, active int) *unstructured.Unstructured {
+	activeJobs := []any{}
+	for i := 0; i < active; i++ {
+		activeJobs = append(activeJobs, map[string]any{"name": name})
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "CronJob",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": namespace,
+		},
+		"spec": map[string]any{},
+		"status": map[string]any{
+			"active":             activeJobs,
+			"lastScheduleTime":   lastSchedule,
+			"lastSuccessfulTime": lastSuccessful,
 		},
 	}}
 }

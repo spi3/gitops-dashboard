@@ -512,8 +512,18 @@ func (monitor Monitor) checkKubernetesWithClient(ctx context.Context, target con
 		if service.Runtime != "kubernetes" {
 			continue
 		}
+		status := core.StatusResult{
+			ServiceID: service.ID,
+			Target:    target.Name,
+			CheckedAt: time.Now().UTC(),
+		}
 		gvr, ok := gvrForKind(service.Kind)
 		if !ok {
+			status.Health = core.HealthNotApplicable
+			status.Message = unsupportedKubernetesKindMessage(service.Kind)
+			if err := monitor.store.UpsertStatus(ctx, status); err != nil {
+				return err
+			}
 			continue
 		}
 		namespace := service.Namespace
@@ -521,17 +531,12 @@ func (monitor Monitor) checkKubernetesWithClient(ctx context.Context, target con
 			namespace = "default"
 		}
 		resource, err := clientset.Resource(gvr).Namespace(namespace).Get(ctx, service.ResourceName, metav1.GetOptions{})
-		status := core.StatusResult{
-			ServiceID: service.ID,
-			Target:    target.Name,
-			CheckedAt: time.Now().UTC(),
-		}
 		if err != nil {
 			status.Health = core.HealthError
 			status.Message = err.Error()
 		} else {
-			status.Health = kubeHealth(resource.Object)
-			status.Message = fmt.Sprintf("%s/%s found", service.Kind, service.ResourceName)
+			status.Health, status.Message = kubeHealth(service.Kind, resource.Object)
+			status.Message = fmt.Sprintf("%s/%s found: %s", service.Kind, service.ResourceName, status.Message)
 			observedImages, err := observedKubernetesImages(ctx, clientset, target.Name, namespace, resource.Object)
 			if err != nil {
 				status.Message = fmt.Sprintf("%s; image metadata unavailable: %v", status.Message, err)
@@ -554,6 +559,10 @@ func gvrForKind(kind string) (schema.GroupVersionResource, bool) {
 		return schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}, true
 	case "DaemonSet":
 		return schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}, true
+	case "Job":
+		return schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}, true
+	case "CronJob":
+		return schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"}, true
 	default:
 		return schema.GroupVersionResource{}, false
 	}
@@ -563,21 +572,220 @@ func podGVR() schema.GroupVersionResource {
 	return schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 }
 
-func kubeHealth(object map[string]any) core.HealthState {
+func unsupportedKubernetesKindMessage(kind string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return "Kubernetes live monitoring not supported for resources without a kind"
+	}
+	return fmt.Sprintf("Kubernetes live monitoring not supported for %s resources", kind)
+}
+
+func kubeHealth(kind string, object map[string]any) (core.HealthState, string) {
+	switch kind {
+	case "Deployment":
+		return deploymentHealth(object)
+	case "StatefulSet":
+		return statefulSetHealth(object)
+	case "DaemonSet":
+		return daemonSetHealth(object)
+	case "Job":
+		return jobHealth(object)
+	case "CronJob":
+		return cronJobHealth(object)
+	default:
+		return core.HealthNotApplicable, unsupportedKubernetesKindMessage(kind)
+	}
+}
+
+func deploymentHealth(object map[string]any) (core.HealthState, string) {
 	status, _ := object["status"].(map[string]any)
+	desired, ok := desiredReplicas(object, status)
+	if !ok {
+		return core.HealthUnknown, "Deployment desired replica count unavailable"
+	}
+	current := number(status["replicas"])
 	ready := number(status["readyReplicas"])
 	available := number(status["availableReplicas"])
-	desired := number(status["replicas"])
+	message := fmt.Sprintf("Deployment ready %.0f/%.0f replicas, available %.0f", ready, desired, available)
 	if desired == 0 {
-		return core.HealthUnknown
+		if current == 0 {
+			return core.HealthHealthy, message
+		}
+		return core.HealthDegraded, message
 	}
 	if ready >= desired || available >= desired {
-		return core.HealthHealthy
+		return core.HealthHealthy, message
 	}
 	if ready > 0 || available > 0 {
-		return core.HealthDegraded
+		return core.HealthDegraded, message
 	}
-	return core.HealthUnhealthy
+	return core.HealthUnhealthy, message
+}
+
+func statefulSetHealth(object map[string]any) (core.HealthState, string) {
+	status := kubeMap(object["status"])
+	desired, ok := desiredReplicas(object, status)
+	if !ok {
+		return core.HealthUnknown, "StatefulSet desired replica count unavailable"
+	}
+	current := number(status["replicas"])
+	ready := number(status["readyReplicas"])
+	message := fmt.Sprintf("StatefulSet ready %.0f/%.0f replicas, current %.0f", ready, desired, current)
+	if desired == 0 {
+		if current == 0 {
+			return core.HealthHealthy, message
+		}
+		return core.HealthDegraded, message
+	}
+	if ready >= desired {
+		return core.HealthHealthy, message
+	}
+	if ready > 0 {
+		return core.HealthDegraded, message
+	}
+	return core.HealthUnhealthy, message
+}
+
+func daemonSetHealth(object map[string]any) (core.HealthState, string) {
+	status := kubeMap(object["status"])
+	desired, hasDesired := numberField(status, "desiredNumberScheduled")
+	if !hasDesired {
+		return core.HealthUnknown, "DaemonSet desired scheduled count unavailable"
+	}
+	ready := number(status["numberReady"])
+	available, hasAvailable := numberField(status, "numberAvailable")
+	updated, hasUpdated := numberField(status, "updatedNumberScheduled")
+	misscheduled := number(status["numberMisscheduled"])
+	message := fmt.Sprintf("DaemonSet ready %.0f/%.0f scheduled", ready, desired)
+	if hasAvailable {
+		message += fmt.Sprintf(", available %.0f", available)
+	}
+	if hasUpdated {
+		message += fmt.Sprintf(", updated %.0f", updated)
+	}
+	if misscheduled > 0 {
+		message += fmt.Sprintf(", misscheduled %.0f", misscheduled)
+	}
+	if desired == 0 {
+		if misscheduled > 0 {
+			return core.HealthUnhealthy, message
+		}
+		return core.HealthHealthy, message
+	}
+	if ready >= desired {
+		if misscheduled > 0 {
+			return core.HealthDegraded, message
+		}
+		if hasAvailable && available < desired {
+			return core.HealthDegraded, message
+		}
+		if hasUpdated && updated < desired {
+			return core.HealthDegraded, message
+		}
+		return core.HealthHealthy, message
+	}
+	if ready > 0 || (hasAvailable && available > 0) || (hasUpdated && updated > 0) {
+		return core.HealthDegraded, message
+	}
+	return core.HealthUnhealthy, message
+}
+
+func jobHealth(object map[string]any) (core.HealthState, string) {
+	status := kubeMap(object["status"])
+	spec := kubeMap(object["spec"])
+	completions := number(spec["completions"])
+	if completions == 0 {
+		completions = 1
+	}
+	succeeded := number(status["succeeded"])
+	failed := number(status["failed"])
+	active := number(status["active"])
+	message := fmt.Sprintf("Job succeeded %.0f/%.0f, failed %.0f, active %.0f", succeeded, completions, failed, active)
+	if conditionTrue(status, "Complete") || succeeded >= completions {
+		return core.HealthHealthy, message
+	}
+	if conditionTrue(status, "Failed") {
+		return core.HealthUnhealthy, message
+	}
+	if active > 0 || succeeded > 0 {
+		return core.HealthDegraded, message
+	}
+	if failed > 0 {
+		return core.HealthDegraded, message
+	}
+	return core.HealthUnknown, message
+}
+
+func cronJobHealth(object map[string]any) (core.HealthState, string) {
+	status := kubeMap(object["status"])
+	spec := kubeMap(object["spec"])
+	if suspended, ok := kubeBool(spec["suspend"]); ok && suspended {
+		return core.HealthDegraded, "CronJob is suspended"
+	}
+	active := len(kubeList(status["active"]))
+	lastSchedule, hasLastSchedule := kubeTime(status["lastScheduleTime"])
+	lastSuccess, hasLastSuccess := kubeTime(status["lastSuccessfulTime"])
+	if active > 0 {
+		if hasLastSuccess {
+			return core.HealthDegraded, fmt.Sprintf("CronJob has %d active job(s), last successful at %s", active, formatKubeTime(lastSuccess))
+		}
+		return core.HealthDegraded, fmt.Sprintf("CronJob has %d active job(s), no successful run recorded", active)
+	}
+	if hasLastSuccess && (!hasLastSchedule || !lastSuccess.Before(lastSchedule)) {
+		return core.HealthHealthy, fmt.Sprintf("CronJob last successful at %s", formatKubeTime(lastSuccess))
+	}
+	if hasLastSchedule {
+		if hasLastSuccess {
+			return core.HealthUnhealthy, fmt.Sprintf("CronJob last scheduled at %s, last successful at %s", formatKubeTime(lastSchedule), formatKubeTime(lastSuccess))
+		}
+		return core.HealthUnhealthy, fmt.Sprintf("CronJob last scheduled at %s with no successful run recorded", formatKubeTime(lastSchedule))
+	}
+	return core.HealthUnknown, "CronJob has not scheduled a job yet"
+}
+
+func desiredReplicas(object map[string]any, status map[string]any) (float64, bool) {
+	if spec := kubeMap(object["spec"]); len(spec) > 0 {
+		if desired, ok := numberField(spec, "replicas"); ok {
+			return desired, true
+		}
+	}
+	return numberField(status, "replicas")
+}
+
+func conditionTrue(status map[string]any, conditionType string) bool {
+	for _, item := range kubeList(status["conditions"]) {
+		condition := kubeMap(item)
+		if kubeString(condition["type"]) != conditionType {
+			continue
+		}
+		value, ok := kubeBool(condition["status"])
+		if ok && value {
+			return true
+		}
+	}
+	return false
+}
+
+func formatKubeTime(value time.Time) string {
+	return value.UTC().Format(time.RFC3339)
+}
+
+func kubeTime(value any) (time.Time, bool) {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed.UTC(), true
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return time.Time{}, false
+		}
+		parsed, err := time.Parse(time.RFC3339, typed)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return parsed.UTC(), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 func observedKubernetesImages(ctx context.Context, clientset dynamic.Interface, target, namespace string, object map[string]any) ([]core.ObservedImage, error) {
@@ -727,15 +935,56 @@ func kubeStringSlice(value any) []string {
 	return result
 }
 
+func kubeBool(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
+func numberField(values map[string]any, field string) (float64, bool) {
+	if values == nil {
+		return 0, false
+	}
+	value, ok := values[field]
+	if !ok {
+		return 0, false
+	}
+	return kubeNumber(value)
+}
+
 func number(value any) float64 {
+	result, _ := kubeNumber(value)
+	return result
+}
+
+func kubeNumber(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case int64:
-		return float64(typed)
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
 	case int:
-		return float64(typed)
+		return float64(typed), true
 	case float64:
-		return typed
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case json.Number:
+		result, err := typed.Float64()
+		return result, err == nil
 	default:
-		return 0
+		return 0, false
 	}
 }
