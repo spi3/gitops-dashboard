@@ -122,7 +122,12 @@ Agent mode validates only the `agent` section, so server-only `auth`,
 
 Agent reports appear on the dashboard's Agents tab with connection state and
 reported container state. Reports from configured `kind: agent` Docker targets
-also feed per-service health and uptime rows for matching Compose services.
+also feed per-service health and uptime rows only when a Compose service can be
+bound to that target by source path (`docker_files/<target>/...`, where
+`<target>` is the configured target name). Incoming agent report rows carry
+normalized `health` and `restartCount` values, so per-service status uses the
+same normalized container semantics used by the dashboard's direct docker status
+mapping.
 Per-service dashboard health can also be produced by direct Docker Engine
 targets, HTTP route checks, Kubernetes targets, and host ping targets.
 

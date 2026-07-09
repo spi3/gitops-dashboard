@@ -146,7 +146,12 @@ configuration, target binding, and the full agent config shape are documented in
 
 Agent reports appear on the dashboard's Agents tab with connection state and
 reported container state. Reports from configured `kind: agent` Docker targets
-also feed per-service health and uptime rows for matching Compose services.
+also feed per-service health and uptime rows only when a Compose service can be
+bound to that target by source path (`docker_files/<target>/...`, where
+`<target>` is the configured Docker target name).  
+Incoming agent report rows include normalized `health` and `restartCount` fields
+so service health uses the same normalized container semantics as server-side
+docker checks.
 Dashboard health rows can also come from direct Docker Engine targets, HTTP
 route checks, Kubernetes targets, and host ping targets.
 
