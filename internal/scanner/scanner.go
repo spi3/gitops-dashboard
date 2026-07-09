@@ -349,6 +349,7 @@ func (scanner Scanner) composeServices(repoName, commit, sourcePath string, proj
 	var services []core.Service
 	for _, svc := range project.Services {
 		warnings := append([]string{}, svc.Warnings...)
+		warnings = append(warnings, core.MutableImageWarnings([]string{svc.Image})...)
 		id := serviceID(repoName, "compose", sourcePath, svc.Name)
 		services = append(services, core.Service{
 			ID:           id,
@@ -379,6 +380,8 @@ func (scanner Scanner) kubeServices(repoName, commit string, resources []parser.
 		if !resource.IsWorkload() {
 			continue
 		}
+		warnings := append([]string{}, resource.Warnings...)
+		warnings = append(warnings, core.MutableImageWarnings(resource.Images)...)
 		id := serviceID(repoName, "kubernetes", resource.SourcePath, resource.Namespace+"/"+resource.Name)
 		services = append(services, core.Service{
 			ID:           id,
@@ -398,7 +401,7 @@ func (scanner Scanner) kubeServices(repoName, commit string, resources []parser.
 			Storage:      resource.Storage,
 			Exposure:     resource.Exposure,
 			ConfigRefs:   resource.ConfigRefs,
-			Warnings:     resource.Warnings,
+			Warnings:     warnings,
 		})
 	}
 	return services

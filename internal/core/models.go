@@ -33,34 +33,76 @@ type Scan struct {
 	Error      string `json:"error"`
 }
 
+type BuildInfo struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildDate string `json:"buildDate"`
+}
+
+type ImageVersionState string
+
+const (
+	ImageVersionMatching   ImageVersionState = "matching"
+	ImageVersionMismatched ImageVersionState = "mismatched"
+	ImageVersionUnknown    ImageVersionState = "unknown"
+	ImageVersionMutable    ImageVersionState = "mutable"
+)
+
+type ImageReference struct {
+	Original   string `json:"original"`
+	Registry   string `json:"registry"`
+	Repository string `json:"repository"`
+	Tag        string `json:"tag"`
+	Digest     string `json:"digest"`
+}
+
+type ObservedImage struct {
+	Target      string           `json:"target"`
+	Runtime     string           `json:"runtime"`
+	Reference   ImageReference   `json:"reference"`
+	ImageID     string           `json:"imageId"`
+	RepoDigests []ImageReference `json:"repoDigests"`
+}
+
+type ImageVersionCheck struct {
+	Desired  ImageReference    `json:"desired"`
+	Observed *ObservedImage    `json:"observed,omitempty"`
+	State    ImageVersionState `json:"state"`
+	Message  string            `json:"message"`
+}
+
 type Service struct {
-	ID            string      `json:"id"`
-	Name          string      `json:"name"`
-	Repository    string      `json:"repository"`
-	SourceCommit  string      `json:"sourceCommit"`
-	SourcePath    string      `json:"sourcePath"`
-	Runtime       string      `json:"runtime"`
-	Kind          string      `json:"kind"`
-	Namespace     string      `json:"namespace"`
-	ResourceName  string      `json:"resourceName"`
-	Environment   string      `json:"environment"`
-	Health        HealthState `json:"health"`
-	Images        []string    `json:"images"`
-	Ports         []string    `json:"ports"`
-	Dependencies  []string    `json:"dependencies"`
-	Storage       []string    `json:"storage"`
-	Exposure      []string    `json:"exposure"`
-	MonitorRoutes []string    `json:"monitorRoutes"`
-	ConfigRefs    []string    `json:"configRefs"`
-	Warnings      []string    `json:"warnings"`
+	ID                 string              `json:"id"`
+	Name               string              `json:"name"`
+	Repository         string              `json:"repository"`
+	SourceCommit       string              `json:"sourceCommit"`
+	SourcePath         string              `json:"sourcePath"`
+	Runtime            string              `json:"runtime"`
+	Kind               string              `json:"kind"`
+	Namespace          string              `json:"namespace"`
+	ResourceName       string              `json:"resourceName"`
+	Environment        string              `json:"environment"`
+	Health             HealthState         `json:"health"`
+	Images             []string            `json:"images"`
+	DesiredImages      []ImageReference    `json:"desiredImages"`
+	ImageVersionState  ImageVersionState   `json:"imageVersionState"`
+	ImageVersionChecks []ImageVersionCheck `json:"imageVersionChecks"`
+	Ports              []string            `json:"ports"`
+	Dependencies       []string            `json:"dependencies"`
+	Storage            []string            `json:"storage"`
+	Exposure           []string            `json:"exposure"`
+	MonitorRoutes      []string            `json:"monitorRoutes"`
+	ConfigRefs         []string            `json:"configRefs"`
+	Warnings           []string            `json:"warnings"`
 }
 
 type StatusResult struct {
-	ServiceID string      `json:"serviceId"`
-	Target    string      `json:"target"`
-	Health    HealthState `json:"health"`
-	Message   string      `json:"message"`
-	CheckedAt time.Time   `json:"checkedAt"`
+	ServiceID      string          `json:"serviceId"`
+	Target         string          `json:"target"`
+	Health         HealthState     `json:"health"`
+	Message        string          `json:"message"`
+	CheckedAt      time.Time       `json:"checkedAt"`
+	ObservedImages []ObservedImage `json:"observedImages"`
 }
 
 type UptimeSample struct {
@@ -84,6 +126,7 @@ type DashboardSummary struct {
 	Statuses     []StatusResult `json:"statuses"`
 	Uptime       []UptimeStat   `json:"uptime"`
 	Agents       []AgentInfo    `json:"agents"`
+	Version      BuildInfo      `json:"version"`
 	GeneratedAt  time.Time      `json:"generatedAt"`
 }
 
@@ -101,11 +144,13 @@ type AgentMessage struct {
 }
 
 type ContainerStatus struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Image        string `json:"image"`
-	State        string `json:"state"`
-	Status       string `json:"status"`
-	Health       string `json:"health"`
-	RestartCount int    `json:"restartCount"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Image        string   `json:"image"`
+	ImageID      string   `json:"imageId"`
+	RepoDigests  []string `json:"repoDigests"`
+	State        string   `json:"state"`
+	Status       string   `json:"status"`
+	Health       string   `json:"health"`
+	RestartCount int      `json:"restartCount"`
 }

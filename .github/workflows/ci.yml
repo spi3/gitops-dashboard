@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: read
@@ -39,10 +41,61 @@ jobs:
       - name: Run checks
         run: make check
 
+  build:
+    name: Build Container
+    needs: test
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare build metadata
+        id: buildmeta
+        shell: bash
+        run: |
+          created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          commit="$(git rev-parse HEAD)"
+          short_sha="${commit::12}"
+          echo "version=dev-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "created=${created}" >> "$GITHUB_OUTPUT"
+          echo "source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: gitops-dashboard:ci
+          build-args: |
+            VERSION=${{ steps.buildmeta.outputs.version }}
+            COMMIT=${{ steps.buildmeta.outputs.commit }}
+            BUILD_DATE=${{ steps.buildmeta.outputs.created }}
+            SOURCE=${{ steps.buildmeta.outputs.source }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.buildmeta.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.buildmeta.outputs.commit }}
+            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
+            org.opencontainers.image.source=${{ steps.buildmeta.outputs.source }}
+
+      - name: Verify image version metadata
+        shell: bash
+        run: |
+          output="$(docker run --rm gitops-dashboard:ci -version)"
+          echo "$output"
+          grep -F "${{ steps.buildmeta.outputs.version }}" <<< "$output"
+          grep -F "${{ steps.buildmeta.outputs.commit }}" <<< "$output"
+          grep -F "${{ steps.buildmeta.outputs.created }}" <<< "$output"
+
   publish:
     name: Publish Container
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,6 +104,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag ancestry
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch origin main
+          commit="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$commit" origin/main
+
+      - name: Prepare build metadata
+        id: buildmeta
+        shell: bash
+        run: |
+          created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          commit="$(git rev-parse HEAD)"
+          short_sha="${commit::12}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="dev-${short_sha}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "created=${created}" >> "$GITHUB_OUTPUT"
+          echo "source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -70,11 +149,24 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # Keep :latest controlled by the explicit main-only raw tag below;
+          # semver release tag pushes must not publish or overwrite :latest.
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern=v{{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.buildmeta.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.buildmeta.outputs.commit }}
+            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
+            org.opencontainers.image.source=${{ steps.buildmeta.outputs.source }}
 
       - name: Build and publish image
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -82,3 +174,21 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.buildmeta.outputs.version }}
+            COMMIT=${{ steps.buildmeta.outputs.commit }}
+            BUILD_DATE=${{ steps.buildmeta.outputs.created }}
+            SOURCE=${{ steps.buildmeta.outputs.source }}
+
+      - name: Write image summary
+        run: |
+          {
+            echo "## Published image"
+            echo "- Image: ghcr.io/${{ github.repository }}"
+            echo "- Tags:"
+            printf '%s\n' "${{ steps.meta.outputs.tags }}" | sed 's/^/  - /'
+            echo "- Digest: ${{ steps.push.outputs.digest }}"
+            echo "- Version: ${{ steps.buildmeta.outputs.version }}"
+            echo "- Commit: ${{ steps.buildmeta.outputs.commit }}"
+            echo "- Build timestamp: ${{ steps.buildmeta.outputs.created }}"
+          } >> "$GITHUB_STEP_SUMMARY"

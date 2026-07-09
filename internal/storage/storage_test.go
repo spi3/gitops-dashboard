@@ -38,7 +38,7 @@ func TestStorePersistsSummary(t *testing.T) {
 		Runtime:      "compose",
 		Environment:  "production",
 		Health:       core.HealthUnknown,
-		Images:       []string{"example/api:v1"},
+		Images:       []string{"example/api:v1.0.0"},
 		Warnings:     []string{"missing healthcheck"},
 	}}
 	if err := store.FinishScan(ctx, scanID, "repo", "abc123", services, nil); err != nil {
@@ -50,6 +50,9 @@ func TestStorePersistsSummary(t *testing.T) {
 		Health:    core.HealthHealthy,
 		Message:   "running",
 		CheckedAt: time.Date(2026, 6, 27, 16, 0, 0, 0, time.UTC),
+		ObservedImages: []core.ObservedImage{
+			core.NewObservedImage("local", "docker", "example/api:v1.0.0", "sha256:local", nil),
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -60,8 +63,14 @@ func TestStorePersistsSummary(t *testing.T) {
 	if len(summary.Repositories) != 1 || summary.Repositories[0].LastCommit != "abc123" {
 		t.Fatalf("repositories = %#v", summary.Repositories)
 	}
-	if len(summary.Services) != 1 || summary.Services[0].Images[0] != "example/api:v1" {
+	if len(summary.Services) != 1 || summary.Services[0].Images[0] != "example/api:v1.0.0" {
 		t.Fatalf("services = %#v", summary.Services)
+	}
+	if summary.Services[0].ImageVersionState != core.ImageVersionMatching {
+		t.Fatalf("image version state = %s, want matching; checks=%#v", summary.Services[0].ImageVersionState, summary.Services[0].ImageVersionChecks)
+	}
+	if len(summary.Statuses[0].ObservedImages) != 1 || summary.Statuses[0].ObservedImages[0].Reference.Tag != "v1.0.0" {
+		t.Fatalf("observed images = %#v, want persisted image metadata", summary.Statuses[0].ObservedImages)
 	}
 	if len(summary.Scans) != 1 || summary.Scans[0].CommitSHA != "abc123" {
 		t.Fatalf("scans = %#v", summary.Scans)
@@ -665,6 +674,71 @@ func TestSetMonitorNotApplicableRemovesTargetFromHealthAndUptime(t *testing.T) {
 	}
 	if statusByTarget[badTarget].Health != core.HealthUnknown {
 		t.Fatalf("re-enabled status = %#v, want unknown until next check", statusByTarget[badTarget])
+	}
+}
+
+func TestSetMonitorNotApplicableClearsImageVersionContribution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{
+		ID:          "svc-api",
+		Name:        "api",
+		Repository:  "repo",
+		SourcePath:  "prod/compose.yaml",
+		Runtime:     "compose",
+		Kind:        "Service",
+		Health:      core.HealthUnknown,
+		Images:      []string{"example/api:v1.0.0"},
+		Environment: "production",
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "prod/compose.yaml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	status := core.StatusResult{
+		ServiceID: "svc-api",
+		Target:    "docker",
+		Health:    core.HealthHealthy,
+		Message:   "running",
+		CheckedAt: time.Now().UTC(),
+		ObservedImages: []core.ObservedImage{
+			core.NewObservedImage("docker", "docker", "example/api:v1.0.0", "sha256:api", nil),
+		},
+	}
+	if err := store.UpsertStatus(ctx, status); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc-api", "docker", true); err != nil {
+		t.Fatal(err)
+	}
+	status.Message = "running after override"
+	status.CheckedAt = status.CheckedAt.Add(time.Minute)
+	if err := store.UpsertStatus(ctx, status); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Services[0].ImageVersionState != core.ImageVersionUnknown {
+		t.Fatalf("image version state = %s, want unknown; checks=%#v", summary.Services[0].ImageVersionState, summary.Services[0].ImageVersionChecks)
+	}
+	if len(summary.Services[0].ImageVersionChecks) != 1 || summary.Services[0].ImageVersionChecks[0].Observed != nil {
+		t.Fatalf("image checks = %#v, want no observed image contribution", summary.Services[0].ImageVersionChecks)
+	}
+	statusByTarget := map[string]core.StatusResult{}
+	for _, item := range summary.Statuses {
+		statusByTarget[item.Target] = item
+	}
+	if statusByTarget["docker"].Health != core.HealthNotApplicable {
+		t.Fatalf("docker status = %#v, want not_applicable", statusByTarget["docker"])
+	}
+	if len(statusByTarget["docker"].ObservedImages) != 0 {
+		t.Fatalf("observed images = %#v, want cleared on override", statusByTarget["docker"].ObservedImages)
 	}
 }
 

@@ -32,7 +32,7 @@ status board.
 | TASK-0012 | Done | P0 | MVP Hardening | End-to-end MVP validation and documentation sweep | `docs/tasks/TASK-0012-mvp-validation-and-doc-sweep.md` | TASK-0011 | 2026-06-27 | MVP E2E validation, checks, image build, doc sweep, and maintainability fixes passed. |
 | TASK-0013 | Done | P0 | Quality | Playwright UI verification | `docs/tasks/TASK-0013-playwright-ui-verification.md` | TASK-0012 | 2026-06-27 | Browser E2E target verifies scan, dashboard rendering, detail view, and console cleanliness. |
 | TASK-0014 | Done | P0 | Quality | Complete Playwright UI feature coverage | `docs/tasks/TASK-0014-complete-playwright-ui-feature-coverage.md` | TASK-0013 | 2026-06-27 | Expanded browser coverage for all dashboard controls, health states, metrics, filtering, live status, and error display. |
-| TASK-0015 | Ready | P1 | Release | CI versioning process | `docs/tasks/TASK-0015-ci-versioning-process.md` | TASK-0011 | 2026-07-07 | Design documented in `docs/versioning.md`; implementation pending. |
+| TASK-0015 | Done | P1 | Release | CI versioning process | `docs/tasks/TASK-0015-ci-versioning-process.md` | TASK-0011 | 2026-07-08 | Build metadata, SemVer CI tags, OCI labels, and desired-versus-observed image comparison implemented. |
 
 ## Next Task ID
 

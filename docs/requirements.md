@@ -103,6 +103,9 @@ The dashboard must support:
   - Runtime type
   - Inferred environment
   - Images
+  - Desired image tag and digest metadata parsed from declared image references
+  - Desired-versus-observed image version state when runtime metadata is
+    available
   - Exposed ports
   - Dependencies
   - Storage references
@@ -165,7 +168,8 @@ The dashboard must support:
 - Docker monitoring must determine whether discovered Compose services appear to
   be running.
 - Docker monitoring should capture container state, restart count, healthcheck
-  state, image, exposed ports, and last status update time when available.
+  state, image reference, image ID, repo digest metadata when available, exposed
+  ports, and last status update time when available.
 - Docker monitoring must report connection and permission errors clearly.
 
 ### Kubernetes Monitoring
@@ -180,8 +184,9 @@ The dashboard must support:
 - Kubernetes monitoring must match discovered manifest resources to live
   resources by kind, namespace, and name.
 - Kubernetes monitoring should capture workload readiness, available replicas,
-  pod status summaries, service presence, ingress presence, and recent relevant
-  conditions when available.
+  container image references, container status image IDs, pod status summaries,
+  service presence, ingress presence, and recent relevant conditions when
+  available.
 - Kubernetes monitoring must report connection, authentication, authorization,
   and missing-resource errors clearly.
 
@@ -203,7 +208,9 @@ The dashboard must support:
 - The dashboard must show scan status and scan history.
 - The dashboard must show live monitoring status and last checked time.
 - The dashboard must distinguish `healthy`, `degraded`, `unhealthy`, `unknown`,
-  and `error` states.
+  `error`, and `not_applicable` states.
+- The dashboard must distinguish matching, mismatched, unknown, and mutable
+  desired-versus-observed service image version states.
 - Runtime health checks should run every 30 seconds by default.
 - Runtime health check cadence should be configurable per target.
 - Runtime health checks should apply backoff after repeated connection errors.
@@ -232,6 +239,10 @@ The dashboard must support:
   product artifact is a single container.
 - The same container image must be able to run in dashboard server mode or
   remote Docker agent mode.
+- The binary and running server must expose version, commit revision, and build
+  timestamp metadata.
+- Published images should include OCI labels for version, revision, source, and
+  build timestamp.
 
 ### Security
 

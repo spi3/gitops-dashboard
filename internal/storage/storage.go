@@ -186,6 +186,9 @@ func (store *Store) migrate(ctx context.Context) error {
 	if err := store.ensureColumn(ctx, "services", "config_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
+	if err := store.ensureColumn(ctx, "status_results", "observed_images_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
 	if err := store.canonicalizeStoredRouteTargets(ctx); err != nil {
 		return err
 	}
@@ -800,6 +803,7 @@ func (store *Store) Summary(ctx context.Context) (core.DashboardSummary, error) 
 	if uptime == nil {
 		uptime = []core.UptimeStat{}
 	}
+	core.ApplyImageVersionComparisons(services, statuses)
 	return core.DashboardSummary{
 		Repositories: repos,
 		Services:     services,
@@ -895,7 +899,7 @@ func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, err
 		return nil, err
 	}
 	rows, err := store.db.QueryContext(ctx, `
-SELECT service_id, target, health, message, checked_at
+SELECT service_id, target, health, message, checked_at, observed_images_json
 FROM status_results ORDER BY checked_at DESC
 `)
 	if err != nil {
@@ -905,12 +909,16 @@ FROM status_results ORDER BY checked_at DESC
 	var statuses []core.StatusResult
 	for rows.Next() {
 		var status core.StatusResult
-		var health, checkedAt string
-		if err := rows.Scan(&status.ServiceID, &status.Target, &health, &status.Message, &checkedAt); err != nil {
+		var health, checkedAt, observedImages string
+		if err := rows.Scan(&status.ServiceID, &status.Target, &health, &status.Message, &checkedAt, &observedImages); err != nil {
 			return nil, err
 		}
 		status.Health = core.HealthState(health)
 		status.Message = store.redact(status.Message)
+		fromJSON(observedImages, &status.ObservedImages)
+		if status.ObservedImages == nil {
+			status.ObservedImages = []core.ObservedImage{}
+		}
 		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
 			status.CheckedAt = parsed
 		}
@@ -968,7 +976,8 @@ ON CONFLICT(service_id, target) DO UPDATE SET not_applicable=1, updated_at=exclu
 INSERT INTO status_results(service_id, target, health, message, checked_at)
 VALUES(?, ?, ?, ?, ?)
 ON CONFLICT(service_id, target) DO UPDATE SET
-  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at
+  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at,
+  observed_images_json='[]'
 `, serviceID, target, string(core.HealthNotApplicable), "not applicable", now); err != nil {
 			return fmt.Errorf("update status override %s/%s: %w", serviceID, target, err)
 		}
@@ -1204,6 +1213,7 @@ func normalizeService(service core.Service) core.Service {
 	if service.Images == nil {
 		service.Images = []string{}
 	}
+	core.NormalizeServiceImageMetadata(&service)
 	if service.Ports == nil {
 		service.Ports = []string{}
 	}
@@ -1229,6 +1239,9 @@ func normalizeService(service core.Service) core.Service {
 func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) error {
 	status.ServiceID = strings.TrimSpace(status.ServiceID)
 	status.Target = canonicalStatusTarget(status.Target)
+	if status.ObservedImages == nil {
+		status.ObservedImages = []core.ObservedImage{}
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1244,15 +1257,17 @@ func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) 
 	if exactOverride {
 		status.Health = core.HealthNotApplicable
 		status.Message = "not applicable"
+		status.ObservedImages = []core.ObservedImage{}
 	}
 	checkedAt := status.CheckedAt.UTC().Format(time.RFC3339)
 	message := store.redact(status.Message)
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO status_results(service_id, target, health, message, checked_at)
-VALUES(?, ?, ?, ?, ?)
+INSERT INTO status_results(service_id, target, health, message, checked_at, observed_images_json)
+VALUES(?, ?, ?, ?, ?, ?)
 ON CONFLICT(service_id, target) DO UPDATE SET
-  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at
-`, status.ServiceID, status.Target, string(status.Health), message, checkedAt)
+  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at,
+  observed_images_json=excluded.observed_images_json
+`, status.ServiceID, status.Target, string(status.Health), message, checkedAt, toJSON(status.ObservedImages))
 	if err != nil {
 		return fmt.Errorf("upsert status %s/%s: %w", status.ServiceID, status.Target, err)
 	}
@@ -1569,6 +1584,7 @@ CREATE TABLE IF NOT EXISTS status_results (
   health TEXT NOT NULL,
   message TEXT NOT NULL,
   checked_at TEXT NOT NULL,
+  observed_images_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY(service_id, target)
 );
 

@@ -137,6 +137,7 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
   await expect(page.locator(".sentence")).toHaveText("Everything checked is up");
   await expect(page.locator(".tally")).toHaveText("1 of 2 up");
   await expect(webTile.locator(".stateWord")).toHaveText("Up");
+  await expect(webTile.locator(".imageBadge")).toHaveText("Image matches");
   await expect(webTile.locator(".tick.healthy")).toHaveCount(1);
   await expect(webTile.getByText(/100% · 24h/)).toBeVisible();
   await expect(apiTile.locator(".stateWord")).toHaveText("No data");
@@ -146,15 +147,20 @@ test("verifies the full dashboard workflow against the real server", async ({ pa
   await expect(drawer.getByRole("heading", { name: "web" })).toBeVisible();
   await expect(drawer.getByText(/Up · Compose · Production/)).toBeVisible();
   await expect(drawer.getByRole("link", { name: /web\.example\.test/ })).toHaveAttribute("href", "https://web.example.test");
+  await expect(drawer.getByRole("heading", { name: "Image versions" })).toBeVisible();
+  await expect(drawer.locator(".versionBlock .imageBadge")).toHaveText("Image matches");
+  await expect(drawer.locator(".versionFacts")).toContainText("example/web:v1.0.0");
+  await expect(drawer.locator(".versionFacts")).toContainText("local-docker");
   await expect(drawer.locator(".targetHead strong")).toHaveText("local-docker");
   await expect(drawer.locator(".targetHead span")).toHaveText(/100% · 1 check · 24h/);
-  await expect(drawer.locator(".targetNote")).toContainText("Up 5 minutes");
+  await expect(drawer.locator(".targetBlock .targetNote")).toContainText("Up 5 minutes");
   await expect(drawer.locator(".chip")).toHaveText("db");
   await expect(drawer.locator(".provenance").first()).toContainText("fixture · prod/compose.yaml @");
   await page.keyboard.press("Escape");
   await expect(drawer).toBeHidden();
 
   await expect(page.locator(".foot")).toContainText("last sync ok");
+  await expect(page.locator(".foot")).toContainText("GitOps Dashboard");
 
   await page.route("**/api/summary", async (route) => {
     await route.fulfill({ status: 500, body: "summary unavailable" });
@@ -195,6 +201,37 @@ test("renders every supported health state in the browser", async ({ page }) => 
 
   await page.getByRole("button", { name: /Needs attention/ }).click();
   await expect(page.locator("article.tile")).toHaveCount(3);
+});
+
+test("renders image version states in tiles and details", async ({ page }) => {
+  await page.route("**/api/summary", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(summaryWithImageVersionStates())
+    });
+  });
+
+  await page.goto(baseURL);
+  const expectations: Array<[string, string]> = [
+    ["matching-image", "Image matches"],
+    ["drifted-image", "Image drift"],
+    ["unknown-image", "Image unknown"],
+    ["mutable-image", "Mutable image"]
+  ];
+  for (const [name, word] of expectations) {
+    const tile = page.locator("article.tile").filter({ has: page.getByRole("heading", { name, exact: true }) });
+    await expect(tile.locator(".imageBadge")).toHaveText(word);
+  }
+
+  const drifted = page.locator("article.tile").filter({ has: page.getByRole("heading", { name: "drifted-image", exact: true }) });
+  await drifted.click();
+  const drawer = page.getByRole("dialog");
+  await expect(drawer.locator(".versionBlock.mismatched .imageBadge")).toHaveText("Image drift");
+  await expect(drawer.locator(".versionFacts")).toContainText("example/drifted-image:v1.0.0");
+  const observed = drawer.locator(".versionFacts div", { hasText: "Observed" }).locator("dd");
+  await expect(observed).toHaveText("example/drifted-image:v2.0.0 · sha256:feedface…");
+  await expect(observed).toHaveAttribute("title", /example\/drifted-image@sha256:feedfacecafebeef00112233445566778899aabbccddeeff/);
+  await expect(page.locator(".foot")).toContainText("GitOps Dashboard v1.2.3 · abc123def456 · built 2026-07-08T12:34:56Z");
 });
 
 test("renders uptime history and drawer details from the summary", async ({ page }) => {
@@ -496,7 +533,7 @@ function createFixtureRepo(dir: string) {
   writeFileSync(path.join(dir, "prod", "compose.yaml"), [
     "services:",
     "  web:",
-    "    image: example/web:v1",
+    "    image: example/web:v1.0.0",
     "    depends_on:",
     "      - db",
     "    environment:",
@@ -530,7 +567,7 @@ function createFixtureRepo(dir: string) {
     "    spec:",
     "      containers:",
     "        - name: api",
-    "          image: example/api:v1",
+    "          image: example/api:v1.0.0",
     "          ports:",
     "            - containerPort: 8080",
     "          envFrom:",
@@ -624,7 +661,8 @@ function createFakeDockerServer() {
       response.end(JSON.stringify([{
         Id: "container-web",
         Names: ["/fixture-web-1"],
-        Image: "example/web:v1",
+        Image: "example/web:v1.0.0",
+        ImageID: "sha256:container-web",
         State: "running",
         Status: "Up 5 minutes"
       }]));
@@ -683,6 +721,11 @@ function summaryShell(services: unknown[], uptime: unknown[], statuses: unknown[
     services,
     statuses,
     uptime,
+    version: {
+      version: "v1.2.3",
+      commit: "abc123def4567890",
+      buildDate: "2026-07-08T12:34:56Z"
+    },
     generatedAt: now
   };
 }
@@ -693,6 +736,39 @@ function summaryWithEveryHealthState() {
     healthStates.map((health) => baseService(`svc-${health}`, `${health}-service`, health)),
     []
   );
+}
+
+function summaryWithImageVersionStates() {
+  const serviceFor = (name: string, state: string, desired: string, observed?: string, repoDigests: string[] = []) => ({
+    ...baseService(`svc-${name}`, name, "healthy"),
+    images: [desired],
+    desiredImages: [imageRef(desired)],
+    imageVersionState: state,
+    imageVersionChecks: [{
+      desired: imageRef(desired),
+      observed: observed ? {
+        target: "runtime",
+        runtime: "docker",
+        reference: imageRef(observed),
+        imageId: "sha256:observed",
+        repoDigests: repoDigests.map(imageRef)
+      } : undefined,
+      state,
+      message: state === "mismatched" ? "desired and observed image versions differ" : "image metadata state"
+    }]
+  });
+  return summaryShell([
+    serviceFor("matching-image", "matching", "example/matching-image:v1.0.0", "example/matching-image:v1.0.0"),
+    serviceFor(
+      "drifted-image",
+      "mismatched",
+      "example/drifted-image:v1.0.0",
+      "example/drifted-image:v2.0.0",
+      ["example/drifted-image@sha256:feedfacecafebeef00112233445566778899aabbccddeeff"]
+    ),
+    serviceFor("unknown-image", "unknown", "example/unknown-image:v1.0.0"),
+    serviceFor("mutable-image", "mutable", "example/mutable-image:latest", "example/mutable-image:latest")
+  ], []);
 }
 
 function summaryWithUptimeHistory() {
@@ -713,6 +789,24 @@ function summaryWithUptimeHistory() {
     checkCount: 6,
     samples
   }]);
+}
+
+function imageRef(value: string) {
+  const [repositoryAndTag, digest = ""] = value.split("@", 2);
+  const lastSlash = repositoryAndTag.lastIndexOf("/");
+  const lastColon = repositoryAndTag.lastIndexOf(":");
+  const tag = lastColon > lastSlash ? repositoryAndTag.slice(lastColon + 1) : "";
+  const name = tag ? repositoryAndTag.slice(0, lastColon) : repositoryAndTag;
+  const firstSlash = name.indexOf("/");
+  const first = firstSlash >= 0 ? name.slice(0, firstSlash) : "";
+  const hasRegistry = first.includes(".") || first.includes(":") || first === "localhost";
+  return {
+    original: value,
+    registry: hasRegistry ? first : "",
+    repository: hasRegistry ? name.slice(firstSlash + 1) : name,
+    tag,
+    digest
+  };
 }
 
 function summaryWithMixedTargetUptime() {

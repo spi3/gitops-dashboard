@@ -1,9 +1,13 @@
 VITE_API_TARGET ?= http://127.0.0.1:18080
+COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+VERSION ?= dev-$(COMMIT)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -X github.com/example/gitops-dashboard/internal/version.Version=$(VERSION) -X github.com/example/gitops-dashboard/internal/version.Commit=$(COMMIT) -X github.com/example/gitops-dashboard/internal/version.BuildDate=$(BUILD_DATE)
 
 .PHONY: build check dev-server dev-ui format lint test ui-build ui-lint ui-test ui-e2e go-test
 
 build: ui-build
-	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go build -buildvcs=false ./cmd/gitops-dashboard
+	GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go build -buildvcs=false -ldflags "$(LDFLAGS)" ./cmd/gitops-dashboard
 
 check: format lint test build ui-e2e
 

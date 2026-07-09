@@ -14,6 +14,12 @@ Server mode is the default.
 gitops-dashboard -config /config/config.yaml
 ```
 
+Build metadata can be checked without loading config:
+
+```sh
+gitops-dashboard -version
+```
+
 Agent mode:
 
 ```sh
@@ -59,10 +65,17 @@ After tests pass, the workflow publishes the image to GitHub Container Registry:
 
 - `ghcr.io/spi3/gitops-dashboard:latest`
 - `ghcr.io/spi3/gitops-dashboard:sha-<short-sha>`
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR.PATCH` on release tags
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR` on release tags
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR` on release tags
 
 The full container and service versioning process, including release tags and
 GitOps deployment pinning guidance, is documented in
 [versioning.md](versioning.md).
+
+The image and binary carry the same build metadata: version, commit revision,
+and UTC build timestamp. The running server exposes it at `GET /api/version`
+and includes it in the dashboard footer.
 
 The Compose file mounts `examples/compose-config` into both containers:
 

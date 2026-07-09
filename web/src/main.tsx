@@ -7,6 +7,7 @@ import "./styles.css";
 type Health = "healthy" | "degraded" | "unhealthy" | "unknown" | "error" | "not_applicable";
 type Theme = "light" | "dark";
 type Tone = "steady" | "pending" | "watch" | "alert";
+type ImageVersionState = "matching" | "mismatched" | "unknown" | "mutable";
 
 type Repository = {
   name: string;
@@ -21,6 +22,35 @@ type Scan = {
   finishedAt: string;
 };
 
+type BuildInfo = {
+  version: string;
+  commit: string;
+  buildDate: string;
+};
+
+type ImageReference = {
+  original: string;
+  registry: string;
+  repository: string;
+  tag: string;
+  digest: string;
+};
+
+type ObservedImage = {
+  target: string;
+  runtime: string;
+  reference: ImageReference;
+  imageId: string;
+  repoDigests: ImageReference[];
+};
+
+type ImageVersionCheck = {
+  desired: ImageReference;
+  observed?: ObservedImage;
+  state: ImageVersionState;
+  message: string;
+};
+
 type Service = {
   id: string;
   name: string;
@@ -33,6 +63,9 @@ type Service = {
   environment: string;
   health: Health;
   images: string[];
+  desiredImages?: ImageReference[];
+  imageVersionState?: ImageVersionState;
+  imageVersionChecks?: ImageVersionCheck[];
   dependencies: string[];
   exposure: string[];
   monitorRoutes?: string[];
@@ -44,6 +77,7 @@ type StatusResult = {
   health: Health;
   message: string;
   checkedAt: string;
+  observedImages?: ObservedImage[];
 };
 
 type UptimeSample = {
@@ -99,6 +133,7 @@ type DashboardSummary = {
   statuses: StatusResult[];
   uptime?: UptimeStat[];
   agents?: AgentInfo[];
+  version?: BuildInfo;
   generatedAt: string;
 };
 
@@ -127,6 +162,13 @@ const tallyWord: Record<Health, string> = {
   unknown: "unchecked",
   error: "failed",
   not_applicable: "not applicable"
+};
+
+const imageVersionWord: Record<ImageVersionState, string> = {
+  matching: "Image matches",
+  mismatched: "Image drift",
+  unknown: "Image unknown",
+  mutable: "Mutable image"
 };
 
 const attentionStates: Health[] = ["degraded", "unhealthy", "error"];
@@ -337,6 +379,7 @@ function App() {
   const selectedAgent = agents.find((agent) => agent.target === selectedAgentTarget) ?? null;
   const latestScan = summary?.scans[0] ?? null;
   const repositoryCount = summary?.repositories.length ?? 0;
+  const buildVersion = summary?.version ?? null;
 
   return (
     <div className="shell">
@@ -486,9 +529,12 @@ function App() {
           </main>
 
           <footer className="foot">
-            {latestScan
-              ? <span>Discovered from {repositoryCount} {plural(repositoryCount, "repository", "repositories")} · last sync <em className={latestScan.status === "ok" ? "ok" : "bad"}>{latestScan.status === "ok" ? "ok" : "failed"}</em>{latestScan.finishedAt ? ` · ${formatDate(latestScan.finishedAt)}` : ""}</span>
-              : <span>Not synced yet</span>}
+            <span>
+              {latestScan
+                ? <>Discovered from {repositoryCount} {plural(repositoryCount, "repository", "repositories")} · last sync <em className={latestScan.status === "ok" ? "ok" : "bad"}>{latestScan.status === "ok" ? "ok" : "failed"}</em>{latestScan.finishedAt ? ` · ${formatDate(latestScan.finishedAt)}` : ""}</>
+                : "Not synced yet"}
+            </span>
+            {buildVersion ? <span>{buildVersionLabel(buildVersion)}</span> : null}
           </footer>
         </div>
       ) : (
@@ -549,6 +595,7 @@ function ServiceTile({ onOpen, service, uptime }: {
   const samples = aggregateUptimeSamples(uptime);
   const percent = worstPercent(uptime);
   const lastSample = samples[samples.length - 1] ?? null;
+  const imageState = service.imageVersionState ?? "unknown";
 
   return (
     <article
@@ -585,6 +632,9 @@ function ServiceTile({ onOpen, service, uptime }: {
       ) : (
         <span className="doorRow doorNone">no route in Git</span>
       )}
+      {service.images.length ? (
+        <span className={`imageBadge ${imageState}`}>{imageVersionWord[imageState]}</span>
+      ) : null}
       <PulseStrip samples={samples} slots={tileSlots} />
       <div className="tileFoot">
         <span>{percent === null ? "no checks yet" : `${percent}% · 24h`}</span>
@@ -675,6 +725,13 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
           )}
         </section>
 
+        {service.images.length ? (
+          <section className="drawerSection">
+            <h3>Image versions</h3>
+            <ImageVersionList service={service} />
+          </section>
+        ) : null}
+
         <section className="drawerSection">
           <h3>Uptime</h3>
           {targets.length ? targets.map((target) => {
@@ -743,6 +800,52 @@ function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApplicable
         </section>
       </aside>
     </>
+  );
+}
+
+function ImageVersionList({ service }: { service: Service }) {
+  const checks = service.imageVersionChecks ?? [];
+  if (checks.length === 0) {
+    return (
+      <div className="versionBlock unknown">
+        <div className="versionHead">
+          <strong>{service.images.join(", ")}</strong>
+          <span className="imageBadge unknown">Image unknown</span>
+        </div>
+        <p className="targetNote">No runtime image metadata has been reported yet.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="versionList">
+      {checks.map((check, index) => (
+        <div className={`versionBlock ${check.state}`} key={`${check.desired.original || imageRefLabel(check.desired)}-${index}`}>
+          <div className="versionHead">
+            <strong>{imageRefLabel(check.desired)}</strong>
+            <span className={`imageBadge ${check.state}`}>{imageVersionWord[check.state]}</span>
+          </div>
+          <dl className="versionFacts">
+            <div>
+              <dt>Desired</dt>
+              <dd>{imageRefLabel(check.desired)}</dd>
+            </div>
+            {check.observed ? (
+              <div>
+                <dt>Observed</dt>
+                <dd title={observedImageTitle(check.observed)}>{observedImageLabel(check.observed)}</dd>
+              </div>
+            ) : null}
+            {check.observed?.target ? (
+              <div>
+                <dt>Target</dt>
+                <dd>{check.observed.target}</dd>
+              </div>
+            ) : null}
+          </dl>
+          <p className="targetNote">{check.message}</p>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -1272,8 +1375,78 @@ function searchableServiceText(service: Service) {
     service.runtime,
     service.environment,
     service.kind,
+    service.imageVersionState ?? "",
+    ...service.images,
     ...service.exposure
   ].join(" ").toLowerCase();
+}
+
+function buildVersionLabel(version: BuildInfo): string {
+  const commit = version.commit && version.commit !== "unknown" ? version.commit.slice(0, 12) : "unknown";
+  const buildDate = version.buildDate && version.buildDate !== "unknown" ? version.buildDate : "unknown";
+  return `GitOps Dashboard ${version.version || "dev"} · ${commit} · built ${buildDate}`;
+}
+
+function imageRefLabel(ref: ImageReference): string {
+  if (ref.original) {
+    return ref.original;
+  }
+  const base = [ref.registry, ref.repository].filter(Boolean).join("/");
+  if (ref.digest) {
+    return `${base}@${ref.digest}`;
+  }
+  if (ref.tag) {
+    return `${base}:${ref.tag}`;
+  }
+  return base || "image";
+}
+
+function observedImageLabel(image: ObservedImage): string {
+  const reference = imageRefLabel(image.reference);
+  const repoDigestLabels = (image.repoDigests ?? []).map(repoDigestLabel).filter(Boolean);
+  if (reference !== "image") {
+    return repoDigestLabels.length > 0 ? `${reference} · ${repoDigestLabels.join(", ")}` : reference;
+  }
+  if (repoDigestLabels.length > 0) {
+    return (image.repoDigests ?? []).map(repoDigestReferenceLabel).filter(Boolean).join(", ");
+  }
+  return image.imageId || "reported without reference";
+}
+
+function observedImageTitle(image: ObservedImage): string {
+  const reference = imageRefLabel(image.reference);
+  const parts = reference !== "image" ? [reference] : [];
+  const repoDigests = (image.repoDigests ?? []).map(imageRefLabel).filter(Boolean);
+  if (repoDigests.length > 0) {
+    parts.push(`repo digests: ${repoDigests.join(", ")}`);
+  }
+  if (image.imageId) {
+    parts.push(`image ID: ${image.imageId}`);
+  }
+  return parts.join(" · ") || observedImageLabel(image);
+}
+
+function repoDigestLabel(ref: ImageReference): string {
+  if (ref.digest) {
+    return shortDigest(ref.digest);
+  }
+  return imageRefLabel(ref);
+}
+
+function repoDigestReferenceLabel(ref: ImageReference): string {
+  const base = [ref.registry, ref.repository].filter(Boolean).join("/");
+  if (ref.digest) {
+    return base ? `${base}@${shortDigest(ref.digest)}` : shortDigest(ref.digest);
+  }
+  return imageRefLabel(ref);
+}
+
+function shortDigest(digest: string): string {
+  const [algorithm, value] = digest.split(":", 2);
+  if (algorithm && value && value.length > 8) {
+    return `${algorithm}:${value.slice(0, 8)}…`;
+  }
+  return digest;
 }
 
 function accessTargets(service: Service) {

@@ -109,6 +109,14 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 		t.Fatalf("summary status = %d", res.Code)
 	}
 	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("version status = %d", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), `"version"`) || !strings.Contains(res.Body.String(), `"commit"`) || !strings.Contains(res.Body.String(), `"buildDate"`) {
+		t.Fatalf("version body = %q, want version metadata fields", res.Body.String())
+	}
+	res = httptest.NewRecorder()
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("frontend status = %d", res.Code)

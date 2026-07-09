@@ -54,18 +54,28 @@ func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessa
 	if err != nil {
 		return core.AgentMessage{}, err
 	}
+	imageInspector, err := newDockerImageInspector(cfg.Docker.Host)
+	if err != nil {
+		imageInspector = nil
+	}
 	message := core.AgentMessage{Target: cfg.Target, CheckedAt: time.Now().UTC()}
 	for _, item := range containers {
 		name := ""
 		if len(item.Names) > 0 {
 			name = item.Names[0]
 		}
+		repoDigests := item.RepoDigests
+		if imageInspector != nil && liveDockerContainer(item.State, item.Status) {
+			repoDigests = imageInspector.repoDigests(ctx, item)
+		}
 		message.Containers = append(message.Containers, core.ContainerStatus{
-			ID:     item.ID,
-			Name:   name,
-			Image:  item.Image,
-			State:  item.State,
-			Status: item.Status,
+			ID:          item.ID,
+			Name:        name,
+			Image:       item.Image,
+			ImageID:     item.ImageID,
+			RepoDigests: repoDigests,
+			State:       item.State,
+			Status:      item.Status,
 		})
 	}
 	return message, nil

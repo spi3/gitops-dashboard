@@ -57,6 +57,7 @@ The frontend should provide:
 - Scan history
 - Static analysis warnings
 - Health/status indicators
+- Desired-versus-observed service image version indicators
 - Read-only visibility into loaded file-based configuration where useful
 
 The frontend should be built into static assets and served by the Go backend so
@@ -76,6 +77,7 @@ SQLite should store:
 - Normalized services
 - Static analysis warnings
 - Live health/status results
+- Observed image metadata attached to current runtime status results
 - Scan and monitoring errors
 - Basic audit-style timestamps for important events
 

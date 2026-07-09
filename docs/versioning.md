@@ -104,6 +104,7 @@ Recommended surfaces:
 
 - `gitops-dashboard -version`
 - `GET /api/version`
+- Dashboard footer and per-service image version detail.
 - OCI labels on the container image.
 - GitHub Actions workflow summary.
 
@@ -135,6 +136,11 @@ Observed service version should come from live targets:
 - Kubernetes container image, container image ID, and pod status image ID when
   available.
 
+Image observations should come only from live runtime objects. Docker excludes
+stopped containers. Kubernetes excludes deleting Pods and terminal
+`Succeeded`/`Failed` Pods; it includes `Running` Pods and `Pending` Pods only
+when Pod status already reports container image metadata.
+
 The dashboard can then show:
 
 - Desired version from Git.
@@ -146,6 +152,11 @@ The dashboard can then show:
 Mutable or unpinned service image references should be warnings, not hard
 failures. The dashboard is read-only and should surface the risk without
 blocking scans.
+
+Digest-pinned references are immutable. Full SemVer tags such as `v1.2.3` are
+treated as immutable release references, while partial SemVer channel tags such
+as `v1` and `v1.2`, empty tags, `latest`, and unknown non-SemVer tag schemes
+are treated as mutable because they can move without a manifest change.
 
 ## GitOps Update Flow
 

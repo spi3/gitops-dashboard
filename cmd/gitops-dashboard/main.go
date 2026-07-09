@@ -14,14 +14,20 @@ import (
 	"github.com/example/gitops-dashboard/internal/agent"
 	"github.com/example/gitops-dashboard/internal/app"
 	"github.com/example/gitops-dashboard/internal/config"
+	"github.com/example/gitops-dashboard/internal/version"
 )
 
 func main() {
 	var (
-		mode       = flag.String("mode", "server", "server or agent")
-		configPath = flag.String("config", "config.yaml", "path to configuration file")
+		mode        = flag.String("mode", "server", "server or agent")
+		configPath  = flag.String("config", "config.yaml", "path to configuration file")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if *mode != config.ModeServer && *mode != config.ModeAgent {

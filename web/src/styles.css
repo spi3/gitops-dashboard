@@ -537,6 +537,41 @@ main {
   font-size: 12.5px;
 }
 
+.imageBadge {
+  align-self: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 560;
+  line-height: 1;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+.imageBadge.matching {
+  background: color-mix(in oklab, var(--card), var(--up) 8%);
+  border-color: color-mix(in oklab, var(--line), var(--up) 35%);
+  color: var(--up-text);
+}
+
+.imageBadge.mismatched {
+  background: color-mix(in oklab, var(--card), var(--down) 8%);
+  border-color: color-mix(in oklab, var(--line), var(--down) 40%);
+  color: var(--down-text);
+}
+
+.imageBadge.unknown {
+  background: color-mix(in oklab, var(--card), var(--nodata) 8%);
+  color: var(--nodata-text);
+}
+
+.imageBadge.mutable {
+  background: color-mix(in oklab, var(--card), var(--degraded) 10%);
+  border-color: color-mix(in oklab, var(--line), var(--degraded) 40%);
+  color: var(--degraded-text);
+}
+
 /* Pulse strip */
 
 .pulseStrip {
@@ -613,8 +648,12 @@ main {
 .foot {
   border-top: 1px solid var(--line-soft);
   color: var(--ink-3);
+  display: flex;
+  flex-wrap: wrap;
   font-family: "JetBrains Mono Variable", ui-monospace, monospace;
   font-size: 11.5px;
+  gap: 8px 18px;
+  justify-content: space-between;
   margin-top: auto;
   padding-top: 14px;
 }
@@ -857,6 +896,73 @@ main {
 .targetToggle:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+.versionList {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.versionBlock {
+  border-left: 2px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 12px;
+}
+
+.versionBlock.matching {
+  border-left-color: var(--up);
+}
+
+.versionBlock.mismatched {
+  border-left-color: var(--down);
+}
+
+.versionBlock.mutable {
+  border-left-color: var(--degraded);
+}
+
+.versionHead {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.versionHead strong {
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.versionFacts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+}
+
+.versionFacts div {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 68px minmax(0, 1fr);
+}
+
+.versionFacts dt {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.versionFacts dd {
+  color: var(--ink-2);
+  font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+  font-size: 12px;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .statusFallback {

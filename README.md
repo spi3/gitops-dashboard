@@ -26,7 +26,10 @@ monitoring targets or host ping inventories are configured.
   repositories.
 - React dashboard with at-a-glance status, per-service uptime history from the
   monitors, clickable routes and DNS names discovered in Git, and a detail
-  drawer with live check results and Git provenance.
+  drawer with live check results, Git provenance, and desired-versus-observed
+  image version comparison.
+- Build metadata exposed through the binary, API, dashboard footer, and
+  container labels.
 - Playwright browser coverage for the dashboard workflow.
 
 ## Quick Start
@@ -48,6 +51,7 @@ Useful endpoints:
 
 - `GET /healthz`
 - `GET /readyz`
+- `GET /api/version`
 - `GET /api/summary`
 - `POST /api/scan`
 - `POST /api/monitor`
@@ -128,9 +132,11 @@ docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
 
 Pushes to `main` run tests and publish the container image to GitHub Container
-Registry as `ghcr.io/spi3/gitops-dashboard:latest` and a short SHA tag.
-The versioning policy for release tags, immutable image pins, and service
-version inventory is documented in [docs/versioning.md](docs/versioning.md).
+Registry as `ghcr.io/spi3/gitops-dashboard:latest` and `sha-<short-sha>`.
+Pushing a `vMAJOR.MINOR.PATCH` tag publishes `vMAJOR.MINOR.PATCH`,
+`vMAJOR.MINOR`, and `vMAJOR` tags from the same image digest. The versioning
+policy for release tags, immutable image pins, and service version inventory is
+documented in [docs/versioning.md](docs/versioning.md).
 
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `X-Agent-Token` value. Tokens are sent only by header and are authorized against

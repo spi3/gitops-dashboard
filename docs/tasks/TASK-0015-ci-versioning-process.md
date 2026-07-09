@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready
+Done
 
 ## Summary
 
@@ -89,12 +89,51 @@ This task must satisfy `docs/task_acceptance_criteria.md`.
 
 Fill this in before moving the task to `Done`.
 
-- End-to-end test result:
+- End-to-end test result: `npm run test:e2e -- tests/ui/dashboard.spec.ts`
+  passed on 2026-07-08 with 11 Chromium tests passing. `make check` also
+  passed with all 13 Playwright tests passing.
 - Automated test result:
-- Build result:
-- Lint result:
-- Formatting result:
-- Documentation sweep result:
-- Maintainability sweep result:
-- Conventional commit:
-- Notes or exceptions:
+  `GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go test ./internal/...`
+  passed; `make check` also ran `go test ./cmd/... ./internal/...`.
+- Build result: `make build` passed, including Vite production build and Go
+  binary build with ldflags. `./gitops-dashboard -version` reported
+  `gitops-dashboard dev-381872caca7b (commit 381872caca7b, built 2026-07-09T01:12:07Z)`.
+- Lint result: `npm test` passed TypeScript typecheck and ESLint; `make check`
+  passed `go vet ./cmd/... ./internal/...`.
+- Formatting result: `make check` passed `gofmt -w cmd internal` and
+  `npm run format`.
+- Documentation sweep result: reviewed `README.md`, `docs/deployment.md`,
+  `docs/versioning.md`, `docs/requirements.md`, `docs/tech_stack.md`,
+  `docs/implementation_plan.md`, `docs/task_acceptance_criteria.md`, this task
+  file, and `docs/tasks/tracker.md`; updated the docs that changed behavior or
+  operator-facing usage.
+- Maintainability sweep result: build metadata is centralized in
+  `internal/version`; image parsing and comparison logic is centralized in
+  `internal/core`; scanner, monitor, storage, API, and UI changes stay within
+  existing module boundaries.
+- Conventional commit: `feat(release): add ci versioning process (T-001)`
+- Notes or exceptions: No release tag was pushed from this sandbox. The workflow
+  now defines the SemVer release path, release-tag ancestry check, OCI labels,
+  disables automatic `latest` tagging, and writes a workflow summary; live GHCR
+  publication will be exercised when a reviewed `vMAJOR.MINOR.PATCH` tag is
+  pushed. Round-1 reviewer fixes covered release-tag `latest` behavior,
+  registry-aware image matching, Kubernetes status-only observed images, and
+  exact desired-to-observed image pairing. Round-2 reviewer fixes moved
+  Kubernetes observations to matching Pod status data and changed image
+  comparison to exact-match, repository-match, then unknown phases with no
+  cross-repository fallback. Round-3 reviewer fixes preserved workload health
+  when optional Pod image lookup fails and deduplicated desired image references
+  before comparison. Round-4 reviewer fixes exclude not-applicable targets from
+  image version comparisons, clear override-row observed images, and inspect
+  Docker image metadata so digest-pinned desired images can match observed
+  repo digests from both direct Docker checks and agent reports. Round-5
+  reviewer fixes display observed repo digests in the drawer and include the
+  UTC build timestamp in the footer build label. Round-6 reviewer fixes treat
+  moving release-channel tags and unknown non-SemVer tags as mutable while
+  keeping full SemVer tags and digest-pinned references immutable. Round-7
+  reviewer fixes derive workflow commit metadata from the checked-out commit
+  instead of raw `GITHUB_SHA`, preserving source traceability for annotated
+  release tags. Round-8 reviewer fixes limit Docker image observations to live
+  containers so stopped stale Compose containers do not create false image
+  drift. Round-9 reviewer fixes limit Kubernetes image observations to live Pods
+  so deleting or terminal stale Pods do not create false image drift.

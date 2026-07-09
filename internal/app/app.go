@@ -22,6 +22,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/scanner"
 	"github.com/example/gitops-dashboard/internal/storage"
 	"github.com/example/gitops-dashboard/internal/ui"
+	"github.com/example/gitops-dashboard/internal/version"
 	"github.com/gorilla/websocket"
 )
 
@@ -107,6 +108,7 @@ func (app *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
 	mux.HandleFunc("GET /readyz", app.ready)
+	mux.HandleFunc("GET /api/version", app.version)
 	mux.HandleFunc("GET /api/summary", app.summary)
 	mux.HandleFunc("POST /api/scan", app.scan)
 	mux.HandleFunc("POST /api/monitor", app.checkMonitor)
@@ -124,6 +126,10 @@ func (app *App) ready(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ready\n"))
 }
 
+func (app *App) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, version.Current())
+}
+
 func (app *App) summary(w http.ResponseWriter, r *http.Request) {
 	summary, err := app.store.Summary(r.Context())
 	if err != nil {
@@ -136,6 +142,7 @@ func (app *App) summary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	summary.Agents = mergeAgents(agents, app.cfg.Runtime.Docker)
+	summary.Version = version.Current()
 	writeJSON(w, summary)
 }
 

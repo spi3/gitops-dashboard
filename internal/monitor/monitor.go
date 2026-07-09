@@ -16,6 +16,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/storage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/clientcmd"
@@ -114,13 +115,14 @@ func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentM
 		if service.Runtime != "compose" || composeServiceTarget(service) != target {
 			continue
 		}
-		health, statusMessage := dockerHealth(service, containers)
+		health, statusMessage, observedImages := dockerStatus(ctx, service, target, containers, nil)
 		if err := monitor.store.UpsertStatus(ctx, core.StatusResult{
-			ServiceID: service.ID,
-			Target:    target,
-			Health:    health,
-			Message:   statusMessage,
-			CheckedAt: checkedAt,
+			ServiceID:      service.ID,
+			Target:         target,
+			Health:         health,
+			Message:        statusMessage,
+			CheckedAt:      checkedAt,
+			ObservedImages: observedImages,
 		}); err != nil {
 			return err
 		}
@@ -207,17 +209,22 @@ func (monitor Monitor) checkDocker(ctx context.Context, target config.DockerTarg
 	if err != nil {
 		return err
 	}
+	imageInspector, err := newDockerImageInspector(target.Host)
+	if err != nil {
+		imageInspector = nil
+	}
 	for _, service := range services {
 		if service.Runtime != "compose" {
 			continue
 		}
-		health, message := dockerHealth(service, containers)
+		health, message, observedImages := dockerStatus(ctx, service, target.Name, containers, imageInspector)
 		if err := monitor.store.UpsertStatus(ctx, core.StatusResult{
-			ServiceID: service.ID,
-			Target:    target.Name,
-			Health:    health,
-			Message:   message,
-			CheckedAt: time.Now().UTC(),
+			ServiceID:      service.ID,
+			Target:         target.Name,
+			Health:         health,
+			Message:        message,
+			CheckedAt:      time.Now().UTC(),
+			ObservedImages: observedImages,
 		}); err != nil {
 			return err
 		}
@@ -226,30 +233,157 @@ func (monitor Monitor) checkDocker(ctx context.Context, target config.DockerTarg
 }
 
 func dockerHealth(service core.Service, containers []dockerContainer) (core.HealthState, string) {
-	for _, container := range containers {
+	health, message, _ := dockerStatus(context.Background(), service, "", containers, nil)
+	return health, message
+}
+
+func dockerStatus(ctx context.Context, service core.Service, target string, containers []dockerContainer, imageInspector *dockerImageInspector) (core.HealthState, string, []core.ObservedImage) {
+	matches := matchingDockerContainers(service, containers)
+	observedImages := observedDockerImages(ctx, target, matches, imageInspector)
+	for _, container := range matches {
 		if matchesContainer(service, container) {
 			if strings.EqualFold(container.State, "running") {
 				switch strings.ToLower(strings.TrimSpace(container.Health)) {
 				case "unhealthy":
-					return core.HealthUnhealthy, container.Status
+					return core.HealthUnhealthy, container.Status, observedImages
 				case "starting":
-					return core.HealthDegraded, container.Status
+					return core.HealthDegraded, container.Status, observedImages
 				case "healthy":
-					return core.HealthHealthy, container.Status
+					return core.HealthHealthy, container.Status, observedImages
 				}
 				status := strings.ToLower(container.Status)
 				if strings.Contains(status, "(unhealthy)") {
-					return core.HealthUnhealthy, container.Status
+					return core.HealthUnhealthy, container.Status, observedImages
 				}
 				if strings.Contains(status, "(health: starting)") {
-					return core.HealthDegraded, container.Status
+					return core.HealthDegraded, container.Status, observedImages
 				}
-				return core.HealthHealthy, container.Status
+				return core.HealthHealthy, container.Status, observedImages
 			}
-			return core.HealthUnhealthy, container.Status
+			return core.HealthUnhealthy, container.Status, observedImages
 		}
 	}
-	return core.HealthUnknown, "no matching container"
+	return core.HealthUnknown, "no matching container", nil
+}
+
+func matchingDockerContainers(service core.Service, containers []dockerContainer) []dockerContainer {
+	var matches []dockerContainer
+	for _, container := range containers {
+		if matchesContainer(service, container) {
+			matches = append(matches, container)
+		}
+	}
+	return matches
+}
+
+func observedDockerImages(ctx context.Context, target string, containers []dockerContainer, imageInspector *dockerImageInspector) []core.ObservedImage {
+	images := make([]core.ObservedImage, 0, len(containers))
+	for _, container := range containers {
+		if !liveDockerContainer(container.State, container.Status) {
+			continue
+		}
+		repoDigests := container.RepoDigests
+		if imageInspector != nil {
+			repoDigests = imageInspector.repoDigests(ctx, container)
+		}
+		images = append(images, core.NewObservedImage(target, "docker", container.Image, container.ImageID, repoDigests))
+	}
+	return images
+}
+
+func liveDockerContainer(state, status string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "running", "restarting", "paused":
+		return true
+	case "":
+		normalizedStatus := strings.ToLower(strings.TrimSpace(status))
+		return strings.HasPrefix(normalizedStatus, "up") || strings.HasPrefix(normalizedStatus, "restarting")
+	default:
+		return false
+	}
+}
+
+type dockerImageInspector struct {
+	client  *http.Client
+	baseURL string
+	cache   map[string][]string
+}
+
+type dockerImageInspect struct {
+	RepoDigests []string `json:"RepoDigests"`
+}
+
+func newDockerImageInspector(host string) (*dockerImageInspector, error) {
+	if host == "" {
+		host = "unix:///var/run/docker.sock"
+	}
+	client, baseURL, err := dockerHTTPClient(host)
+	if err != nil {
+		return nil, err
+	}
+	return &dockerImageInspector{
+		client:  client,
+		baseURL: baseURL,
+		cache:   map[string][]string{},
+	}, nil
+}
+
+func (inspector *dockerImageInspector) repoDigests(ctx context.Context, container dockerContainer) []string {
+	if inspector == nil {
+		return container.RepoDigests
+	}
+	key := strings.TrimSpace(container.ImageID)
+	if key == "" {
+		key = strings.TrimSpace(container.Image)
+	}
+	if key == "" {
+		return container.RepoDigests
+	}
+	if digests, ok := inspector.cache[key]; ok {
+		return mergeDockerRepoDigests(container.RepoDigests, digests)
+	}
+	digests := inspector.inspectRepoDigests(ctx, key)
+	inspector.cache[key] = digests
+	return mergeDockerRepoDigests(container.RepoDigests, digests)
+}
+
+func (inspector *dockerImageInspector) inspectRepoDigests(ctx context.Context, key string) []string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, inspector.baseURL+"/images/"+url.PathEscape(key)+"/json", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := inspector.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	var image dockerImageInspect
+	if err := json.NewDecoder(resp.Body).Decode(&image); err != nil {
+		return nil
+	}
+	return image.RepoDigests
+}
+
+func mergeDockerRepoDigests(values ...[]string) []string {
+	seen := map[string]struct{}{}
+	var result []string
+	for _, list := range values {
+		for _, value := range list {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func matchesContainer(service core.Service, container dockerContainer) bool {
@@ -267,12 +401,14 @@ func matchesContainer(service core.Service, container dockerContainer) bool {
 }
 
 type dockerContainer struct {
-	ID     string   `json:"Id"`
-	Names  []string `json:"Names"`
-	Image  string   `json:"Image"`
-	State  string   `json:"State"`
-	Status string   `json:"Status"`
-	Health string   `json:"Health"`
+	ID          string   `json:"Id"`
+	Names       []string `json:"Names"`
+	Image       string   `json:"Image"`
+	ImageID     string   `json:"ImageID"`
+	RepoDigests []string `json:"RepoDigests"`
+	State       string   `json:"State"`
+	Status      string   `json:"Status"`
+	Health      string   `json:"Health"`
 }
 
 func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
@@ -283,12 +419,14 @@ func agentDockerContainers(statuses []core.ContainerStatus) []dockerContainer {
 			names = []string{status.Name}
 		}
 		containers = append(containers, dockerContainer{
-			ID:     status.ID,
-			Names:  names,
-			Image:  status.Image,
-			State:  status.State,
-			Status: status.Status,
-			Health: status.Health,
+			ID:          status.ID,
+			Names:       names,
+			Image:       status.Image,
+			ImageID:     status.ImageID,
+			RepoDigests: status.RepoDigests,
+			State:       status.State,
+			Status:      status.Status,
+			Health:      status.Health,
 		})
 	}
 	return containers
@@ -394,6 +532,12 @@ func (monitor Monitor) checkKubernetesWithClient(ctx context.Context, target con
 		} else {
 			status.Health = kubeHealth(resource.Object)
 			status.Message = fmt.Sprintf("%s/%s found", service.Kind, service.ResourceName)
+			observedImages, err := observedKubernetesImages(ctx, clientset, target.Name, namespace, resource.Object)
+			if err != nil {
+				status.Message = fmt.Sprintf("%s; image metadata unavailable: %v", status.Message, err)
+			} else {
+				status.ObservedImages = observedImages
+			}
 		}
 		if err := monitor.store.UpsertStatus(ctx, status); err != nil {
 			return err
@@ -415,6 +559,10 @@ func gvrForKind(kind string) (schema.GroupVersionResource, bool) {
 	}
 }
 
+func podGVR() schema.GroupVersionResource {
+	return schema.GroupVersionResource{Version: "v1", Resource: "pods"}
+}
+
 func kubeHealth(object map[string]any) core.HealthState {
 	status, _ := object["status"].(map[string]any)
 	ready := number(status["readyReplicas"])
@@ -430,6 +578,153 @@ func kubeHealth(object map[string]any) core.HealthState {
 		return core.HealthDegraded
 	}
 	return core.HealthUnhealthy
+}
+
+func observedKubernetesImages(ctx context.Context, clientset dynamic.Interface, target, namespace string, object map[string]any) ([]core.ObservedImage, error) {
+	selector, ok, err := workloadLabelSelector(object)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	pods, err := clientset.Resource(podGVR()).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("list pods for workload images: %w", err)
+	}
+	var images []core.ObservedImage
+	for _, pod := range pods.Items {
+		podImages := observedPodImages(target, pod.Object)
+		if !liveKubernetesPod(pod.Object, len(podImages) > 0) {
+			continue
+		}
+		images = append(images, podImages...)
+	}
+	return uniqueObservedKubernetesImages(images), nil
+}
+
+func liveKubernetesPod(object map[string]any, hasObservedImages bool) bool {
+	if value, found, _ := unstructured.NestedFieldNoCopy(object, "metadata", "deletionTimestamp"); found {
+		switch typed := value.(type) {
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return false
+			}
+		case nil:
+		default:
+			return false
+		}
+	}
+	phase, _, _ := unstructured.NestedString(object, "status", "phase")
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "running":
+		return true
+	case "pending":
+		return hasObservedImages
+	default:
+		return false
+	}
+}
+
+func workloadLabelSelector(object map[string]any) (string, bool, error) {
+	labelSelector := metav1.LabelSelector{}
+	matchLabels, found, err := unstructured.NestedStringMap(object, "spec", "selector", "matchLabels")
+	if err != nil {
+		return "", false, fmt.Errorf("read workload matchLabels: %w", err)
+	}
+	if found {
+		labelSelector.MatchLabels = matchLabels
+	}
+	expressions, found, err := unstructured.NestedSlice(object, "spec", "selector", "matchExpressions")
+	if err != nil {
+		return "", false, fmt.Errorf("read workload matchExpressions: %w", err)
+	}
+	if found {
+		for _, item := range expressions {
+			expression := kubeMap(item)
+			key := kubeString(expression["key"])
+			operator := kubeString(expression["operator"])
+			if key == "" || operator == "" {
+				continue
+			}
+			labelSelector.MatchExpressions = append(labelSelector.MatchExpressions, metav1.LabelSelectorRequirement{
+				Key:      key,
+				Operator: metav1.LabelSelectorOperator(operator),
+				Values:   kubeStringSlice(expression["values"]),
+			})
+		}
+	}
+	if len(labelSelector.MatchLabels) == 0 && len(labelSelector.MatchExpressions) == 0 {
+		return "", false, nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
+	if err != nil {
+		return "", false, fmt.Errorf("build workload pod selector: %w", err)
+	}
+	return selector.String(), true, nil
+}
+
+func observedPodImages(target string, object map[string]any) []core.ObservedImage {
+	var images []core.ObservedImage
+	status := kubeMap(object["status"])
+	for _, field := range []string{"initContainerStatuses", "containerStatuses"} {
+		for _, item := range kubeList(status[field]) {
+			container := kubeMap(item)
+			image := kubeString(container["image"])
+			imageID := kubeString(container["imageID"])
+			if image == "" && imageID == "" {
+				continue
+			}
+			images = append(images, core.NewObservedImage(target, "kubernetes", image, imageID, nil))
+		}
+	}
+	return images
+}
+
+func uniqueObservedKubernetesImages(images []core.ObservedImage) []core.ObservedImage {
+	seen := map[string]struct{}{}
+	result := make([]core.ObservedImage, 0, len(images))
+	for _, image := range images {
+		key := image.Reference.Original + "\x00" + image.ImageID
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, image)
+	}
+	return result
+}
+
+func kubeMap(value any) map[string]any {
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	return map[string]any{}
+}
+
+func kubeList(value any) []any {
+	if typed, ok := value.([]any); ok {
+		return typed
+	}
+	return nil
+}
+
+func kubeString(value any) string {
+	if typed, ok := value.(string); ok {
+		return strings.TrimSpace(typed)
+	}
+	return ""
+}
+
+func kubeStringSlice(value any) []string {
+	values := kubeList(value)
+	result := make([]string, 0, len(values))
+	for _, item := range values {
+		if value := kubeString(item); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 func number(value any) float64 {
