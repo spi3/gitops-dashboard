@@ -34,8 +34,16 @@ LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${SOURCE}"
-RUN apk add --no-cache ca-certificates git iputils openssh-client
+RUN apk add --no-cache ca-certificates git iputils libcap openssh-client setpriv \
+    && addgroup -S -g 10001 gitops-dashboard \
+    && adduser -S -D -u 10001 -G gitops-dashboard -h /home/gitops-dashboard gitops-dashboard \
+    && mkdir -p /app /data/repos /home/gitops-dashboard \
+    && chown -R gitops-dashboard:gitops-dashboard /app /data /home/gitops-dashboard \
+    && setcap cap_net_raw+ep "$(command -v ping)"
+ENV HOME=/tmp
 WORKDIR /app
 COPY --from=build /out/gitops-dashboard /usr/local/bin/gitops-dashboard
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8080
-ENTRYPOINT ["gitops-dashboard"]
+ENTRYPOINT ["docker-entrypoint.sh"]

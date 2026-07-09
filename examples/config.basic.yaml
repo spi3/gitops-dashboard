@@ -3,6 +3,8 @@ server:
   dataDir: "data/basic"
   repoCacheDir: "data/basic/repos"
 auth:
+  # Local testing only. The example credentials are admin/password.
+  # Replace this with a bcrypt hash generated for your own password.
   mode: basic
   users:
     - username: admin

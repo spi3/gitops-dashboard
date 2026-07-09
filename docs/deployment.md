@@ -31,6 +31,21 @@ once as the Docker agent. The dashboard exposes the UI/API and persists `/data`.
 The agent does not expose a port; it opens an outbound WebSocket connection to
 the dashboard server at `/api/agents/connect`.
 
+The runtime image starts its entrypoint as root only long enough to handle
+upgrades from older root-owned data volumes. When `/data` or the known database
+and repo-cache paths under `/data` are not owned by UID/GID `10001`, the
+entrypoint runs `chown -R 10001:10001 /data` and then drops privileges before
+executing the dashboard. Fresh Docker named volumes inherit the image's
+pre-owned `/data`, and already-correct volumes skip the repair.
+
+The ownership repair is intentionally limited to `/data`. If you replace the
+named volume with a host bind mount, create it for that UID first, for example
+`sudo install -d -o 10001 -g 10001 /srv/gitops-dashboard/data`. Hosts that
+pre-chown `/data` and require a strictly non-root container can opt out of the
+repair by setting `GITOPS_DASHBOARD_SKIP_DATA_CHOWN=true` and running the
+container with `user: "10001:10001"` in Compose or `runAsUser: 10001` and
+`runAsGroup: 10001` in Kubernetes.
+
 ## Required Server Mounts
 
 - `/config`: file-based application configuration.
@@ -38,15 +53,35 @@ the dashboard server at `/api/agents/connect`.
 - `/ssh`: optional SSH keys and known hosts for private Git repositories.
 - `/kube`: optional kubeconfig files for Kubernetes monitoring.
 
+Files mounted under `/ssh` and `/kube` must be readable by UID/GID `10001`; the
+entrypoint does not change these bind mounts because they are credentials. For
+OpenSSH private keys, prefer owner-readable permissions such as
+`chown 10001:10001 id_ed25519 && chmod 0600 id_ed25519`. Kubeconfigs and
+known-hosts files can instead be owned by the host user and made group-readable
+with group `10001`:
+
+```sh
+chgrp 10001 kubeconfig
+chmod 0640 kubeconfig
+```
+
+Docker user namespace remapping is another option when host file
+ownership must stay in a remapped range. At startup, configured SSH key,
+known-hosts, and kubeconfig paths that UID `10001` cannot open are logged as
+warnings.
+
 ## Required Agent Mounts
 
 - `/config`: file-based agent configuration.
 - `/var/run/docker.sock`: optional local Docker socket when the agent monitors
   the colocated Docker engine.
 
-Mounting the Docker socket gives the container Docker API access on that host.
-For stricter deployments, point `agent.docker.host` at a constrained Docker API
-proxy instead of mounting the socket directly.
+Mounting the Docker socket gives the container Docker API access on that host,
+even when the socket path is mounted read-only. The example starts the agent as
+UID/GID `10001`, keeps `cap_drop: ALL`, and adds only the socket's numeric group
+ID with `DOCKER_SOCKET_GID`. For stricter deployments, point `agent.docker.host`
+at a Docker socket proxy that allowlists only the read-only endpoints the agent
+needs instead of mounting the host socket directly.
 
 ## Docker Compose Agent Example
 
@@ -54,11 +89,34 @@ proxy instead of mounting the socket directly.
 
 ```sh
 docker build -t gitops-dashboard:latest .
+export GITOPS_DASHBOARD_ADMIN_HASH="$(htpasswd -nbB admin 'change-me' | cut -d: -f2-)"
 export GITOPS_DASHBOARD_AGENT_TOKEN="$(openssl rand -hex 32)"
+export DOCKER_SOCKET_GID="$(
+  docker run --rm --entrypoint stat \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    gitops-dashboard:latest -c '%g' /var/run/docker.sock
+)"
 docker compose -f examples/docker-compose.yaml up -d
 docker compose -f examples/docker-compose.yaml ps
 docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
+
+Replace `change-me` with a real admin password before use. The username in the
+example config is `admin`; the dashboard reads the bcrypt hash from
+`GITOPS_DASHBOARD_ADMIN_HASH`. If `htpasswd` is not installed locally, this
+Docker-based command produces the same bcrypt hash format:
+
+```sh
+docker run --rm httpd:2.4-alpine htpasswd -nbB admin 'change-me' | cut -d: -f2-
+```
+
+The example publishes the dashboard only on `127.0.0.1:8080`. Put a reverse
+proxy with TLS and its own intentional exposure in front of the service when it
+needs to be reachable from other hosts.
+
+The `DOCKER_SOCKET_GID` command asks Docker for the socket group as a container
+sees it. That is more reliable than host-side `stat` on systems with user
+namespaces, symlinked sockets, or Docker socket proxies.
 
 Pushes to `main` run the GitHub Actions workflow in `.github/workflows/ci.yml`.
 After tests pass, the workflow publishes the image to GitHub Container Registry:
@@ -80,14 +138,16 @@ and includes it in the dashboard footer.
 The Compose file mounts `examples/compose-config` into both containers:
 
 - `config.yaml`: dashboard server config that reads the accepted agent token
-  from `GITOPS_DASHBOARD_AGENT_TOKEN`.
+  from `GITOPS_DASHBOARD_AGENT_TOKEN` and protects the UI/API with basic auth
+  using `GITOPS_DASHBOARD_ADMIN_HASH`.
 - `agent.yaml`: remote Docker agent config with the dashboard WebSocket URL,
   target name, matching token environment reference, reporting interval, and
   Docker host.
 
-Before using the example outside local testing, provide the same
-`GITOPS_DASHBOARD_AGENT_TOKEN` value to both containers through your container
-runtime, secret manager, or orchestrator.
+Before using the example outside local testing, provide
+`GITOPS_DASHBOARD_ADMIN_HASH` and the same `GITOPS_DASHBOARD_AGENT_TOKEN` value
+to the containers through your container runtime, secret manager, or
+orchestrator.
 
 The dashboard accepts agent connections only when the token is sent in the
 `X-Agent-Token` header. Query-string tokens are rejected. Shared
@@ -239,7 +299,7 @@ Repository scans can be narrowed with `includePaths` and `excludePaths` under a
 repository entry. Plain paths match that file or directory subtree, and glob
 paths support `*` plus recursive `**` patterns.
 
-Use `examples/config.dev.yaml` for a no-auth local development server.
+Use `examples/config.dev.yaml` only for a no-auth local development server.
 Use `examples/config.basic.yaml` for a basic-auth local server example.
 Use `examples/docker-compose.yaml` for server and remote-agent deployment
 shape, with concrete configuration in `examples/compose-config`.

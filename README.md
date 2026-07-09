@@ -126,10 +126,32 @@ Docker socket and reports outbound to the dashboard:
 
 ```sh
 docker build -t gitops-dashboard:latest .
+export GITOPS_DASHBOARD_ADMIN_HASH="$(htpasswd -nbB admin 'change-me' | cut -d: -f2-)"
 export GITOPS_DASHBOARD_AGENT_TOKEN="$(openssl rand -hex 32)"
+export DOCKER_SOCKET_GID="$(
+  docker run --rm --entrypoint stat \
+    -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    gitops-dashboard:latest -c '%g' /var/run/docker.sock
+)"
 docker compose -f examples/docker-compose.yaml up -d
 docker compose -f examples/docker-compose.yaml logs -f dashboard docker-agent
 ```
+
+Replace `change-me` before use. The Compose example enables basic auth for
+`admin` with the bcrypt hash from `GITOPS_DASHBOARD_ADMIN_HASH`, binds the
+dashboard port to `127.0.0.1:8080`, and runs the server and agent processes as
+UID/GID `10001`. If `htpasswd` is not installed locally, generate the same kind
+of bcrypt hash with Docker:
+
+```sh
+docker run --rm httpd:2.4-alpine htpasswd -nbB admin 'change-me' | cut -d: -f2-
+```
+
+On startup, the image briefly runs its entrypoint as root to repair ownership
+of `/data` when upgrading an older root-owned Compose volume, then execs the
+dashboard as UID/GID `10001`. It does not change `/ssh` or `/kube`; SSH private
+keys should be owned by UID `10001` with mode `0600`, and kubeconfigs should be
+owner- or group-readable by UID/GID `10001`.
 
 Pushes to `main` run tests and publish the container image to GitHub Container
 Registry as `ghcr.io/spi3/gitops-dashboard:latest` and `sha-<short-sha>`.
@@ -164,6 +186,12 @@ runtime:
     - name: local-docker
       host: unix:///var/run/docker.sock
 ```
+
+Mounting `/var/run/docker.sock` gives Docker API access to that host even when
+the bind mount is marked read-only. The example keeps the agent non-root by
+adding only the socket's numeric group ID as containers see it. Use a Docker
+socket proxy with an allowlist of read-only endpoints when you need a tighter
+boundary.
 
 To add host health rows from an Ansible YAML inventory, keep the inventory in a
 configured repository and point the ping target at that repo-relative path:

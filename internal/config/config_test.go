@@ -431,6 +431,7 @@ runtime:
 }
 
 func TestLoadComposeExampleConfigs(t *testing.T) {
+	t.Setenv("GITOPS_DASHBOARD_ADMIN_HASH", "$2a$10$example-admin-hash")
 	t.Setenv("GITOPS_DASHBOARD_AGENT_TOKEN", "example-agent-token")
 	serverConfig := filepath.Join("..", "..", "examples", "compose-config", "config.yaml")
 	if _, err := Load(serverConfig); err != nil {

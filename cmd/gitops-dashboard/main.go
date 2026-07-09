@@ -40,6 +40,7 @@ func main() {
 		logger.Error("configuration failed", "error", err)
 		os.Exit(1)
 	}
+	warnUnreadableConfiguredFiles(cfg, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -56,6 +57,40 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+func warnUnreadableConfiguredFiles(cfg config.Config, logger *slog.Logger) {
+	seen := map[string]struct{}{}
+	for _, repo := range cfg.Repositories {
+		warnUnreadableConfiguredFile(logger, seen, "repository ssh key", repo.Name, repo.SSHKeyPath)
+		warnUnreadableConfiguredFile(logger, seen, "repository known hosts", repo.Name, repo.KnownHosts)
+	}
+	for _, target := range cfg.Runtime.Kubernetes {
+		warnUnreadableConfiguredFile(logger, seen, "kubernetes kubeconfig", target.Name, target.Kubeconfig)
+	}
+}
+
+func warnUnreadableConfiguredFile(logger *slog.Logger, seen map[string]struct{}, kind, name, path string) {
+	if path == "" {
+		return
+	}
+	key := kind + "\x00" + path
+	if _, ok := seen[key]; ok {
+		return
+	}
+	seen[key] = struct{}{}
+	file, err := os.Open(path)
+	if err == nil {
+		_ = file.Close()
+		return
+	}
+	logger.Warn(
+		"configured file is not readable",
+		"kind", kind,
+		"name", name,
+		"path", path,
+		"error", err,
+	)
 }
 
 func runServer(ctx context.Context, cfg config.Config, logger *slog.Logger) error {

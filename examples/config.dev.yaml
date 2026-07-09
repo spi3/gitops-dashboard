@@ -3,6 +3,7 @@ server:
   dataDir: "data/dev"
   repoCacheDir: "data/dev/repos"
 auth:
+  # Development only. Do not expose this config outside a trusted local shell.
   mode: dev-no-auth
 monitoring:
   defaultInterval: 30s

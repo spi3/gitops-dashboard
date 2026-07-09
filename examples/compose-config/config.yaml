@@ -3,7 +3,10 @@ server:
   dataDir: "/data"
   repoCacheDir: "/data/repos"
 auth:
-  mode: dev-no-auth
+  mode: basic
+  users:
+    - username: admin
+      passwordHashEnv: GITOPS_DASHBOARD_ADMIN_HASH
   agent:
     tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
 monitoring:

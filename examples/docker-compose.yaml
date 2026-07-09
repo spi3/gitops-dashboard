@@ -3,23 +3,40 @@ services:
     image: gitops-dashboard:latest
     command: ["-config", "/config/config.yaml"]
     environment:
+      GITOPS_DASHBOARD_ADMIN_HASH: ${GITOPS_DASHBOARD_ADMIN_HASH:?set GITOPS_DASHBOARD_ADMIN_HASH}
       GITOPS_DASHBOARD_AGENT_TOKEN: ${GITOPS_DASHBOARD_AGENT_TOKEN:?set GITOPS_DASHBOARD_AGENT_TOKEN}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./compose-config:/config:ro
       - dashboard-data:/data
+      # SSH keys and kubeconfigs must be readable by uid/gid 10001.
       - ./ssh:/ssh:ro
       - ./kube:/kube:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
 
   docker-agent:
     image: gitops-dashboard:latest
     command: ["-mode", "agent", "-config", "/config/agent.yaml"]
+    user: "10001:10001"
     environment:
       GITOPS_DASHBOARD_AGENT_TOKEN: ${GITOPS_DASHBOARD_AGENT_TOKEN:?set GITOPS_DASHBOARD_AGENT_TOKEN}
+    group_add:
+      - "${DOCKER_SOCKET_GID:?set DOCKER_SOCKET_GID to the numeric gid of /var/run/docker.sock}"
     volumes:
       - ./compose-config:/config:ro
+      # The Docker socket grants Docker API access to this host. The bind mount
+      # is read-only for the filesystem path, but the API is still powerful.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       - dashboard
 
