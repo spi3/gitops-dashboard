@@ -760,30 +760,26 @@ func TestDockerCheckInspectsRepoDigestsForImageComparison(t *testing.T) {
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/containers/json":
-			_ = json.NewEncoder(w).Encode([]dockerContainer{
+			_ = json.NewEncoder(w).Encode([]dockerContainerFixture{
 				{
-					ID:      "container-1",
-					Names:   []string{"/stack-api-1"},
-					Image:   "example/api:v1",
-					ImageID: "sha256:api",
-					Labels: map[string]string{
-						dockerComposeProjectLabel: "prod",
-						dockerComposeServiceLabel: "api",
+					Container: dockerContainer{
+						ID: "container-1", Names: []string{"/stack-api-1"}, Image: "example/api:v1", ImageID: "sha256:api", State: "running", Status: "Up 1 minute",
+						Labels: map[string]string{
+							dockerComposeProjectLabel: "prod",
+							dockerComposeServiceLabel: "api",
+						},
 					},
-					State:  "running",
-					Status: "Up 1 minute",
+					Health: map[string]any{"Status": "healthy", "FailingStreak": 0},
 				},
 				{
-					ID:      "container-2",
-					Names:   []string{"/stack-api-2"},
-					Image:   "example/api:v1",
-					ImageID: "sha256:api",
-					Labels: map[string]string{
-						dockerComposeProjectLabel: "prod",
-						dockerComposeServiceLabel: "api",
+					Container: dockerContainer{
+						ID: "container-2", Names: []string{"/stack-api-2"}, Image: "example/api:v1", ImageID: "sha256:api", State: "running", Status: "Up 1 minute",
+						Labels: map[string]string{
+							dockerComposeProjectLabel: "prod",
+							dockerComposeServiceLabel: "api",
+						},
 					},
-					State:  "running",
-					Status: "Up 1 minute",
+					Health: map[string]any{"Status": "healthy", "FailingStreak": 0},
 				},
 			})
 		case strings.HasPrefix(r.URL.Path, "/images/"):
@@ -1070,4 +1066,11 @@ func dockerContainerAPIServer(t *testing.T, containers []dockerContainer) *httpt
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+// dockerContainerFixture mirrors the object-valued Health field returned by
+// current Docker Engine /containers/json responses.
+type dockerContainerFixture struct {
+	dockerapi.Container
+	Health any `json:"Health"`
 }

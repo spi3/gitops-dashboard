@@ -103,61 +103,30 @@ func TestCollectDockerInfersContainerHealthAndRestartCount(t *testing.T) {
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/containers/json":
-			_ = json.NewEncoder(w).Encode([]dockerapi.Container{
+			_ = json.NewEncoder(w).Encode([]dockerContainerFixture{
 				{
-					ID:           "container-healthy",
-					Names:        []string{"/stack-web-1"},
-					Image:        "example/web:v1",
-					ImageID:      "sha256:web",
-					Labels:       map[string]string{},
-					State:        "running",
-					Status:       "Up 10 minutes",
-					RestartCount: 1,
+					Container: dockerapi.Container{ID: "container-healthy", Names: []string{"/stack-web-1"}, Image: "example/web:v1", ImageID: "sha256:web", Labels: map[string]string{}, State: "running", Status: "Up 10 minutes", RestartCount: 1},
+					Health:    map[string]any{"Status": "healthy", "FailingStreak": 0},
 				},
 				{
-					ID:           "container-unhealthy",
-					Names:        []string{"/stack-api-1"},
-					Image:        "example/api:v1",
-					ImageID:      "sha256:api",
-					State:        "running",
-					Status:       "Up 8 minutes (unhealthy)",
-					RestartCount: 4,
+					Container: dockerapi.Container{ID: "container-unhealthy", Names: []string{"/stack-api-1"}, Image: "example/api:v1", ImageID: "sha256:api", State: "running", Status: "Up 8 minutes (unhealthy)", RestartCount: 4},
+					Health:    map[string]any{"Status": "unhealthy", "FailingStreak": 4},
 				},
 				{
-					ID:           "container-starting",
-					Names:        []string{"/stack-worker-1"},
-					Image:        "example/worker:v1",
-					ImageID:      "sha256:worker",
-					State:        "running",
-					Status:       "Up 1 minute (health: starting)",
-					RestartCount: 3,
+					Container: dockerapi.Container{ID: "container-starting", Names: []string{"/stack-worker-1"}, Image: "example/worker:v1", ImageID: "sha256:worker", State: "running", Status: "Up 1 minute (health: starting)", RestartCount: 3},
+					Health:    map[string]any{"Status": "starting", "FailingStreak": 0},
 				},
 				{
-					ID:           "container-restarting",
-					Names:        []string{"/stack-restarting-1"},
-					Image:        "example/restarting:v1",
-					ImageID:      "sha256:restarting",
-					State:        "restarting",
-					Status:       "Restarting (1) 2 seconds ago",
-					RestartCount: 7,
+					Container: dockerapi.Container{ID: "container-restarting", Names: []string{"/stack-restarting-1"}, Image: "example/restarting:v1", ImageID: "sha256:restarting", State: "restarting", Status: "Restarting (1) 2 seconds ago", RestartCount: 7},
+					Health:    nil,
 				},
 				{
-					ID:           "container-paused",
-					Names:        []string{"/stack-paused-1"},
-					Image:        "example/paused:v1",
-					ImageID:      "sha256:paused",
-					State:        "paused",
-					Status:       "Up 4 minutes",
-					RestartCount: 12,
+					Container: dockerapi.Container{ID: "container-paused", Names: []string{"/stack-paused-1"}, Image: "example/paused:v1", ImageID: "sha256:paused", State: "paused", Status: "Up 4 minutes", RestartCount: 12},
+					Health:    nil,
 				},
 				{
-					ID:           "container-none",
-					Names:        []string{"/stack-none-1"},
-					Image:        "example/none:v1",
-					ImageID:      "sha256:none",
-					State:        "running",
-					Status:       "Up 3 minutes (health: none)",
-					RestartCount: 0,
+					Container: dockerapi.Container{ID: "container-none", Names: []string{"/stack-none-1"}, Image: "example/none:v1", ImageID: "sha256:none", State: "running", Status: "Up 3 minutes (health: none)"},
+					Health:    map[string]any{"Status": "none", "FailingStreak": 0},
 				},
 			})
 		default:
@@ -201,4 +170,11 @@ func TestCollectDockerInfersContainerHealthAndRestartCount(t *testing.T) {
 			}
 		}
 	}
+}
+
+// dockerContainerFixture mirrors dockerd's container-summary Health object.
+// The embedded Container keeps the rest of the test response concise.
+type dockerContainerFixture struct {
+	dockerapi.Container
+	Health any `json:"Health"`
 }

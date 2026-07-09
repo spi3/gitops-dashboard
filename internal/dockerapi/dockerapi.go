@@ -26,6 +26,63 @@ type Container struct {
 	Health       string            `json:"Health"`
 }
 
+// containerSummary is the response shape returned by Docker Engine's
+// /containers/json endpoint. Docker documents Health as a string on some API
+// versions, while current dockerd returns an object containing Status.
+// Keep that wire-format difference at the API boundary and expose the
+// normalized status string used by the monitor.
+type containerSummary struct {
+	ID           string            `json:"Id"`
+	Names        []string          `json:"Names"`
+	Image        string            `json:"Image"`
+	ImageID      string            `json:"ImageID"`
+	RepoDigests  []string          `json:"RepoDigests"`
+	Labels       map[string]string `json:"Labels"`
+	State        string            `json:"State"`
+	Status       string            `json:"Status"`
+	RestartCount int               `json:"RestartCount"`
+	Health       containerHealth   `json:"Health"`
+}
+
+func (summary containerSummary) container() Container {
+	return Container{
+		ID:           summary.ID,
+		Names:        summary.Names,
+		Image:        summary.Image,
+		ImageID:      summary.ImageID,
+		RepoDigests:  summary.RepoDigests,
+		Labels:       summary.Labels,
+		State:        summary.State,
+		Status:       summary.Status,
+		RestartCount: summary.RestartCount,
+		Health:       string(summary.Health),
+	}
+}
+
+type containerHealth string
+
+func (health *containerHealth) UnmarshalJSON(value []byte) error {
+	if string(value) == "null" {
+		*health = ""
+		return nil
+	}
+
+	var status string
+	if err := json.Unmarshal(value, &status); err == nil {
+		*health = containerHealth(status)
+		return nil
+	}
+
+	var detail struct {
+		Status string `json:"Status"`
+	}
+	if err := json.Unmarshal(value, &detail); err != nil {
+		return fmt.Errorf("decode Docker container health: %w", err)
+	}
+	*health = containerHealth(detail.Status)
+	return nil
+}
+
 type ImageInspect struct {
 	RepoDigests []string `json:"RepoDigests"`
 }
@@ -50,9 +107,13 @@ func ListContainers(ctx context.Context, host string) ([]Container, error) {
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("docker api status %s", resp.Status)
 	}
-	var containers []Container
-	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+	var summaries []containerSummary
+	if err := json.NewDecoder(resp.Body).Decode(&summaries); err != nil {
 		return nil, err
+	}
+	containers := make([]Container, len(summaries))
+	for i, summary := range summaries {
+		containers[i] = summary.container()
 	}
 	return containers, nil
 }
