@@ -36,11 +36,12 @@ not override externally managed assignment, priority, or status.
 | TASK-0026 | In Review | P1 | Release | SemVer allocator and manual release | `docs/tasks/TASK-0026-semver-allocator-and-manual-release.md` | TASK-0015 | 2026-07-10 | Guarded allocator, release-tag publication, and release-path E2E coverage. |
 | TASK-0027 | In Review | P1 | Release | Inline auto-patch release on main | `docs/tasks/TASK-0027-inline-main-release.md` | TASK-0026 | 2026-07-10 | Serialized inline release allocation, immutable image reuse, and display-name-aware dispatch integration. |
 | TASK-0028 | In Review | P1 | Release | Continuous versioning convergence and rollout | `docs/tasks/TASK-0028-continuous-versioning-convergence.md` | TASK-0027 | 2026-07-10 | Queued-run channel convergence, stale latest guard, operator runbook, and continuous-model documentation. |
+| TASK-0030 | In Review | P1 | Route Discovery | Explicit Compose port evidence | `docs/tasks/TASK-0030-route-discovery-correctness.md` | TASK-0028 | 2026-07-10 | Static-address port-evidence rules, IPv6-safe routes, and discovery reference. |
 | TASK-0047 | In Review | P1 | CI Reliability | CI publish wedge hotfix | `docs/tasks/TASK-0047-ci-publish-wedge-hotfix.md` | TASK-0015 | 2026-07-10 | Native UI build platform, bounded CI jobs, and exact Docker variable-reference guards. |
 
 ## Next Task ID
 
-`TASK-0029`
+`TASK-0031`
 
 Reserved-task traceability:
 

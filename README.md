@@ -6,6 +6,9 @@ Compose and generic Kubernetes manifests, builds a normalized service inventory,
 and displays live health/status when HTTP route, Docker, or Kubernetes
 monitoring targets or host ping inventories are configured.
 
+See [route discovery](docs/discovery.md) for the exact evidence required to
+generate monitorable routes.
+
 ## Current Capabilities
 
 - GitHub repositories with personal access tokens.

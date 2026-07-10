@@ -38,6 +38,13 @@ func TestNormalizePreservesOnlySignificantTrailingSlashes(t *testing.T) {
 	}
 }
 
+func TestRoutesSkipsNonMonitorableAddressInventory(t *testing.T) {
+	t.Parallel()
+	if got := Routes([]string{"address/10.10.10.127", "http://10.10.10.127:8080"}); len(got) != 1 || got[0] != "http://10.10.10.127:8080" {
+		t.Fatalf("Routes() = %v, want only the explicit HTTP route", got)
+	}
+}
+
 func TestCanonicalTargetPreservesNonRootTrailingSlash(t *testing.T) {
 	t.Parallel()
 	got, ok := CanonicalTarget("routes: HTTPS://APP.EXAMPLE.TEST:443/admin/")

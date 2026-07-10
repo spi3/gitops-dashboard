@@ -36,12 +36,19 @@ func accessRoute(host, port string) string {
 		if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") || strings.HasPrefix(host, "ssh://") {
 			return host
 		}
-		if net.ParseIP(host) != nil {
-			return "http://" + host
+		if net.ParseIP(strings.Trim(host, "[]")) != nil {
+			literal := strings.Trim(host, "[]")
+			if strings.Contains(literal, ":") {
+				return "http://[" + literal + "]"
+			}
+			return "http://" + literal
 		}
 		return schemeForHost(host) + "://" + host
 	}
-	return schemeForPort(port) + "://" + host + ":" + port
+	// JoinHostPort correctly brackets IPv6 literals while leaving DNS names
+	// unchanged. Trim brackets first because Compose permits bracketed binds.
+	host = strings.Trim(host, "[]")
+	return schemeForPort(port) + "://" + net.JoinHostPort(host, port)
 }
 
 func schemeForHost(host string) string {

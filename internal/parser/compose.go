@@ -2,9 +2,11 @@ package parser
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -16,16 +18,17 @@ type ComposeProject struct {
 }
 
 type ComposeService struct {
-	Name      string
-	Image     string
-	Build     string
-	Ports     []string
-	Volumes   []string
-	Networks  []string
-	Exposure  []string
-	DependsOn []string
-	EnvVars   []string
-	Warnings  []string
+	Name        string
+	Image       string
+	Build       string
+	Ports       []string
+	NetworkMode string
+	Volumes     []string
+	Networks    []string
+	Exposure    []string
+	DependsOn   []string
+	EnvVars     []string
+	Warnings    []string
 }
 
 type composeFile struct {
@@ -37,6 +40,8 @@ type composeService struct {
 	Image       string    `yaml:"image"`
 	Build       yaml.Node `yaml:"build"`
 	Ports       yaml.Node `yaml:"ports"`
+	Expose      yaml.Node `yaml:"expose"`
+	NetworkMode yaml.Node `yaml:"network_mode"`
 	Volumes     yaml.Node `yaml:"volumes"`
 	Networks    yaml.Node `yaml:"networks"`
 	DependsOn   yaml.Node `yaml:"depends_on"`
@@ -80,17 +85,19 @@ func ParseCompose(path string) (ComposeProject, error) {
 	for _, name := range names {
 		raw := file.Services[name]
 		service := ComposeService{
-			Name:      name,
-			Image:     raw.Image,
-			Build:     stringifyNode(raw.Build),
-			Ports:     stringifyNodeSlice(raw.Ports),
-			Volumes:   stringifyNodeSlice(raw.Volumes),
-			Networks:  networks(raw.Networks),
-			Exposure:  composeExposure(raw),
-			DependsOn: dependsOn(raw.DependsOn),
-			EnvVars:   envVars(raw.Environment),
+			Name:        name,
+			Image:       raw.Image,
+			Build:       stringifyNode(raw.Build),
+			Ports:       stringifyNodeSlice(raw.Ports),
+			NetworkMode: stringValueNode(raw.NetworkMode),
+			Volumes:     stringifyNodeSlice(raw.Volumes),
+			Networks:    networks(raw.Networks),
+			Exposure:    composeExposure(raw),
+			DependsOn:   dependsOn(raw.DependsOn),
+			EnvVars:     envVars(raw.Environment),
 		}
 		service.Warnings = append(service.Warnings, composeShapeWarnings(name, raw)...)
+		service.Warnings = append(service.Warnings, composePortWarnings(name, raw.Ports)...)
 		if !hasComposeHealthcheck(raw.Healthcheck) {
 			service.Warnings = append(service.Warnings, "missing healthcheck")
 		}
@@ -146,12 +153,21 @@ func envVars(value yaml.Node) []string {
 
 func composeExposure(service composeService) []string {
 	var result []string
+	// Host networking has no independent container address or published-port
+	// boundary. Do not turn its declarations into a guessed host endpoint.
+	if composeNetworkMode(service.NetworkMode) == "host" {
+		return labelRoutes(service.Labels)
+	}
 	for _, port := range nodeSequence(service.Ports) {
 		result = append(result, publishedPortRoutes(*port)...)
 	}
-	result = append(result, staticAddressRoutes(service.Networks, service.Ports)...)
+	result = append(result, staticAddressRoutes(service.Networks, service.Ports, service.Expose)...)
 	result = append(result, labelRoutes(service.Labels)...)
 	return uniqueSorted(result)
+}
+
+func composeNetworkMode(value yaml.Node) string {
+	return strings.ToLower(strings.TrimSpace(stringValueNode(value)))
 }
 
 func publishedPortRoutes(value yaml.Node) []string {
@@ -159,82 +175,180 @@ func publishedPortRoutes(value yaml.Node) []string {
 	switch value.Kind {
 	case yaml.ScalarNode:
 		typed := value.Value
-		host, published, ok := shortPublishedPort(typed)
-		if !ok || host == "" || host == "0.0.0.0" {
+		host, published, target, protocol, ok := shortPublishedPort(typed)
+		if !ok || host == "" || wildcardBind(host) || !httpRouteProtocol(protocol) {
 			return nil
 		}
-		return []string{accessRoute(host, published)}
+		return publishedRoutes(host, published, target, true)
 	case yaml.MappingNode:
 		published := stringValueNode(mappingValue(value, "published"))
+		target := stringValueNode(mappingValue(value, "target"))
 		host := stringValueNode(mappingValue(value, "host_ip"))
-		if published == "" || host == "" || host == "0.0.0.0" {
+		protocol := stringValueNode(mappingValue(value, "protocol"))
+		if published == "" || host == "" || wildcardBind(host) || !httpRouteProtocol(protocol) {
 			return nil
 		}
-		return []string{accessRoute(host, published)}
+		return publishedRoutes(host, published, target, false)
 	default:
 		return nil
 	}
 }
 
-func shortPublishedPort(value string) (string, string, bool) {
-	value = strings.TrimSpace(strings.SplitN(value, "/", 2)[0])
+func shortPublishedPort(value string) (string, string, string, string, bool) {
+	value, protocol := splitPortProtocol(value)
 	if !strings.Contains(value, ":") {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	parts := strings.Split(value, ":")
 	if len(parts) < 2 {
-		return "", "", false
+		return "", "", "", "", false
 	}
+	target := parts[len(parts)-1]
 	published := parts[len(parts)-2]
 	host := ""
 	if len(parts) > 2 {
 		host = strings.Join(parts[:len(parts)-2], ":")
 	}
-	if published == "" {
-		return "", "", false
+	if published == "" || target == "" {
+		return "", "", "", "", false
 	}
-	return host, published, true
+	return host, published, target, protocol, true
 }
 
-func staticAddressRoutes(networks yaml.Node, ports yaml.Node) []string {
+func wildcardBind(host string) bool {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.Unmap().IsUnspecified()
+	}
+	return host == "0.0.0.0" || host == "::"
+}
+
+func httpRouteProtocol(protocol string) bool {
+	return protocol == "" || strings.EqualFold(strings.TrimSpace(protocol), "tcp")
+}
+
+func splitPortProtocol(value string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(value), "/", 2)
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
+}
+
+func publishedRoutes(host, published, target string, allowTargetRange bool) []string {
+	// Long syntax defines target as one container port. Short syntax alone
+	// permits matching published and target ranges.
+	if !allowTargetRange && isPortRange(target) {
+		return nil
+	}
+	publishedPorts := composePortRange(published)
+	targetPorts := composePortRange(target)
+	// Compose treats unequal port ranges as an allocation pool: Docker selects
+	// one published port for the target. That runtime-selected host port is not
+	// known from the declaration, so do not invent published-host routes.
+	if len(publishedPorts) == 0 || len(publishedPorts) != len(targetPorts) {
+		return nil
+	}
+	var result []string
+	for _, port := range publishedPorts {
+		result = append(result, accessRoute(host, port))
+	}
+	return result
+}
+
+func staticAddressRoutes(networks, ports, expose yaml.Node) []string {
 	var addresses []string
 	for _, network := range mappingValues(networks) {
-		ip := stringValueNode(mappingValue(network, "ipv4_address"))
-		if ip != "" {
-			addresses = append(addresses, ip)
+		for _, key := range []string{"ipv4_address", "ipv6_address"} {
+			if ip := stringValueNode(mappingValue(network, key)); ip != "" {
+				addresses = append(addresses, ip)
+			}
 		}
 	}
-	var targetPorts []string
-	for _, port := range nodeSequence(ports) {
-		if target := targetPort(*port); target != "" {
-			targetPorts = append(targetPorts, target)
-		}
-	}
+	targetPorts := composeTargetPorts(ports, expose)
 	var result []string
 	for _, address := range uniqueSorted(addresses) {
 		if len(targetPorts) == 0 {
-			result = append(result, accessRoute(address, ""))
+			// Retain the declared address as inventory, but make its
+			// non-monitorable status explicit rather than guessing port 80.
+			result = append(result, "address/"+address)
 			continue
 		}
 		for _, port := range uniqueSorted(targetPorts) {
 			result = append(result, accessRoute(address, port))
 		}
 	}
-	return result
+	return uniqueSorted(result)
 }
 
-func targetPort(value yaml.Node) string {
+func composeTargetPorts(ports, expose yaml.Node) []string {
+	var result []string
+	for _, source := range []yaml.Node{ports, expose} {
+		for _, port := range nodeSequence(source) {
+			result = append(result, targetPorts(*port)...)
+		}
+	}
+	return uniqueSorted(result)
+}
+
+func targetPorts(value yaml.Node) []string {
 	value = resolveAlias(value)
+	var target, protocol string
 	switch value.Kind {
 	case yaml.ScalarNode:
-		value := strings.TrimSpace(strings.SplitN(value.Value, "/", 2)[0])
-		parts := strings.Split(value, ":")
-		return parts[len(parts)-1]
+		raw, parsedProtocol := splitPortProtocol(value.Value)
+		protocol = parsedProtocol
+		parts := strings.Split(raw, ":")
+		target = parts[len(parts)-1]
 	case yaml.MappingNode:
-		return stringValueNode(mappingValue(value, "target"))
+		target = stringValueNode(mappingValue(value, "target"))
+		protocol = stringValueNode(mappingValue(value, "protocol"))
+		// Compose long syntax accepts one target/container port, not a range.
+		if isPortRange(target) {
+			return nil
+		}
 	default:
-		return ""
+		return nil
 	}
+	if !httpRouteProtocol(protocol) {
+		return nil
+	}
+	return composePortRange(target)
+}
+
+func isPortRange(value string) bool {
+	return strings.Contains(strings.TrimSpace(value), "-")
+}
+
+func composePortRange(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if !strings.Contains(value, "-") {
+		port, err := strconv.ParseUint(value, 10, 16)
+		if err != nil || port == 0 {
+			return nil
+		}
+		return []string{value}
+	}
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return nil
+	}
+	start, startErr := strconv.ParseUint(parts[0], 10, 16)
+	end, endErr := strconv.ParseUint(parts[1], 10, 16)
+	if startErr != nil || endErr != nil || start == 0 || end < start {
+		return nil
+	}
+	// Compose permits equivalent host:container port ranges. Each target port is
+	// a declared container listener, so retaining every member avoids inventing
+	// a synthetic single-port route. https://docs.docker.com/reference/compose-file/services/#ports
+	result := make([]string, 0, end-start+1)
+	for port := start; port <= end; port++ {
+		result = append(result, strconv.FormatUint(port, 10))
+	}
+	return result
 }
 
 func labelRoutes(value yaml.Node) []string {
@@ -347,6 +461,21 @@ func composeShapeWarnings(serviceName string, service composeService) []string {
 			continue
 		}
 		warnings = append(warnings, fmt.Sprintf("unsupported compose services.%s.%s shape: %s", serviceName, field.name, yamlKindName(value.Kind)))
+	}
+	sort.Strings(warnings)
+	return warnings
+}
+
+func composePortWarnings(serviceName string, ports yaml.Node) []string {
+	var warnings []string
+	for _, port := range nodeSequence(ports) {
+		port := resolveAlias(*port)
+		if port.Kind != yaml.MappingNode {
+			continue
+		}
+		if target := stringValueNode(mappingValue(port, "target")); isPortRange(target) {
+			warnings = append(warnings, fmt.Sprintf("invalid compose services.%s.ports target range skipped: long syntax target must be a single container port", serviceName))
+		}
 	}
 	sort.Strings(warnings)
 	return warnings
