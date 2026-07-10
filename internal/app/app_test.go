@@ -128,6 +128,397 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	}
 }
 
+func TestNewRegistersAlertingSecretsForStorageRedaction(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Alerting: config.AlertingConfig{
+			Sinks: config.AlertingSinksConfig{
+				Webhook: config.WebhookAlertSinkConfig{
+					URL:          "https://hooks.example.test/api/services/webhook-secret?token=123456&id=services",
+					RedactValues: []string{"abc123", "x6"},
+					Headers: map[string]string{
+						"Authorization": "Bearer 654321",
+						"Content-Type":  "application/json",
+					},
+				},
+				Discord: config.DiscordAlertSinkConfig{
+					WebhookURL: "https://discord.example.test/api/webhooks/123/discord-secret-42",
+				},
+				HomeAssistant: config.HomeAssistantAlertSinkConfig{
+					Token:     "ha-token-secret",
+					WebhookID: "ha-webhook-secret",
+				},
+			},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	event, _, err := app.store.EnqueueAlertEvent(context.Background(), storage.AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "failed webhook-secret abc123 x6 123456 654321 discord-secret-42 ha-token-secret ha-webhook-secret id services application/json",
+		DedupeKey: "svc:webhook-secret:abc123:x6",
+	}, []string{"webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := app.store.ClaimPendingAlertDeliveries(context.Background(), "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := app.store.RecordAlertDispatchResult(context.Background(), claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, storage.AlertDispatchStatusDeadLettered, "abc123 x6 123456 654321 id services application/json"); err != nil {
+		t.Fatal(err)
+	}
+	var reason, dedupeKey, lastError string
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.QueryRowContext(context.Background(), `SELECT reason, dedupe_key FROM alert_events WHERE id=?`, event.ID).Scan(&reason, &dedupeKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT last_error FROM alert_dispatches WHERE event_id=?`, event.ID).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"webhook-secret", "abc123", "x6", "123456", "654321", "discord-secret-42", "ha-token-secret", "ha-webhook-secret"} {
+		if strings.Contains(reason, secret) || strings.Contains(dedupeKey, secret) || strings.Contains(lastError, secret) {
+			t.Fatalf("alert event persisted secret %q: reason=%q dedupe=%q last_error=%q", secret, reason, dedupeKey, lastError)
+		}
+	}
+	for _, nonSecret := range []string{"id", "services", "application/json"} {
+		if !strings.Contains(reason, nonSecret) || !strings.Contains(lastError, nonSecret) {
+			t.Fatalf("non-secret %q was redacted unexpectedly: reason=%q last_error=%q", nonSecret, reason, lastError)
+		}
+	}
+}
+
+func TestNewDoesNotRegisterBareAlertURLUsernameForGlobalRedaction(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Alerting: config.AlertingConfig{
+			Sinks: config.AlertingSinksConfig{
+				Webhook: config.WebhookAlertSinkConfig{
+					URL: "https://git@example.test/hooks",
+				},
+			},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	event, _, err := app.store.EnqueueAlertEvent(context.Background(), storage.AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "github.com-service",
+		NewState:  "unhealthy",
+		Reason:    "github.com repository identity preserved",
+		DedupeKey: "github.com:identity",
+	}, []string{"webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := app.store.ClaimPendingAlertDeliveries(context.Background(), "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := app.store.RecordAlertDispatchResult(context.Background(), claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, storage.AlertDispatchStatusDeadLettered, "github.com failed"); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var serviceID, reason, dedupeKey, lastError string
+	if err := db.QueryRowContext(context.Background(), `SELECT service_id, reason, dedupe_key FROM alert_events WHERE id=?`, event.ID).Scan(&serviceID, &reason, &dedupeKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT last_error FROM alert_dispatches WHERE event_id=?`, event.ID).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	for field, value := range map[string]string{"service_id": serviceID, "reason": reason, "dedupe_key": dedupeKey, "last_error": lastError} {
+		if !strings.Contains(value, "github.com") || strings.Contains(value, "[REDACTED]hub.com") {
+			t.Fatalf("%s = %q, want bare URL username not globally redacted", field, value)
+		}
+	}
+}
+
+func TestNewRegistersRawEscapedAlertURLSecretsForStorageRedaction(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	pathToken := "s%65cretTok%65n42"
+	queryToken := "q%75eryTok%65n42"
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Alerting: config.AlertingConfig{
+			Sinks: config.AlertingSinksConfig{
+				Webhook: config.WebhookAlertSinkConfig{
+					URL: "https://hooks.example.test/api/" + pathToken + "?token=" + queryToken,
+				},
+			},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	event, _, err := app.store.EnqueueAlertEvent(context.Background(), storage.AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "failed " + pathToken + " secretToken42 " + queryToken + " queryToken42",
+		DedupeKey: "health:svc:" + pathToken + ":" + queryToken,
+	}, []string{"webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := app.store.ClaimPendingAlertDeliveries(context.Background(), "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := app.store.RecordAlertDispatchResult(context.Background(), claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, storage.AlertDispatchStatusDeadLettered, "failed "+pathToken+" "+queryToken); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "gitops-dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var reason, dedupeKey, lastError string
+	if err := db.QueryRowContext(context.Background(), `SELECT reason, dedupe_key FROM alert_events WHERE id=?`, event.ID).Scan(&reason, &dedupeKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(context.Background(), `SELECT last_error FROM alert_dispatches WHERE event_id=?`, event.ID).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{pathToken, "secretToken42", queryToken, "queryToken42"} {
+		if strings.Contains(reason, secret) || strings.Contains(dedupeKey, secret) || strings.Contains(lastError, secret) {
+			t.Fatalf("persisted alert text contains escaped secret %q: reason=%q dedupe=%q last_error=%q", secret, reason, dedupeKey, lastError)
+		}
+	}
+}
+
+func TestNewRedactsAlertSecretsBeforeCanonicalizeFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "gitops-dashboard.db")
+	secret := "ha-token-secret"
+	seed, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, inserted, err := seed.EnqueueAlertEvent(ctx, storage.AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "home assistant token " + secret,
+		DedupeKey: "health:svc:" + secret,
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"home-assistant"}, time.Hour)
+	if err != nil {
+		_ = seed.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = seed.Close()
+		t.Fatal("inserted = false, want seed alert event")
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+DROP TABLE monitor_overrides;
+CREATE TABLE monitor_overrides (id TEXT NOT NULL);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Alerting: config.AlertingConfig{
+			Sinks: config.AlertingSinksConfig{
+				HomeAssistant: config.HomeAssistantAlertSinkConfig{
+					Token:     secret,
+					WebhookID: "gitops-alert",
+				},
+			},
+		},
+	}
+	app, err := New(cfg, slog.Default())
+	if err == nil {
+		app.Close()
+		t.Fatal("New succeeded, want injected canonicalize failure")
+	}
+
+	db, err = sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var reason, dedupeKey string
+	if err := db.QueryRowContext(ctx, `SELECT reason, dedupe_key FROM alert_events WHERE id=?`, event.ID).Scan(&reason, &dedupeKey); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(reason, secret) || strings.Contains(dedupeKey, secret) {
+		t.Fatalf("startup failure left alert secret unredacted: reason=%q dedupe=%q", reason, dedupeKey)
+	}
+}
+
+func TestNewRedactsDisabledAlertingSinkSecrets(t *testing.T) {
+	t.Setenv("GITOPS_DISABLED_HA_TOKEN", "disabled-ha-env-token")
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "gitops-dashboard.db")
+	seed, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, inserted, err := seed.EnqueueAlertEvent(ctx, storage.AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "disabled sink tokens disabled-ha-literal-token disabled-ha-env-token",
+		DedupeKey: "health:svc:disabled-ha-literal-token:disabled-ha-env-token",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"home-assistant"}, time.Hour)
+	if err != nil {
+		_ = seed.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = seed.Close()
+		t.Fatal("inserted = false, want seed alert event")
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`
+server:
+  dataDir: %q
+  repoCacheDir: %q
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    homeAssistant:
+      enabled: false
+      token: disabled-ha-literal-token
+      tokenEnv: GITOPS_DISABLED_HA_TOKEN
+`, dataDir, filepath.Join(t.TempDir(), "repos"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var reason, dedupeKey string
+	if err := db.QueryRowContext(ctx, `SELECT reason, dedupe_key FROM alert_events WHERE id=?`, event.ID).Scan(&reason, &dedupeKey); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"disabled-ha-literal-token", "disabled-ha-env-token"} {
+		if strings.Contains(reason, secret) || strings.Contains(dedupeKey, secret) {
+			t.Fatalf("disabled sink token %q remained in persisted alert text: reason=%q dedupe=%q", secret, reason, dedupeKey)
+		}
+	}
+}
+
+func TestNewWarnsAlertingWorkerDeferred(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Alerting: config.AlertingConfig{
+			Sinks: config.AlertingSinksConfig{
+				Discord: config.DiscordAlertSinkConfig{
+					Enabled:    true,
+					WebhookURL: "https://discord.example.test/api/webhooks/123/token",
+				},
+			},
+		},
+	}
+	app, err := New(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if !strings.Contains(logs.String(), "alerting configured: delivery worker not yet available (foundations only)") {
+		t.Fatalf("logs = %q, want alerting worker deferral warning", logs.String())
+	}
+}
+
 func TestReadyzReportsClosedDatabase(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{
@@ -596,6 +987,44 @@ func TestReadyzUsesLiveProbeWithAdvisoryStartupWarnings(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), "services.images_json") {
 		t.Fatalf("healed readyz body exposed startup warning details: %q", res.Body.String())
+	}
+}
+
+func TestReadyzAdvisesWhenAlertStateLocked(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	keyPath := filepath.Join(dataDir, "alert-dedupe.key")
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	warnings := strings.Join(app.store.StartupWarnings(), "\n")
+	if !strings.Contains(warnings, "alert state locked") || !strings.Contains(warnings, "dedupe key unavailable") {
+		t.Fatalf("startup warnings = %q, want alert locked detail", warnings)
+	}
+	res := httptest.NewRecorder()
+	app.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("readyz status = %d, want 200 advisory; body=%q", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), "startup storage warnings present") {
+		t.Fatalf("readyz body = %q, want startup warning advisory", res.Body.String())
 	}
 }
 

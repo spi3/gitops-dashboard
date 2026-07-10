@@ -40,6 +40,44 @@ repositories:
 	if len(cfg.Repositories[0].ExcludePaths) != 1 || cfg.Repositories[0].ExcludePaths[0] != "clusters/retired" {
 		t.Fatalf("excludePaths = %#v", cfg.Repositories[0].ExcludePaths)
 	}
+	if cfg.Alerting.Enabled() {
+		t.Fatalf("alerting enabled = true, want absent alerting config disabled")
+	}
+	if got, err := cfg.Alerting.DebounceDuration(); err != nil || got.String() != "30s" {
+		t.Fatalf("alerting debounce = %v, err=%v; want 30s", got, err)
+	}
+}
+
+func TestLoadConfigCanonicalizesAlertSinkNamesAndRejectsDescendingRetryBounds(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth: {mode: dev-no-auth}
+alerting:
+  retry: {initialInterval: 1m, maxInterval: 10s}
+  sinks:
+    webhook: {name: " custom-webhook "}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "maxInterval") {
+		t.Fatalf("Load error = %v, want retry ordering error", err)
+	}
+	if err := os.WriteFile(path, []byte(`
+auth: {mode: dev-no-auth}
+alerting:
+  sinks:
+    webhook: {name: " custom-webhook "}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alerting.Sinks.Webhook.Name != "custom-webhook" || cfg.Alerting.Sinks.Discord.Name != "discord" {
+		t.Fatalf("effective sink names = %#v", cfg.Alerting.Sinks)
+	}
 }
 
 func TestLoadConfigRejectsInvalidDurations(t *testing.T) {
@@ -298,6 +336,532 @@ runtime:
 	}
 }
 
+func TestLoadConfigLoadsAlertingSinksWithEnvAndFileSecrets(t *testing.T) {
+	t.Setenv("GITOPS_ALERT_WEBHOOK_URL", "https://hooks.example.test/gitops")
+	t.Setenv("GITOPS_ALERT_AUTH_HEADER", "Bearer webhook-secret")
+	t.Setenv("GITOPS_HOME_ASSISTANT_TOKEN", "ha-token")
+	dir := t.TempDir()
+	discordURLFile := filepath.Join(dir, "discord-url")
+	secretHeaderFile := filepath.Join(dir, "header")
+	webhookIDFile := filepath.Join(dir, "webhook-id")
+	if err := os.WriteFile(discordURLFile, []byte("https://discord.example.test/api/webhooks/123/token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretHeaderFile, []byte("header-file-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(webhookIDFile, []byte("ha-webhook-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(`
+auth:
+  mode: dev-no-auth
+alerting:
+  debounce: 15s
+  cooldown: 2m
+  retry:
+    maxAttempts: 4
+    initialInterval: 5s
+    maxInterval: 1m
+  sinks:
+    webhook:
+      enabled: true
+      urlEnv: GITOPS_ALERT_WEBHOOK_URL
+      redactValues:
+        - x6
+      method: post
+      headerEnv:
+        Authorization: GITOPS_ALERT_AUTH_HEADER
+      headerFile:
+        X-Secret: "%s"
+      bodyTemplate: '{"service":"{{ .ServiceID }}"}'
+      include:
+        services:
+          - svc
+        targets:
+          - docker
+    discord:
+      enabled: true
+      webhookURLFile: "%s"
+    homeAssistant:
+      enabled: true
+      baseURL: http://homeassistant.local:8123
+      insecureAllowHTTP: true
+      tokenEnv: GITOPS_HOME_ASSISTANT_TOKEN
+      webhookIDFile: "%s"
+`, secretHeaderFile, discordURLFile, webhookIDFile)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Alerting.Enabled() {
+		t.Fatal("alerting enabled = false, want true")
+	}
+	if cfg.Alerting.Sinks.Webhook.URL != "https://hooks.example.test/gitops" {
+		t.Fatalf("webhook URL = %q", cfg.Alerting.Sinks.Webhook.URL)
+	}
+	if cfg.Alerting.Sinks.Webhook.Method != "POST" {
+		t.Fatalf("webhook method = %q, want POST", cfg.Alerting.Sinks.Webhook.Method)
+	}
+	if got := cfg.Alerting.Sinks.Webhook.Headers["Authorization"]; got != "Bearer webhook-secret" {
+		t.Fatalf("authorization header = %q", got)
+	}
+	if got := cfg.Alerting.Sinks.Webhook.Headers["X-Secret"]; got != "header-file-secret" {
+		t.Fatalf("file header = %q", got)
+	}
+	if !stringSliceContains(cfg.Alerting.RedactionValues, "x6") {
+		t.Fatalf("alerting redaction values = %#v, want explicit redactValues entry", cfg.Alerting.RedactionValues)
+	}
+	if cfg.Alerting.Sinks.Discord.WebhookURL != "https://discord.example.test/api/webhooks/123/token" {
+		t.Fatalf("discord webhook URL = %q", cfg.Alerting.Sinks.Discord.WebhookURL)
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.Token != "ha-token" {
+		t.Fatalf("home assistant token = %q", cfg.Alerting.Sinks.HomeAssistant.Token)
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.WebhookID != "ha-webhook-secret" {
+		t.Fatalf("home assistant webhook ID = %q", cfg.Alerting.Sinks.HomeAssistant.WebhookID)
+	}
+	if got, err := cfg.Alerting.RetryInitialIntervalDuration(); err != nil || got.String() != "5s" {
+		t.Fatalf("retry initial interval = %v, err=%v; want 5s", got, err)
+	}
+}
+
+func TestLoadConfigResolvesDisabledAlertingSecretsBestEffort(t *testing.T) {
+	t.Setenv("GITOPS_DISABLED_HA_TOKEN", "disabled-ha-token-env")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    homeAssistant:
+      enabled: false
+      token: disabled-ha-token-literal
+      tokenEnv: GITOPS_DISABLED_HA_TOKEN
+      webhookIDEnv: MISSING_DISABLED_HA_WEBHOOK_ID
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alerting.Enabled() {
+		t.Fatal("alerting enabled = true, want disabled sink not to enable delivery")
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.Token != "disabled-ha-token-literal" {
+		t.Fatalf("disabled home assistant token = %q, want literal preserved for disabled delivery config", cfg.Alerting.Sinks.HomeAssistant.Token)
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.WebhookID != "" {
+		t.Fatalf("disabled missing webhook env resolved to %q, want non-fatal empty value", cfg.Alerting.Sinks.HomeAssistant.WebhookID)
+	}
+	for _, want := range []string{"disabled-ha-token-literal", "disabled-ha-token-env"} {
+		if !stringSliceContains(cfg.Alerting.RedactionValues, want) {
+			t.Fatalf("disabled redaction values = %#v, want %q", cfg.Alerting.RedactionValues, want)
+		}
+	}
+}
+
+func TestLoadConfigLoadsAlertingResetOnMissingKey(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  resetOnMissingKey: true
+  resetToken: second-arm
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Alerting.ResetOnMissingKey {
+		t.Fatal("alerting resetOnMissingKey = false, want true")
+	}
+	if cfg.Alerting.ResetToken != "second-arm" {
+		t.Fatalf("alerting resetToken = %q, want second-arm", cfg.Alerting.ResetToken)
+	}
+}
+
+func TestLoadConfigRejectsAlertingSinkNameContainingSecret(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      name: webhook-secret-name
+      url: https://hooks.example.test/gitops
+      redactValues:
+        - secret
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want sink name secret validation error")
+	}
+	if !strings.Contains(err.Error(), "alerting.sinks.webhook.name") || !strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error = %v, want sink name secret validation", err)
+	}
+}
+
+func TestLoadConfigRejectsAlertingSinkNameContainingInferredURLSecret(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      name: alerts-abc123DEF
+      url: https://hooks.example.test/webhooks/abc123DEF
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want inferred sink name secret validation error")
+	}
+	if !strings.Contains(err.Error(), "alerting.sinks.webhook.name") || !strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error = %v, want inferred sink name secret validation", err)
+	}
+}
+
+func TestLoadConfigRejectsAlertingSinkNameContainingEncodedSecret(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      name: alerts-tok%2Fsecret%3F
+      url: https://hooks.example.test/gitops
+      redactValues:
+        - tok/secret?
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want encoded sink name secret validation error")
+	}
+	if !strings.Contains(err.Error(), "alerting.sinks.webhook.name") || !strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error = %v, want encoded sink name secret validation", err)
+	}
+}
+
+func TestLoadConfigRejectsDuplicateAlertingSinkNames(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      name: alerts
+    discord:
+      name: alerts
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded, want duplicate sink name validation error")
+	}
+	if !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("error = %v, want duplicate sink name validation", err)
+	}
+}
+
+func TestLoadConfigDoesNotTreatNonSecretAlertHeadersAsRedactionValues(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      headers:
+        Content-Type: application/json
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nonSecret := range []string{"application/json", "https://hooks.example.test/gitops"} {
+		if stringSliceContains(cfg.Alerting.RedactionValues, nonSecret) {
+			t.Fatalf("alerting redaction values = %#v, want non-secret %q omitted", cfg.Alerting.RedactionValues, nonSecret)
+		}
+	}
+}
+
+func TestAlertAuthorizationRedactionValuesIncludeEverySchemeCredential(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"Basic dXNlcjpwYXNz", "Token non-bearer-secret"} {
+		values := alertHeaderRedactionValues("Authorization", raw)
+		parts := strings.Fields(raw)
+		if !stringSliceContains(values, raw) || !stringSliceContains(values, parts[1]) {
+			t.Fatalf("redaction values for %q = %#v, want complete value and credential", raw, values)
+		}
+	}
+}
+
+func TestLoadConfigRejectsAlertHeaderCaseInsensitiveSourceDuplicates(t *testing.T) {
+	t.Setenv("GITOPS_ALERT_AUTH_HEADER", "Bearer env-token")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      headers:
+        authorization: Bearer literal-token
+      headerEnv:
+        Authorization: GITOPS_ALERT_AUTH_HEADER
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "Authorization") || !strings.Contains(errText, "must use only one") {
+		t.Fatalf("error = %q, want case-insensitive header duplicate rejection", errText)
+	}
+}
+
+func TestLoadConfigRejectsInvalidAlertHeaderName(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      headers:
+        "Bad Header": value
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "valid HTTP header name") {
+		t.Fatalf("error = %q, want invalid header name rejection", errText)
+	}
+}
+
+func TestLoadConfigRejectsAlertHeaderCRLFValue(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      headers:
+        X-Token: "bad\nvalue"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "CR or LF") {
+		t.Fatalf("error = %q, want CR/LF header value rejection", errText)
+	}
+}
+
+func TestLoadConfigRejectsInvalidAlertingURL(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: not-a-url
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.webhook.url") {
+		t.Fatalf("error = %q, want alerting webhook URL context", errText)
+	}
+}
+
+func TestLoadConfigRejectsPlainHTTPDiscordWebhook(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    discord:
+      enabled: true
+      webhookURL: http://discord.example.test/api/webhooks/123/token
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.discord.webhookURL must use https") {
+		t.Fatalf("error = %q, want discord https requirement", errText)
+	}
+}
+
+func TestLoadConfigRequiresExplicitInsecureHTTPForGenericWebhook(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: http://hooks.example.test/gitops
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.webhook.insecureAllowHTTP") {
+		t.Fatalf("error = %q, want insecureAllowHTTP requirement", errText)
+	}
+
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: http://hooks.example.test/gitops
+      insecureAllowHTTP: true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load with insecureAllowHTTP failed: %v", err)
+	}
+	if !cfg.Alerting.Sinks.Webhook.InsecureAllowHTTP || cfg.Alerting.Sinks.Webhook.URL != "http://hooks.example.test/gitops" {
+		t.Fatalf("webhook config = %#v, want accepted explicit HTTP opt-in", cfg.Alerting.Sinks.Webhook)
+	}
+}
+
+func TestLoadConfigRequiresExplicitInsecureHTTPForHomeAssistant(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    homeAssistant:
+      enabled: true
+      baseURL: http://homeassistant.local:8123
+      token: ha-token
+      webhookID: gitops-alert
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.homeAssistant.insecureAllowHTTP") {
+		t.Fatalf("error = %q, want insecureAllowHTTP requirement", errText)
+	}
+
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    homeAssistant:
+      enabled: true
+      baseURL: http://homeassistant.local:8123
+      insecureAllowHTTP: true
+      token: ha-token
+      webhookID: gitops-alert
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load with homeAssistant insecureAllowHTTP failed: %v", err)
+	}
+	if !cfg.Alerting.Sinks.HomeAssistant.InsecureAllowHTTP || cfg.Alerting.Sinks.HomeAssistant.BaseURL != "http://homeassistant.local:8123" {
+		t.Fatalf("home assistant config = %#v, want accepted explicit HTTP opt-in", cfg.Alerting.Sinks.HomeAssistant)
+	}
+
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    homeAssistant:
+      enabled: true
+      baseURL: https://homeassistant.example.test
+      token: ha-token
+      webhookID: gitops-alert
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load with homeAssistant HTTPS failed: %v", err)
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.BaseURL != "https://homeassistant.example.test" {
+		t.Fatalf("home assistant base URL = %q, want HTTPS URL", cfg.Alerting.Sinks.HomeAssistant.BaseURL)
+	}
+}
+
+func TestLoadConfigRejectsInvalidAlertingMethod(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      method: TRACE
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.webhook.method") {
+		t.Fatalf("error = %q, want alerting webhook method context", errText)
+	}
+}
+
 func TestLoadConfigRejectsUnsetEnvVars(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -534,4 +1098,13 @@ func loadError(t *testing.T, path string) string {
 		t.Fatal("Load succeeded, want error")
 	}
 	return err.Error()
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

@@ -101,6 +101,22 @@ agent:
   tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
 ```
 
+Alerting configuration is accepted for the alert-event storage foundations, but
+delivery workers are not active until the follow-up alerting tasks land. Alert
+dedupe state uses an `alert-dedupe.key` sidecar next to the SQLite database;
+when restoring a database, restore that key file with it. If a restore
+intentionally omits the key, set `alerting.resetOnMissingKey: true` for one
+startup to terminalize old alert rows and generate a fresh key, then remove the
+flag. The reset flag is one-shot: if another key problem happens while the same
+flag remains set, alerting locks instead of resetting again. To intentionally
+reset again, change `alerting.resetToken` to a new operator-chosen value for
+that startup, then remove the flag. Restart all dashboard processes after
+restoring or resetting the sidecar key; alert-state writes expect one current
+key fingerprint across running processes and will lock on stale writers. Sink
+URL and header redaction is intentionally conservative; add per-sink
+`redactValues` entries for short tokens or other secrets that are not obvious
+bearer/token values.
+
 Repositories can optionally narrow scanning with path filters. Plain entries
 match that file or directory subtree; glob entries support `*` and recursive
 `**` matching:

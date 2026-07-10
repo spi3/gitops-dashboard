@@ -76,16 +76,20 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger = slog.Default()
 	}
 	dbPath := filepath.Join(cfg.Server.DataDir, "gitops-dashboard.db")
-	store, err := storage.OpenWithLogger(dbPath, logger)
+	redactionValues := append(repositoryRedactionValues(cfg.Repositories), config.AlertingRedactionValues(cfg.Alerting)...)
+	store, err := storage.OpenWithOptions(dbPath, storage.OpenOptions{
+		Logger:                      logger,
+		RedactionValues:             redactionValues,
+		ResetAlertStateOnMissingKey: cfg.Alerting.ResetOnMissingKey,
+		ResetAlertStateToken:        cfg.Alerting.ResetToken,
+		AlertSinkNames:              cfg.Alerting.EnabledSinkNames(),
+		AlertSinkAllowlist:          true,
+	})
 	if err != nil {
 		return nil, err
 	}
-	store.AddRedactionValues(repositoryRedactionValues(cfg.Repositories)...)
+	store.AddRedactionValues(redactionValues...)
 	if err := store.CanonicalizeHTTPRouteTargets(context.Background(), cfg.Runtime.HTTP); err != nil {
-		_ = store.Close()
-		return nil, err
-	}
-	if err := store.RedactPersistedSensitiveValues(context.Background()); err != nil {
 		_ = store.Close()
 		return nil, err
 	}
@@ -117,6 +121,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	app.readinessTTL = readinessCacheTTL
 	app.readinessNow = time.Now
 	app.readinessProbe = app.storageReadinessProbe
+	if cfg.Alerting.Enabled() {
+		logger.Warn("alerting configured: delivery worker not yet available (foundations only)")
+	}
 	return app, nil
 }
 
@@ -145,6 +152,7 @@ func (app *App) Close() {
 func (app *App) RunBackground(ctx context.Context) {
 	app.scanner.RunScheduled(ctx)
 	app.monitor.Run(ctx)
+	// Alert producers and the async delivery worker are intentionally deferred to T-022..T-024.
 }
 
 func (app *App) Handler() http.Handler {

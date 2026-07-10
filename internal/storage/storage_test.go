@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -463,6 +464,96 @@ VALUES(?, ?, 'error', 'failed', ?, '[]')`, "svc-route", target, time.Now().UTC()
 	}
 }
 
+func TestOpenDegradesWhenAlertMetadataPrimaryKeyIsComposite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE storage_metadata (key TEXT, value TEXT NOT NULL, PRIMARY KEY(key, value))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO storage_metadata(key, value) VALUES ('duplicate-key', 'first'), ('duplicate-key', 'second')`); err != nil {
+		t.Fatalf("insert duplicate composite-primary-key metadata rows: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed for alert-only metadata key-constraint skew: %v", err)
+	}
+	defer store.Close()
+	if !strings.Contains(strings.Join(store.StartupWarnings(), "\n"), "alert state locked") {
+		t.Fatalf("warnings = %#v, want alert-state lock", store.StartupWarnings())
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:composite-metadata-key",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM storage_metadata_alert_legacy WHERE key='duplicate-key'`); got != 2 {
+		t.Fatalf("quarantined duplicate metadata rows = %d, want 2", got)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO repositories(name, url, default_ref) VALUES ('core-still-available', 'https://example.test/repo', 'main')`); err != nil {
+		t.Fatalf("core repository write after metadata skew: %v", err)
+	}
+}
+
+func TestCreateAlertDedupeKeySurfacesPartialSidecarCleanupFailures(t *testing.T) {
+	writeErr := errors.New("injected key write failure")
+	closeErr := errors.New("injected key close failure")
+	removeErr := errors.New("injected partial-sidecar removal failure")
+	file := &failingAlertDedupeKeyFile{writeErr: writeErr, closeErr: closeErr}
+	removed := false
+	_, err := createAlertDedupeKeyWithFile("partial-alert-dedupe.key", func(string, int, os.FileMode) (alertDedupeKeyFile, error) {
+		return file, nil
+	}, func(string) error {
+		removed = true
+		return removeErr
+	})
+	if !errors.Is(err, writeErr) || !errors.Is(err, closeErr) || !errors.Is(err, removeErr) {
+		t.Fatalf("create error = %v, want joined write, close, and removal errors", err)
+	}
+	if !removed {
+		t.Fatal("partial sidecar removal was not attempted")
+	}
+}
+
+func TestAlertRedactionFailureDoesNotRollbackCoreRedaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	secret := "core-secret-survives-alert-error"
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO repositories(name, url, default_ref) VALUES ('core-redaction', ?, 'main')`, "https://"+secret+"@example.test/repo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE alert_events; CREATE TABLE alert_events (id TEXT PRIMARY KEY, reason TEXT NOT NULL) WITHOUT ROWID; INSERT INTO alert_events(id, reason) VALUES ('one', ?);`, secret); err != nil {
+		t.Fatal(err)
+	}
+	store.AddRedactionValues(secret)
+	if _, err := store.redactCorePersistedSensitiveValues(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.redactAlertPersistedSensitiveValues(ctx); err == nil {
+		t.Fatal("alert redaction succeeded, want rowid failure")
+	}
+	var url string
+	if err := store.db.QueryRowContext(ctx, `SELECT url FROM repositories WHERE name='core-redaction'`).Scan(&url); err != nil {
+		t.Fatal(err)
+	}
+	assertRedacted(t, url, secret)
+}
+
 func TestReplaceConfiguredServicesPreservesStableStatusHistory(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -685,6 +776,15 @@ func countRows(t *testing.T, store *Store, query string) int {
 	t.Helper()
 	var count int
 	if err := store.db.QueryRowContext(context.Background(), query).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func alertResetConsumedCount(t *testing.T, store *Store, resetToken string) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM alert_dedupe_reset_consumed WHERE token_fingerprint=?`, alertDedupeResetTokenFingerprint(resetToken)).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
@@ -2098,6 +2198,4258 @@ func TestUptimeEmptyIsSlice(t *testing.T) {
 	}
 }
 
+func TestAlertMigrationsAreIdempotent(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("second Open failed: %v", err)
+	}
+	defer store.Close()
+	for _, table := range []string{"alert_events", "alert_dispatches"} {
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("table %s count = %d, want 1", table, count)
+		}
+	}
+}
+
+func TestAlertMigrationRepairsOldEventTableWithoutStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+INSERT INTO alert_events(kind, service_id, new_state, dedupe_key, created_at)
+VALUES('health_transition', 'svc', 'unhealthy', 'legacy-key', '2026-07-09T12:00:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, column := range []string{"status", "dedupe_hash"} {
+		if !tableHasColumn(t, store, "alert_events", column) {
+			t.Fatalf("alert_events missing repaired column %s", column)
+		}
+	}
+	var status, hash string
+	if err := store.db.QueryRowContext(ctx, `SELECT status, dedupe_hash FROM alert_events WHERE dedupe_key='legacy-key'`).Scan(&status, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if status != AlertEventStatusFailed || hash == "" {
+		t.Fatalf("legacy row status/hash = %q/%q, want failed and non-empty hash", status, hash)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO alert_events(kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, status)
+VALUES('health_transition', 'svc-2', 'unhealthy', 'legacy-key', ?, '2026-07-09T12:01:00Z', 'failed')
+`, store.alertDedupeHash("another-raw-key")); err != nil {
+		t.Fatalf("legacy unique dedupe_key constraint was not rebuilt away: %v", err)
+	}
+	fresh, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "legacy-key",
+		CreatedAt: time.Date(2026, 7, 9, 12, 2, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted || fresh.ID == 0 {
+		t.Fatalf("fresh event inserted=%v event=%#v, want dispatchless legacy row not to suppress", inserted, fresh)
+	}
+}
+
+func TestAlertMigrationRemovesLegacyDedupeKeyUniqueBeforeRedaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+INSERT INTO alert_events(kind, service_id, new_state, dedupe_key, created_at)
+VALUES
+  ('health_transition', 'svc-a', 'unhealthy', 'health:svc:secret-a', '2026-07-09T12:00:00Z'),
+  ('health_transition', 'svc-b', 'unhealthy', 'health:svc:secret-b', '2026-07-09T12:01:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := OpenWithOptions(dbPath, OpenOptions{RedactionValues: []string{"secret-a", "secret-b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:[REDACTED]'`); got != 2 {
+		t.Fatalf("redacted dedupe_key rows = %d, want two rows after unique constraint removal", got)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO alert_events(kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, status)
+VALUES('health_transition', 'svc-c', 'unhealthy', 'health:svc:[REDACTED]', ?, '2026-07-09T12:02:00Z', 'failed')
+`, store.alertDedupeHash("health:svc:third")); err != nil {
+		t.Fatalf("dedupe_key unique constraint still active after migration: %v", err)
+	}
+}
+
+func TestAlertSchemaOnlyMigrationDoesNotCompact(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compactions := 0
+	compactRedactedPagesObserver = func() { compactions++ }
+	defer func() { compactRedactedPagesObserver = nil }()
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !tableHasColumn(t, store, "alert_events", "status") {
+		t.Fatal("alert_events status column was not repaired")
+	}
+	if compactions != 0 {
+		t.Fatalf("compactions = %d, want schema-only migration to skip checkpoint/VACUUM", compactions)
+	}
+}
+
+func TestAlertIndexMigrationRepairsSameNamedFullUniqueIndex(t *testing.T) {
+	t.Parallel()
+	testAlertIndexMigrationRepairsSameNamedPendingDedupeIndex(t, `CREATE UNIQUE INDEX idx_alert_events_pending_dedupe_hash ON alert_events(dedupe_hash)`)
+}
+
+func TestAlertIndexMigrationRepairsSameNamedNonUniqueIndex(t *testing.T) {
+	t.Parallel()
+	testAlertIndexMigrationRepairsSameNamedPendingDedupeIndex(t, `CREATE INDEX idx_alert_events_pending_dedupe_hash ON alert_events(dedupe_hash)`)
+}
+
+func testAlertIndexMigrationRepairsSameNamedPendingDedupeIndex(t *testing.T, staleIndexSQL string) {
+	t.Helper()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, staleIndexSQL); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertPendingDedupeIndexShape(t, store)
+}
+
+func assertPendingDedupeIndexShape(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := store.db.QueryContext(ctx, `PRAGMA index_list(alert_events)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatal(err)
+		}
+		if name != "idx_alert_events_pending_dedupe_hash" {
+			continue
+		}
+		found = true
+		if unique != 1 || partial != 1 {
+			t.Fatalf("pending dedupe index unique/partial = %d/%d, want 1/1", unique, partial)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("pending dedupe index missing")
+	}
+	var sqlText string
+	if err := store.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_alert_events_pending_dedupe_hash'`).Scan(&sqlText); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sqlText, "WHERE status='pending' AND dedupe_hash<>''") {
+		t.Fatalf("pending dedupe index sql = %q, want partial predicate", sqlText)
+	}
+}
+
+func TestAlertMigrationRebuildPreservesDispatchForeignKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+PRAGMA foreign_keys=ON;
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(1, 'health_transition', 'svc', 'unhealthy', 'legacy-key', '2026-07-09T12:00:00Z', 'pending');
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at)
+VALUES(1, 'discord', 'pending', '2026-07-09T12:00:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var dispatchSQL string
+	if err := store.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_dispatches'`).Scan(&dispatchSQL); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dispatchSQL, "alert_events_legacy") || !strings.Contains(dispatchSQL, "REFERENCES alert_events(id)") {
+		t.Fatalf("alert_dispatches schema = %s, want FK to alert_events", dispatchSQL)
+	}
+	conn, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 9, 12, 5, 0, 0, time.UTC)
+	if _, err := conn.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns) VALUES(1, 'webhook', 'pending', ?, ?)`, now.Format(time.RFC3339Nano), now.UnixNano()); err != nil {
+		t.Fatalf("valid alert_dispatch insert failed after migration: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns) VALUES(999, 'invalid', 'pending', ?, ?)`, now.Format(time.RFC3339Nano), now.UnixNano()); err == nil {
+		t.Fatal("invalid alert_dispatch insert succeeded, want FK failure")
+	}
+}
+
+func TestRebuildAlertTablesDiscardsConnectionWhenForeignKeyRestorationFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", sqliteDSN(filepath.Join(t.TempDir(), "dashboard.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	restoreErr := errors.New("injected foreign-key restoration failure")
+	store := &Store{
+		db: db,
+		restoreAlertForeignKeys: func(context.Context, *sql.Conn) error {
+			return restoreErr
+		},
+	}
+	err = store.rebuildAlertTables(ctx)
+	if !errors.Is(err, restoreErr) {
+		t.Fatalf("rebuild error = %v, want restoration failure", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var enabled int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("reusable connection foreign_keys = %d, want 1", enabled)
+	}
+}
+
+func TestAlertMigrationRepairsDispatchTableMissingUniqueConstraint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(1, 'health_transition', 'svc', 'unhealthy', 'missing-unique', '2026-07-09T12:00:00Z', 'pending');
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at)
+VALUES(1, 'discord', 'pending', '2026-07-09T12:00:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if ok, err := store.alertDispatchesHasUniqueEventSink(ctx); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("alert_dispatches missing UNIQUE(event_id, sink) after migration")
+	}
+	if ok, err := store.alertDispatchesHasAlertEventsFK(ctx); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("alert_dispatches missing FK to alert_events after migration")
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns) VALUES(1, 'discord', 'pending', '2026-07-09T12:01:00Z', ?)`, time.Date(2026, 7, 9, 12, 1, 0, 0, time.UTC).UnixNano()); err == nil {
+		t.Fatal("duplicate event/sink insert succeeded after migration, want unique constraint")
+	}
+}
+
+func TestAlertDispatchConstraintRebuildMergesDuplicatesByStatusPriority(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, created_at, created_at_ns, status)
+VALUES(1, 'health_transition', 'svc', 'unhealthy', 'constraint-merge', '2026-07-09T12:00:00Z', 100, 'delivered');
+INSERT INTO alert_dispatches(id, event_id, sink, status, attempts, last_error, delivered_at, delivered_at_ns, updated_at, updated_at_ns)
+VALUES
+  (1, 1, 'discord', 'delivered', 5, 'older delivered diagnostic', '2026-07-09T12:00:10Z', 110, '2026-07-09T12:00:10Z', 110),
+  (2, 1, 'discord', 'pending', 2, 'newer pending diagnostic', NULL, NULL, '2026-07-09T12:00:20Z', 120),
+  (3, 1, 'webhook', 'pending', 7, 'older pending diagnostic', NULL, NULL, '2026-07-09T12:00:10Z', 110),
+  (4, 1, 'webhook', 'delivered', 1, 'newer delivered diagnostic', '2026-07-09T12:00:20Z', 120, '2026-07-09T12:00:20Z', 120);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, want := range []struct {
+		sink      string
+		id        int64
+		status    string
+		attempts  int
+		lastError string
+	}{
+		{sink: "discord", id: 1, status: AlertDispatchStatusDelivered, attempts: 5, lastError: "older delivered diagnostic"},
+		{sink: "webhook", id: 4, status: AlertDispatchStatusDelivered, attempts: 1, lastError: "newer delivered diagnostic"},
+	} {
+		var id int64
+		var status string
+		var attempts int
+		var lastError string
+		if err := store.db.QueryRowContext(ctx, `SELECT id, status, attempts, last_error FROM alert_dispatches WHERE event_id=1 AND sink=?`, want.sink).Scan(&id, &status, &attempts, &lastError); err != nil {
+			t.Fatal(err)
+		}
+		if id != want.id || status != want.status || attempts != want.attempts || lastError != want.lastError {
+			t.Fatalf("%s dispatch = id:%d status:%q attempts:%d error:%q, want id:%d status:%q attempts:%d error:%q", want.sink, id, status, attempts, lastError, want.id, want.status, want.attempts, want.lastError)
+		}
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches WHERE event_id=1`); got != 2 {
+		t.Fatalf("merged dispatch rows = %d, want one per sink", got)
+	}
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusDelivered {
+		t.Fatalf("event status = %q, want delivered after sticky delivered dispatch merge", got)
+	}
+}
+
+func TestAlertDispatchForeignKeyEnforcedByDefault(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns)
+VALUES(999, 'discord', 'pending', ?, ?)
+`, now.Format(time.RFC3339Nano), now.UnixNano()); err == nil {
+		t.Fatal("invalid alert_dispatch insert succeeded, want default FK enforcement")
+	}
+}
+
+func TestAlertMigrationReconcilesDuplicatePendingLegacyDedupeHashes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+	CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  lease_expires_at_ns INTEGER,
+  next_attempt_at_ns INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events_legacy(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'health_transition', 'svc-old', 'unhealthy', 'dup-old', 'dup-hash', '2026-07-09T12:00:00Z', 100, 'pending'),
+  (2, 'health_transition', 'svc-new', 'unhealthy', 'dup-new', 'dup-hash', '2026-07-09T12:01:00Z', 200, 'pending');
+INSERT INTO alert_dispatches_legacy(event_id, sink, status, updated_at, updated_at_ns)
+VALUES
+  (1, 'discord', 'pending', '2026-07-09T12:00:00Z', 100),
+  (2, 'webhook', 'pending', '2026-07-09T12:01:00Z', 200);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, table := range []string{"alert_events_legacy", "alert_dispatches_legacy"} {
+		var count int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("legacy table %s still exists after duplicate-dedupe migration", table)
+		}
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE status='pending' AND dedupe_hash='dup-hash'`); got != 1 {
+		t.Fatalf("pending duplicate dedupe rows = %d, want 1", got)
+	}
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusFailed {
+		t.Fatalf("older duplicate event status = %q, want failed", got)
+	}
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusPending {
+		t.Fatalf("newest duplicate event status = %q, want pending", got)
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT sink FROM alert_dispatches WHERE event_id=2 ORDER BY sink`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sinks []string
+	for rows.Next() {
+		var sink string
+		if err := rows.Scan(&sink); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		sinks = append(sinks, sink)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sinks) != 2 || sinks[0] != "discord" || sinks[1] != "webhook" {
+		t.Fatalf("newest event dispatch sinks = %#v, want merged discord/webhook", sinks)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO alert_events(kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES('health_transition', 'svc-dup', 'unhealthy', 'dup-third', 'dup-hash', '2026-07-09T12:02:00Z', 300, 'pending')
+`); err == nil {
+		t.Fatal("duplicate pending dedupe insert succeeded, want repaired unique index")
+	}
+}
+
+func TestAlertMigrationMergesDuplicatePendingDedupeSameSinkByActionableStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  lease_expires_at_ns INTEGER,
+  next_attempt_at_ns INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'health_transition', 'svc-old', 'unhealthy', 'dup-old', 'same-sink-hash', '2026-07-09T12:00:00Z', 100, 'pending'),
+  (2, 'health_transition', 'svc-new', 'unhealthy', 'dup-new', 'same-sink-hash', '2026-07-09T12:01:00Z', 200, 'pending');
+INSERT INTO alert_dispatches(id, event_id, sink, status, last_error, delivered_at, delivered_at_ns, updated_at, updated_at_ns)
+VALUES
+  (1, 1, 'discord', 'in_flight', 'still actionable', NULL, NULL, '2026-07-09T12:00:00Z', 100),
+  (2, 2, 'discord', 'pending', 'newer but less actionable', NULL, NULL, '2026-07-09T12:01:00Z', 200);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusFailed {
+		t.Fatalf("older event status = %q, want failed", got)
+	}
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusPending {
+		t.Fatalf("keeper event status = %q, want pending from merged actionable dispatch", got)
+	}
+	var dispatchID int64
+	var status, lastError string
+	if err := store.db.QueryRowContext(ctx, `SELECT id, status, last_error FROM alert_dispatches WHERE event_id=2 AND sink='discord'`).Scan(&dispatchID, &status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if dispatchID != 1 || status != AlertDispatchStatusInFlight || lastError != "still actionable" {
+		t.Fatalf("merged dispatch = id:%d %q/%q, want original in-flight dispatch ID 1 preserved", dispatchID, status, lastError)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches WHERE event_id=1`); got != 0 {
+		t.Fatalf("duplicate event dispatch rows = %d, want moved/deleted", got)
+	}
+}
+
+func TestAlertMigrationDeliveredDispatchWinsDuplicatePending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  lease_expires_at_ns INTEGER,
+  next_attempt_at_ns INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'health_transition', 'svc-old', 'unhealthy', 'dup-old', 'delivered-pending-hash', '2026-07-09T12:00:00Z', 100, 'pending'),
+  (2, 'health_transition', 'svc-new', 'unhealthy', 'dup-new', 'delivered-pending-hash', '2026-07-09T12:01:00Z', 200, 'pending');
+INSERT INTO alert_dispatches(id, event_id, sink, status, last_error, delivered_at, delivered_at_ns, updated_at, updated_at_ns)
+VALUES
+  (1, 1, 'discord', 'pending', '', NULL, NULL, '2026-07-09T12:00:00Z', 100),
+  (2, 2, 'discord', 'delivered', '', '2026-07-09T12:01:10Z', 210, '2026-07-09T12:01:10Z', 210),
+  (3, 2, 'webhook', 'pending', '', NULL, NULL, '2026-07-09T12:01:20Z', 220);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var keptID int64
+	var keptStatus string
+	if err := store.db.QueryRowContext(ctx, `SELECT id, status FROM alert_dispatches WHERE event_id=2 AND sink='discord'`).Scan(&keptID, &keptStatus); err != nil {
+		t.Fatal(err)
+	}
+	if keptID != 2 || keptStatus != AlertDispatchStatusDelivered {
+		t.Fatalf("keeper dispatch = id:%d status:%q, want delivered dispatch id 2 preserved", keptID, keptStatus)
+	}
+	var duplicateStatus string
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM alert_dispatches WHERE id=1`).Scan(&duplicateStatus); err != nil {
+		t.Fatal(err)
+	}
+	if duplicateStatus != AlertDispatchStatusReset {
+		t.Fatalf("losing pending dispatch status = %q, want reset", duplicateStatus)
+	}
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusPending {
+		t.Fatalf("keeper event status = %q, want pending because webhook is still active", got)
+	}
+	if got, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10); err != nil {
+		t.Fatalf("claim after delivered/pending merge failed: %v", err)
+	} else if len(got) != 1 || got[0].Dispatch.Sink != "webhook" {
+		t.Fatalf("claim after delivered/pending merge = %#v, want only unrelated webhook dispatch", got)
+	}
+}
+
+func TestAlertMigrationDeliveredDispatchWinsDuplicateDeadLettered(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  lease_expires_at_ns INTEGER,
+  next_attempt_at_ns INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES(1, 'health_transition', 'svc', 'unhealthy', 'dup', 'delivered-dead-hash', '2026-07-09T12:00:00Z', 100, 'pending');
+INSERT INTO alert_dispatches(id, event_id, sink, status, last_error, delivered_at, delivered_at_ns, updated_at, updated_at_ns)
+VALUES
+  (1, 1, 'discord', 'delivered', '', '2026-07-09T12:00:10Z', 110, '2026-07-09T12:00:10Z', 110),
+  (2, 1, 'discord', 'dead_lettered', 'terminal diagnostic', NULL, NULL, '2026-07-09T12:01:10Z', 210);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var keptID int64
+	var keptStatus string
+	if err := store.db.QueryRowContext(ctx, `SELECT id, status FROM alert_dispatches WHERE event_id=1 AND sink='discord'`).Scan(&keptID, &keptStatus); err != nil {
+		t.Fatal(err)
+	}
+	if keptID != 1 || keptStatus != AlertDispatchStatusDelivered {
+		t.Fatalf("keeper dispatch = id:%d status:%q, want delivered dispatch id 1 preserved", keptID, keptStatus)
+	}
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusDelivered {
+		t.Fatalf("keeper event status = %q, want delivered", got)
+	}
+	if got, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10); err != nil || len(got) != 0 {
+		t.Fatalf("claim after delivered/dead-lettered merge = %#v, err=%v; want no claimable dispatches", got, err)
+	}
+}
+
+func TestAlertMigrationLeavesTerminalDedupeHistoryUntouched(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  claim_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  lease_expires_at_ns INTEGER,
+  next_attempt_at_ns INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  delivered_at_ns INTEGER,
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'health_transition', 'svc-old', 'unhealthy', 'delivered-history', 'history-hash', '2026-07-09T12:00:00Z', 100, 'delivered'),
+  (2, 'health_transition', 'svc-new', 'unhealthy', 'new-pending', 'history-hash', '2026-07-09T12:01:00Z', 200, 'pending');
+INSERT INTO alert_dispatches(id, event_id, sink, status, last_error, delivered_at, delivered_at_ns, updated_at, updated_at_ns)
+VALUES
+  (1, 1, 'discord', 'delivered', '', '2026-07-09T12:00:10Z', 110, '2026-07-09T12:00:10Z', 110),
+  (2, 2, 'discord', 'pending', '', NULL, NULL, '2026-07-09T12:01:00Z', 200);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusDelivered {
+		t.Fatalf("terminal history status = %q, want delivered", got)
+	}
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusPending {
+		t.Fatalf("new event status = %q, want pending", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_hash='history-hash'`); got != 2 {
+		t.Fatalf("events with shared history hash = %d, want delivered history plus pending event", got)
+	}
+	var status string
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM alert_dispatches WHERE event_id=1 AND sink='discord'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != AlertDispatchStatusDelivered {
+		t.Fatalf("terminal history dispatch status = %q, want delivered", status)
+	}
+}
+
+func TestAlertMigrationResumesInterruptedAlertTableRebuild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  repository TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT '',
+  old_state TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events_legacy(id) ON DELETE CASCADE
+);
+CREATE TABLE alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, partial TEXT NOT NULL DEFAULT '');
+CREATE TABLE alert_dispatches (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL DEFAULT 0, sink TEXT NOT NULL DEFAULT '');
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(7, 'health_transition', 'svc', 'unhealthy', 'resume-key', '2026-07-09T12:00:00.9Z', 'pending');
+INSERT INTO alert_dispatches_legacy(id, event_id, sink, status, updated_at)
+VALUES(11, 7, 'discord', 'pending', '2026-07-09T12:00:00.9Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, table := range []string{"alert_events_legacy", "alert_dispatches_legacy"} {
+		var count int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("legacy table %s still exists after resumed rebuild", table)
+		}
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE id=7`); got != 1 {
+		t.Fatalf("resumed rebuild event rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches WHERE id=11 AND event_id=7`); got != 1 {
+		t.Fatalf("resumed rebuild dispatch rows = %d, want 1", got)
+	}
+}
+
+func TestAlertMigrationLocksWhenCurrentAndLegacyTablesBothContainRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL DEFAULT 0,
+  sink TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL DEFAULT 0,
+  sink TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(7, 'health_transition', 'legacy-svc', 'unhealthy', 'legacy-key', '2026-07-09T12:00:00Z', 'pending');
+INSERT INTO alert_dispatches_legacy(id, event_id, sink, status, updated_at)
+VALUES(17, 7, 'discord', 'pending', '2026-07-09T12:00:00Z');
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(8, 'health_transition', 'current-svc', 'unhealthy', 'current-key', '2026-07-09T12:01:00Z', 'pending');
+INSERT INTO alert_dispatches(id, event_id, sink, status, updated_at)
+VALUES(18, 8, 'webhook', 'pending', '2026-07-09T12:01:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed for conflicted alert tables: %v", err)
+	}
+	warnings := strings.Join(store.StartupWarnings(), "\n")
+	if !strings.Contains(warnings, "alert state locked") || !strings.Contains(warnings, "both alert_dispatches and alert_dispatches_legacy with rows") {
+		t.Fatalf("startup warnings = %q, want alert table conflict guidance", warnings)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:conflicted-alert-tables",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		_ = store.Close()
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, table := range []string{"alert_events", "alert_events_legacy", "alert_dispatches", "alert_dispatches_legacy"} {
+		var count int
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s rows after failed rebuild = %d, want 1", table, count)
+		}
+	}
+}
+
+func TestAlertMigrationFailureRedactsCurrentAndLegacyAlertSecrets(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	secret := "migration-failure-alert-secret"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL DEFAULT 0,
+  sink TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL DEFAULT 0,
+  sink TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  worker_id TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT ''
+);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, insert := range []struct {
+		query string
+		args  []any
+	}{
+		{
+			query: `INSERT INTO alert_events_legacy(id, kind, service_id, new_state, reason, dedupe_key, created_at, status)
+VALUES(7, 'health_transition', 'legacy-svc', 'unhealthy', ?, ?, '2026-07-09T12:00:00Z', 'pending')`,
+			args: []any{"legacy reason " + secret, "legacy-key-" + secret},
+		},
+		{
+			query: `INSERT INTO alert_dispatches_legacy(id, event_id, sink, status, worker_id, last_error, updated_at)
+VALUES(17, 7, 'discord', 'pending', ?, ?, '2026-07-09T12:00:00Z')`,
+			args: []any{"worker-" + secret, "legacy dispatch " + secret},
+		},
+		{
+			query: `INSERT INTO alert_events(id, kind, service_id, new_state, reason, dedupe_key, created_at, status)
+VALUES(8, 'health_transition', 'current-svc', 'unhealthy', ?, ?, '2026-07-09T12:01:00Z', 'pending')`,
+			args: []any{"current reason " + secret, "current-key-" + secret},
+		},
+		{
+			query: `INSERT INTO alert_dispatches(id, event_id, sink, status, worker_id, last_error, updated_at)
+VALUES(18, 8, 'webhook', 'pending', ?, ?, '2026-07-09T12:01:00Z')`,
+			args: []any{"worker-" + secret, "current dispatch " + secret},
+		},
+	} {
+		if _, err := db.ExecContext(ctx, insert.query, insert.args...); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := OpenWithOptions(dbPath, OpenOptions{RedactionValues: []string{secret}})
+	if err != nil {
+		t.Fatalf("Open failed for conflicted alert tables: %v", err)
+	}
+	if !strings.Contains(strings.Join(store.StartupWarnings(), "\n"), "alert state locked") {
+		_ = store.Close()
+		t.Fatalf("startup warnings = %#v, want locked alert state", store.StartupWarnings())
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{
+		`SELECT reason || ' ' || dedupe_key FROM alert_events`,
+		`SELECT reason || ' ' || dedupe_key FROM alert_events_legacy`,
+		`SELECT worker_id || ' ' || last_error FROM alert_dispatches`,
+		`SELECT worker_id || ' ' || last_error FROM alert_dispatches_legacy`,
+	} {
+		rows, err := db.QueryContext(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			if strings.Contains(value, secret) {
+				_ = rows.Close()
+				t.Fatalf("query %q still contains configured secret: %q", query, value)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAlertDispatchTimestampBackfillIgnoresNullNullableTimestamps(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:null-timestamps",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	changed, err := store.backfillAlertDispatchTimestampNS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("timestamp backfill changed rows with NULL nullable timestamps, want no-op")
+	}
+}
+
+func TestAlertMigrationReopensTerminalEventWithActiveDispatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  updated_at TEXT NOT NULL,
+  UNIQUE(event_id, sink),
+  FOREIGN KEY(event_id) REFERENCES alert_events(id) ON DELETE CASCADE
+);
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, created_at, status)
+VALUES(1, 'health_transition', 'svc', 'unhealthy', 'terminal-active', '2026-07-09T12:00:00Z', 'delivered');
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at)
+VALUES(1, 'discord', 'pending', '2026-07-09T12:00:00Z');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusPending {
+		t.Fatalf("event status = %q, want pending for active dispatch", got)
+	}
+	deliveries, err := store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Event.ID != 1 || deliveries[0].Dispatch.Sink != "discord" {
+		t.Fatalf("undelivered deliveries = %#v, want active discord dispatch", deliveries)
+	}
+}
+
+func TestAlertDedupeHMACDiffersAcrossInstalls(t *testing.T) {
+	t.Parallel()
+	firstPath := filepath.Join(t.TempDir(), "dashboard.db")
+	first, err := Open(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHash := first.alertDedupeHash("health:svc:secret")
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopenedHash := reopened.alertDedupeHash("health:svc:secret"); reopenedHash != firstHash {
+		t.Fatalf("reopened install hash = %q, want stable %q", reopenedHash, firstHash)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if secondHash := second.alertDedupeHash("health:svc:secret"); secondHash == firstHash {
+		t.Fatalf("second install hash = %q, want different keyed HMAC", secondHash)
+	}
+}
+
+func TestAlertMigrationBackfillsDedupeHashBeforeRedactingLegacyDisplayKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	rawKey := "health:svc:super-secret-token-1234"
+	secret := "super-secret-token-1234"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, reason, dedupe_key, created_at, status)
+VALUES(7, 'health_transition', 'svc', 'unhealthy', 'legacy reason super-secret-token-1234', ?, '2026-07-09T12:00:00Z', 'pending');
+`, rawKey); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	store, err := OpenWithOptions(dbPath, OpenOptions{RedactionValues: []string{secret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var migratedHash, displayKey, reason string
+	if err := store.db.QueryRowContext(ctx, `SELECT dedupe_hash, dedupe_key, reason FROM alert_events WHERE id=7`).Scan(&migratedHash, &displayKey, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if migratedHash == "" {
+		t.Fatal("migrated dedupe_hash is empty")
+	}
+	if strings.Contains(displayKey, secret) || strings.Contains(reason, secret) {
+		t.Fatalf("legacy display fields not redacted: dedupe=%q reason=%q", displayKey, reason)
+	}
+	fresh, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: rawKey,
+	}, []string{"discord"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("fresh enqueue was suppressed, want new row after failed legacy event")
+	}
+	if fresh.DedupeHash != migratedHash {
+		t.Fatalf("fresh dedupe hash = %q, want migrated raw-key hash %q", fresh.DedupeHash, migratedHash)
+	}
+}
+
+func TestAlertLockedStatePreservesUnhashedLegacyDedupeKeysUntilKeyRestored(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	rawKey := "health:svc:short-recovery-secret-1234"
+	secret := "short-recovery-secret-1234"
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT '',
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, reason, dedupe_key, created_at, status)
+VALUES(7, 'health_transition', 'svc', 'unhealthy', 'legacy reason short-recovery-secret-1234', ?, '2026-07-09T12:00:00Z', 'pending');
+`, rawKey); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+	key, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash := (&Store{alertDedupeKey: key}).alertDedupeHash(rawKey)
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := OpenWithOptions(dbPath, OpenOptions{RedactionValues: []string{secret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(locked.StartupWarnings(), "\n"), "alert state locked") {
+		_ = locked.Close()
+		t.Fatalf("startup warnings = %#v, want locked alert state", locked.StartupWarnings())
+	}
+	if err := locked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preservedKey, lockedReason string
+	if err := db.QueryRowContext(ctx, `SELECT dedupe_key, reason FROM alert_events_legacy WHERE id=7`).Scan(&preservedKey, &lockedReason); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if preservedKey != rawKey {
+		t.Fatalf("locked legacy dedupe_key = %q, want raw recovery key %q", preservedKey, rawKey)
+	}
+	if strings.Contains(lockedReason, secret) {
+		t.Fatalf("locked legacy reason still contains configured secret: %q", lockedReason)
+	}
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := OpenWithOptions(dbPath, OpenOptions{RedactionValues: []string{secret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var migratedHash, displayKey, reason string
+	if err := restored.db.QueryRowContext(ctx, `SELECT dedupe_hash, dedupe_key, reason FROM alert_events WHERE id=7`).Scan(&migratedHash, &displayKey, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if migratedHash != wantHash {
+		t.Fatalf("migrated hash = %q, want hash from preserved raw key %q", migratedHash, wantHash)
+	}
+	if strings.Contains(displayKey, secret) || strings.Contains(reason, secret) {
+		t.Fatalf("restored legacy display fields not redacted: dedupe=%q reason=%q", displayKey, reason)
+	}
+}
+
+func TestAlertDedupeKeyFreshInstallWritesFingerprint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	key, err := readAlertDedupeKey(filepath.Join(filepath.Dir(dbPath), "alert-dedupe.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fingerprint string
+	if err := store.db.QueryRowContext(ctx, `SELECT value FROM storage_metadata WHERE key=?`, alertDedupeKeyFingerprintMetadata).Scan(&fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if want := alertDedupeKeyFingerprint(key); fingerprint != want {
+		t.Fatalf("fingerprint = %q, want %q", fingerprint, want)
+	}
+}
+
+func TestAlertDedupeKeyFingerprintAcceptsCorrectKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(filepath.Dir(dbPath), "alert-dedupe.key")
+	key, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:correct-key",
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopenedKey, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reopenedKey, key) {
+		t.Fatalf("reopened key changed, want original correct key")
+	}
+	if _, _, err := reopened.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:correct-key-2",
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatalf("enqueue with correct restored key failed: %v", err)
+	}
+}
+
+func TestAlertDedupeKeyFingerprintMismatchLocksAlerting(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:wrong-key",
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	restored, err := OpenWithOptions(dbPath, OpenOptions{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "alert state locked: dedupe key mismatch") || !strings.Contains(logs.String(), "alerting.resetOnMissingKey") {
+		t.Fatalf("logs = %q, want mismatch lock repair guidance", logs.String())
+	}
+	if _, _, err := restored.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:wrong-key",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Close()
+	if got := countRows(t, reset, `SELECT COUNT(*) FROM storage_metadata WHERE key='`+alertDedupeResetPendingMetadata+`'`); got != 0 {
+		t.Fatalf("pending reset markers = %d, want cleared after wrong-key reset", got)
+	}
+	if _, _, err := reset.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:wrong-key-recovered",
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatalf("enqueue after wrong-key reset failed: %v", err)
+	}
+}
+
+func TestAlertDedupeKeyConcurrentResetsConverge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:concurrent-reset",
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("seed event inserted = false, want true")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	type openResult struct {
+		store *Store
+		err   error
+	}
+	results := make(chan openResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			opened, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+			results <- openResult{store: opened, err: err}
+		}()
+	}
+	close(start)
+	var openedStores []*Store
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err != nil {
+			for _, opened := range openedStores {
+				_ = opened.Close()
+			}
+			t.Fatalf("concurrent reset open %d failed: %v", i, result.err)
+		}
+		openedStores = append(openedStores, result.store)
+	}
+	defer func() {
+		for _, opened := range openedStores {
+			_ = opened.Close()
+		}
+	}()
+	key, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, opened := range openedStores {
+		if alertDedupeKeyFingerprint(opened.alertDedupeKey) != alertDedupeKeyFingerprint(key) {
+			t.Fatalf("opened store %d has key fingerprint %q, want current file fingerprint %q", i, alertDedupeKeyFingerprint(opened.alertDedupeKey), alertDedupeKeyFingerprint(key))
+		}
+		var markerCount int
+		if err := opened.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM storage_metadata WHERE key=?`, alertDedupeResetPendingMetadata).Scan(&markerCount); err != nil {
+			t.Fatal(err)
+		}
+		if markerCount != 0 {
+			t.Fatalf("pending reset marker count = %d, want cleared", markerCount)
+		}
+		var fingerprint string
+		if err := opened.db.QueryRowContext(ctx, `SELECT value FROM storage_metadata WHERE key=?`, alertDedupeKeyFingerprintMetadata).Scan(&fingerprint); err != nil {
+			t.Fatal(err)
+		}
+		if want := alertDedupeKeyFingerprint(key); fingerprint != want {
+			t.Fatalf("stored fingerprint = %q, want %q", fingerprint, want)
+		}
+	}
+	if got := alertEventStatus(t, openedStores[0], seed.ID); got != AlertEventStatusReset {
+		t.Fatalf("seed event status = %q, want reset after concurrent reset", got)
+	}
+}
+
+func TestAlertDedupeKeyMissingFingerprintWithHashedRowsLocksAlerting(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:missing-fingerprint",
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := deleteStorageMetadata(ctx, store.db, alertDedupeKeyFingerprintMetadata); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	locked, err := OpenWithOptions(dbPath, OpenOptions{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	if !strings.Contains(logs.String(), "dedupe key fingerprint missing") || !strings.Contains(logs.String(), "alerting.resetOnMissingKey") {
+		t.Fatalf("logs = %q, want missing-fingerprint lock guidance", logs.String())
+	}
+	if _, _, err := locked.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:missing-fingerprint",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if got := countRows(t, locked, `SELECT COUNT(*) FROM storage_metadata WHERE key='`+alertDedupeKeyFingerprintMetadata+`'`); got != 0 {
+		t.Fatalf("fingerprint rows = %d, want missing fingerprint not blessed", got)
+	}
+}
+
+func TestAlertDedupeKeyTruncatedResetRecovers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:truncated-key",
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want seed event")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("abcd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := locked.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:truncated-key",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		_ = locked.Close()
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if err := locked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Close()
+	if got := alertEventStatus(t, reset, event.ID); got != AlertEventStatusReset {
+		t.Fatalf("old event status = %q, want reset after corrupt-key reset", got)
+	}
+	if _, err := os.Stat(keyPath + ".corrupt"); err != nil {
+		t.Fatalf("corrupt key backup missing: %v", err)
+	}
+	if _, _, err := reset.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:truncated-key-recovered",
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatalf("enqueue after corrupt-key reset failed: %v", err)
+	}
+}
+
+func TestAlertDedupeKeyMissingWithHashedAlertRowsStartsLocked(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:restored",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	} else if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want true")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	restored, err := OpenWithOptions(dbPath, OpenOptions{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if !strings.Contains(logs.String(), "alert state locked: dedupe key missing") || !strings.Contains(logs.String(), "alerting.resetOnMissingKey") {
+		t.Fatalf("logs = %q, want prominent locked-state repair guidance", logs.String())
+	}
+	if _, _, err := restored.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:restored",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if _, err := restored.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("claim err = %v, want ErrAlertStateLocked", err)
+	}
+}
+
+func TestAlertDedupeKeyMissingResetRecoversAlertState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:reset",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want true")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Close()
+	if got := alertEventStatus(t, reset, event.ID); got != AlertEventStatusReset {
+		t.Fatalf("old event status = %q, want reset after missing-key reset", got)
+	}
+	var dispatchStatus, lastError string
+	if err := reset.db.QueryRowContext(ctx, `SELECT status, last_error FROM alert_dispatches WHERE event_id=?`, event.ID).Scan(&dispatchStatus, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if dispatchStatus != AlertDispatchStatusReset || !strings.Contains(lastError, "alert state reset") {
+		t.Fatalf("old dispatch = %q/%q, want reset diagnostic", dispatchStatus, lastError)
+	}
+	fresh, inserted, err := reset.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:reset",
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted || fresh.ID == event.ID {
+		t.Fatalf("fresh event inserted=%v event=%#v, want recovered alert state with new row", inserted, fresh)
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("reset dedupe key permissions = %o, want 0600", got)
+	}
+}
+
+func TestAlertDedupeKeyResetFlagIsOneShotUntilRearmed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	firstArm := "first-arm-super-secret-token"
+	secondArm := "second-arm"
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:first-reset",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("seed event inserted = false, want true")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{
+		ResetAlertStateOnMissingKey: true,
+		ResetAlertStateToken:        firstArm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, reset, seed.ID); got != AlertEventStatusReset {
+		_ = reset.Close()
+		t.Fatalf("seed event status = %q, want reset", got)
+	}
+	active, inserted, err := reset.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:second-incident",
+		CreatedAt: time.Date(2026, 7, 9, 12, 1, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = reset.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = reset.Close()
+		t.Fatal("active event inserted = false, want true")
+	}
+	if err := reset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("abcd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	locked, err := OpenWithOptions(dbPath, OpenOptions{
+		Logger:                      slog.New(slog.NewTextHandler(&logs, nil)),
+		ResetAlertStateOnMissingKey: true,
+		ResetAlertStateToken:        firstArm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "resetOnMissingKey was already consumed") || !strings.Contains(logs.String(), "resetToken") {
+		_ = locked.Close()
+		t.Fatalf("logs = %q, want consumed reset guidance", logs.String())
+	}
+	if strings.Contains(logs.String(), firstArm) {
+		_ = locked.Close()
+		t.Fatalf("logs leaked raw reset token: %q", logs.String())
+	}
+	if _, _, err := locked.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:locked-after-consumed-reset",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		_ = locked.Close()
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	} else if strings.Contains(err.Error(), firstArm) {
+		_ = locked.Close()
+		t.Fatalf("lock error leaked raw reset token: %v", err)
+	}
+	if got := alertEventStatus(t, locked, active.ID); got != AlertEventStatusPending {
+		_ = locked.Close()
+		t.Fatalf("active event status after stale reset flag = %q, want pending/no data loss", got)
+	}
+	if err := locked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rearmed, err := OpenWithOptions(dbPath, OpenOptions{
+		ResetAlertStateOnMissingKey: true,
+		ResetAlertStateToken:        secondArm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, rearmed, active.ID); got != AlertEventStatusReset {
+		t.Fatalf("active event status after re-armed reset = %q, want reset", got)
+	}
+	if _, _, err := rearmed.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:after-rearm",
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatalf("enqueue after re-armed reset failed: %v", err)
+	}
+	afterRearm, inserted, err := rearmed.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:reuse-first-arm",
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("after-rearm event inserted = false, want true")
+	}
+	if got := countRows(t, rearmed, `SELECT COUNT(*) FROM alert_dedupe_reset_consumed`); got != 2 {
+		t.Fatalf("consumed reset tokens = %d, want A and B retained", got)
+	}
+	if err := rearmed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("abcd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reuseA, err := OpenWithOptions(dbPath, OpenOptions{
+		ResetAlertStateOnMissingKey: true,
+		ResetAlertStateToken:        firstArm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reuseA.Close()
+	if _, _, err := reuseA.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:reuse-a-locked",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("reuse A enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if got := alertEventStatus(t, reuseA, afterRearm.ID); got != AlertEventStatusPending {
+		t.Fatalf("event status after reused reset token = %q, want pending/no data loss", got)
+	}
+}
+
+func TestAlertDedupeKeyResetPreservesDeliveredHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveredEvent, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:delivered-before-reset",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("delivered event inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		_ = store.Close()
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	deliveredDispatch, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, "")
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	activeEvent, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:active-before-reset",
+		CreatedAt: time.Date(2026, 7, 9, 12, 1, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("active event inserted = false, want true")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Close()
+	if got := alertEventStatus(t, reset, deliveredEvent.ID); got != AlertEventStatusDelivered {
+		t.Fatalf("delivered history status = %q, want delivered", got)
+	}
+	var preserved AlertDispatch
+	var deliveredAt sql.NullString
+	if err := reset.db.QueryRowContext(ctx, `
+SELECT id, event_id, status, attempts, last_error, delivered_at
+FROM alert_dispatches
+WHERE id=?
+`, deliveredDispatch.ID).Scan(&preserved.ID, &preserved.EventID, &preserved.Status, &preserved.Attempts, &preserved.LastError, &deliveredAt); err != nil {
+		t.Fatal(err)
+	}
+	if preserved.Status != AlertDispatchStatusDelivered || preserved.LastError != "" || !deliveredAt.Valid {
+		t.Fatalf("delivered dispatch after reset = %#v delivered_at=%v, want verbatim delivered history", preserved, deliveredAt)
+	}
+	if got := alertEventStatus(t, reset, activeEvent.ID); got != AlertEventStatusReset {
+		t.Fatalf("active event status = %q, want reset", got)
+	}
+	var activeStatus, activeError string
+	if err := reset.db.QueryRowContext(ctx, `SELECT status, last_error FROM alert_dispatches WHERE event_id=?`, activeEvent.ID).Scan(&activeStatus, &activeError); err != nil {
+		t.Fatal(err)
+	}
+	if activeStatus != AlertDispatchStatusReset || !strings.Contains(activeError, "alert state reset") {
+		t.Fatalf("active dispatch after reset = %q/%q, want reset diagnostic", activeStatus, activeError)
+	}
+}
+
+func TestAlertDedupeKeyMissingResetTerminalizesLegacyAlertState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  service_id TEXT NOT NULL DEFAULT '',
+  new_state TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  dedupe_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_at_ns INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE alert_dispatches_legacy (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL,
+  sink TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  last_error TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  updated_at_ns INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO alert_events_legacy(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES(7, 'health_transition', 'svc', 'unhealthy', 'health:svc:legacy-reset', 'restored-keyed-hash', '2026-07-09T12:00:00Z', 100, 'pending');
+INSERT INTO alert_dispatches_legacy(id, event_id, sink, status, updated_at, updated_at_ns)
+VALUES(8, 7, 'discord', 'pending', '2026-07-09T12:00:00Z', 100);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := OpenWithOptions(dbPath, OpenOptions{ResetAlertStateOnMissingKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reset.Close()
+	if got := alertEventStatus(t, reset, 7); got != AlertEventStatusReset {
+		t.Fatalf("legacy event status = %q, want reset after missing-key reset", got)
+	}
+	var dispatchStatus, lastError string
+	if err := reset.db.QueryRowContext(ctx, `SELECT status, last_error FROM alert_dispatches WHERE id=8`).Scan(&dispatchStatus, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if dispatchStatus != AlertDispatchStatusReset || !strings.Contains(lastError, "alert state reset") {
+		t.Fatalf("legacy dispatch = %q/%q, want reset diagnostic", dispatchStatus, lastError)
+	}
+	if got, err := reset.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1); err != nil || len(got) != 0 {
+		t.Fatalf("legacy reset claim result = %#v, err=%v; want no claimable old rows", got, err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAlertDedupeKeyPendingResetMarkerCompletesAfterInterruptedReset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:interrupted-reset",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want seed alert event")
+	}
+	if err := setStorageMetadata(ctx, store.db, alertDedupeResetPendingMetadata, "1"); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("c", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if got := alertEventStatus(t, recovered, event.ID); got != AlertEventStatusReset {
+		t.Fatalf("event status = %q, want reset after completing interrupted reset", got)
+	}
+	var markerCount int
+	if err := recovered.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM storage_metadata WHERE key=?`, alertDedupeResetPendingMetadata).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if markerCount != 0 {
+		t.Fatalf("pending reset marker count = %d, want cleared", markerCount)
+	}
+	key, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fingerprint string
+	if err := recovered.db.QueryRowContext(ctx, `SELECT value FROM storage_metadata WHERE key=?`, alertDedupeKeyFingerprintMetadata).Scan(&fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if want := alertDedupeKeyFingerprint(key); fingerprint != want {
+		t.Fatalf("fingerprint after interrupted reset = %q, want %q", fingerprint, want)
+	}
+}
+
+func TestAlertDedupeKeyPendingResetConsumesOriginalTokenFingerprint(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name            string
+		preResetEvent   bool
+		preConsumeToken bool
+	}{
+		{name: "state reset before token consumption", preResetEvent: true},
+		{name: "token consumed before state reset", preConsumeToken: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "dashboard.db")
+			originalToken := "original-reset-token"
+			nextToken := "next-reset-token"
+			store, err := Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+				Kind:      "health_transition",
+				ServiceID: "svc",
+				NewState:  "unhealthy",
+				DedupeKey: "health:svc:interrupted-token",
+				CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+			}, []string{"discord"}, time.Hour)
+			if err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if !inserted {
+				_ = store.Close()
+				t.Fatal("inserted = false, want seed alert event")
+			}
+			key := append([]byte(nil), store.alertDedupeKey...)
+			if tc.preResetEvent {
+				if _, err := store.db.ExecContext(ctx, `UPDATE alert_events SET status=? WHERE id=?`, AlertEventStatusReset, event.ID); err != nil {
+					_ = store.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := setStorageMetadata(ctx, store.db, alertDedupeResetPendingMetadata, alertDedupeResetTokenFingerprint(originalToken)); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if tc.preConsumeToken {
+				tx, err := store.db.BeginTx(ctx, nil)
+				if err != nil {
+					_ = store.Close()
+					t.Fatal(err)
+				}
+				if err := writeAlertDedupeResetConsumedTx(ctx, tx, originalToken, key); err != nil {
+					_ = tx.Rollback()
+					_ = store.Close()
+					t.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					_ = store.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			recovered, err := OpenWithOptions(dbPath, OpenOptions{
+				ResetAlertStateOnMissingKey: true,
+				ResetAlertStateToken:        nextToken,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovered.Close()
+			if got := alertEventStatus(t, recovered, event.ID); got != AlertEventStatusReset {
+				t.Fatalf("event status = %q, want reset", got)
+			}
+			if got := alertResetConsumedCount(t, recovered, originalToken); got != 1 {
+				t.Fatalf("original reset token consumed count = %d, want 1", got)
+			}
+			if got := alertResetConsumedCount(t, recovered, nextToken); got != 0 {
+				t.Fatalf("next reset token consumed count = %d, want 0", got)
+			}
+			if got := countRows(t, recovered, `SELECT COUNT(*) FROM storage_metadata WHERE key='`+alertDedupeResetPendingMetadata+`'`); got != 0 {
+				t.Fatalf("pending reset markers = %d, want cleared", got)
+			}
+		})
+	}
+}
+
+func TestAlertDedupeKeyMissingWithLegacyPlaintextAlertRowsMigrates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_events_legacy (id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL DEFAULT '');
+INSERT INTO alert_events_legacy(dedupe_key) VALUES('legacy-restored');
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var hash string
+	if err := store.db.QueryRowContext(ctx, `SELECT dedupe_hash FROM alert_events WHERE dedupe_key='legacy-restored'`).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if hash == "" {
+		t.Fatal("legacy plaintext row dedupe_hash is empty, want migration backfill with generated key")
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("dedupe key permissions = %o, want 0600", got)
+	}
+}
+
+func TestAlertDedupeKeyMissingWithLegacyDispatchRowsMigrates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE alert_dispatches_legacy (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL DEFAULT 0);
+INSERT INTO alert_dispatches_legacy(event_id) VALUES(1);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches`); got != 0 {
+		t.Fatalf("orphan legacy dispatch rows after migration = %d, want 0", got)
+	}
+}
+
+func TestAlertDedupeFingerprintMismatchLocksOpenStoreWrites(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wrongKey := []byte("01234567890123456789012345678901")
+	if err := setStorageMetadata(ctx, store.db, alertDedupeKeyFingerprintMetadata, alertDedupeKeyFingerprint(wrongKey)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:stale-open-key",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if !strings.Contains(err.Error(), "restart all dashboard processes") {
+		t.Fatalf("enqueue err = %v, want rolling-restart guidance", err)
+	}
+	warnings := strings.Join(store.StartupWarnings(), "\n")
+	if !strings.Contains(warnings, "alert dedupe key fingerprint changed") || !strings.Contains(warnings, "restart all dashboard processes") {
+		t.Fatalf("startup warnings = %q, want latched fingerprint mismatch guidance", warnings)
+	}
+	if err := setStorageMetadata(ctx, store.db, alertDedupeKeyFingerprintMetadata, alertDedupeKeyFingerprint(store.alertDedupeKey)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:stale-open-key-after-fix",
+		CreatedAt: time.Date(2026, 7, 9, 12, 1, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue after metadata repair err = %v, want latched ErrAlertStateLocked until restart", err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:stale-open-key'`); got != 0 {
+		t.Fatalf("stale-key event rows = %d, want no mis-keyed writes", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:stale-open-key-after-fix'`); got != 0 {
+		t.Fatalf("post-latch event rows = %d, want no writes until restart", got)
+	}
+}
+
+func TestAlertDedupeKeyUnreadableFileLocksAlerting(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	store, err := OpenWithOptions(dbPath, OpenOptions{Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	if err != nil {
+		t.Fatalf("Open returned error for unreadable alert dedupe key: %v", err)
+	}
+	defer store.Close()
+	warnings := strings.Join(store.StartupWarnings(), "\n")
+	for _, want := range []string{"alert state locked", "dedupe key unavailable", keyPath} {
+		if !strings.Contains(warnings, want) {
+			t.Fatalf("startup warnings = %q, want %q", warnings, want)
+		}
+	}
+	if !strings.Contains(logs.String(), "alert state locked") {
+		t.Fatalf("logs = %q, want locked alert state", logs.String())
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:locked",
+	}, []string{"discord"}, time.Hour); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("enqueue err = %v, want ErrAlertStateLocked", err)
+	}
+	if _, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("claim err = %v, want ErrAlertStateLocked", err)
+	}
+}
+
+func TestAlertStateLockedRejectsDispatchCompletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:locked-completion",
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		_ = store.Close()
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	dispatchID := claimed[0].Dispatch.ID
+	claimID := claimed[0].Dispatch.ClaimID
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	if _, err := locked.RecordAlertDispatchResult(ctx, dispatchID, "worker-a", claimID, AlertDispatchStatusDelivered, ""); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("completion err = %v, want ErrAlertStateLocked", err)
+	}
+}
+
+func TestAlertDedupeKeyConcurrentCreatorsConverge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "dashboard.db")
+	keyPath := filepath.Join(dir, "alert-dedupe.key")
+	db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ensureStorageMetadataTable(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 20
+	start := make(chan struct{})
+	type result struct {
+		key []byte
+		err error
+	}
+	results := make(chan result, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			loaded, err := loadOrCreateAlertDedupeKey(ctx, db, dbPath, keyPath, false, defaultAlertDedupeResetToken, slog.Default())
+			results <- result{key: loaded.key, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var first string
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		encoded := fmt.Sprintf("%x", result.key)
+		if first == "" {
+			first = encoded
+			continue
+		}
+		if encoded != first {
+			t.Fatalf("key = %s, want converged key %s", encoded, first)
+		}
+	}
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != first {
+		t.Fatalf("stored key = %q, want %q", strings.TrimSpace(string(data)), first)
+	}
+}
+
+func TestAlertEventDedupeSuppressesPendingAndCooldown(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createdAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	cooldown := time.Hour
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		Target:    "docker/serenity",
+		OldState:  "healthy",
+		NewState:  "unhealthy",
+		Reason:    "container unhealthy",
+		DedupeKey: "health:svc:docker/serenity:unhealthy",
+		CreatedAt: createdAt,
+	}, []string{"discord"}, cooldown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true for first event")
+	}
+	if event.ID == 0 || event.Status != AlertEventStatusPending || !event.CreatedAt.Equal(createdAt) {
+		t.Fatalf("event = %#v", event)
+	}
+	duplicate, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		Target:    "docker/serenity",
+		OldState:  "healthy",
+		NewState:  "unhealthy",
+		Reason:    "duplicate reason should not replace original",
+		DedupeKey: "health:svc:docker/serenity:unhealthy",
+		CreatedAt: createdAt.Add(time.Minute),
+	}, []string{"discord"}, cooldown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("inserted = true, want false while prior event is pending")
+	}
+	if duplicate.ID != event.ID || duplicate.Reason != "container unhealthy" {
+		t.Fatalf("duplicate event = %#v, want original event", duplicate)
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Event.ID != event.ID || claimed[0].Dispatch.Sink != "discord" {
+		t.Fatalf("claimed = %#v, want discord dispatch for event %d", claimed, event.ID)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	deliveredAt := createdAt.Add(5 * time.Minute)
+	if _, err := store.db.ExecContext(ctx, `
+UPDATE alert_dispatches SET delivered_at=?, delivered_at_ns=?, updated_at=?, updated_at_ns=? WHERE event_id=?
+`, deliveredAt.Format(time.RFC3339), deliveredAt.UnixNano(), deliveredAt.Format(time.RFC3339), deliveredAt.UnixNano(), event.ID); err != nil {
+		t.Fatal(err)
+	}
+	withinCooldown, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		Target:    "docker/serenity",
+		OldState:  "healthy",
+		NewState:  "unhealthy",
+		Reason:    "still inside cooldown",
+		DedupeKey: "health:svc:docker/serenity:unhealthy",
+		CreatedAt: deliveredAt.Add(30 * time.Minute),
+	}, []string{"discord"}, cooldown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("inserted = true, want false inside cooldown")
+	}
+	if withinCooldown.ID != event.ID {
+		t.Fatalf("within cooldown event ID = %d, want original %d", withinCooldown.ID, event.ID)
+	}
+	afterCooldown, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		Target:    "docker/serenity",
+		OldState:  "healthy",
+		NewState:  "unhealthy",
+		Reason:    "fresh incident after cooldown",
+		DedupeKey: "health:svc:docker/serenity:unhealthy",
+		CreatedAt: deliveredAt.Add(cooldown + time.Minute),
+	}, []string{"discord"}, cooldown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true after cooldown")
+	}
+	if afterCooldown.ID == event.ID {
+		t.Fatalf("after cooldown event reused ID %d, want fresh event", afterCooldown.ID)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:docker/serenity:unhealthy'`); got != 2 {
+		t.Fatalf("alert event history rows = %d, want 2", got)
+	}
+}
+
+func TestAlertDispatchRejectsSecretBearingSinkIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{
+		RedactionValues: []string{"embedded-secret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, _, err = store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:sink-identity",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"webhook-embedded-secret-a", "webhook-embedded-secret-b"}, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "registered secret") {
+		t.Fatalf("EnqueueAlertEvent error = %v, want secret-bearing sink rejection", err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches`); got != 0 {
+		t.Fatalf("persisted alert dispatches = %d, want 0", got)
+	}
+}
+
+func TestAlertMutationsLockWhenDedupeKeySidecarChanges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.Remove(filepath.Join(dir, "alert-dedupe.key")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.EnqueueAlertEvent(ctx, AlertEvent{Kind: "health_transition", ServiceID: "svc", NewState: "unhealthy", DedupeKey: "sidecar-loss"}, []string{"discord"}, time.Minute)
+	if !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("EnqueueAlertEvent error = %v, want ErrAlertStateLocked", err)
+	}
+}
+
+func TestAlertEnqueueRejectsTerminalEventStatusAndUnconfiguredSink(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{AlertSinkNames: []string{"discord"}, AlertSinkAllowlist: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event := AlertEvent{Kind: "health_transition", ServiceID: "svc", NewState: "unhealthy", DedupeKey: "terminal", Status: AlertEventStatusDelivered}
+	if _, _, err := store.EnqueueAlertEvent(ctx, event, []string{"discord"}, time.Minute); err == nil || !strings.Contains(err.Error(), "empty or pending") {
+		t.Fatalf("terminal status error = %v", err)
+	}
+	event.Status, event.DedupeKey = "", "unconfigured"
+	if _, _, err := store.EnqueueAlertEvent(ctx, event, []string{"webhook"}, time.Minute); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unconfigured sink error = %v", err)
+	}
+}
+
+func TestAlertEventPendingDedupeAddsNewlyRequestedSinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createdAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "original pending alert",
+		DedupeKey: "health:svc:extra-sink",
+		CreatedAt: createdAt,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want first event inserted")
+	}
+	suppressed, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "repeat with newly configured sink",
+		DedupeKey: "health:svc:extra-sink",
+		CreatedAt: createdAt.Add(time.Minute),
+	}, []string{"discord", "webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("inserted = true, want pending dedupe suppression")
+	}
+	if suppressed.ID != event.ID || suppressed.Reason != "original pending alert" {
+		t.Fatalf("suppressed event = %#v, want original event %#v", suppressed, event)
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT sink FROM alert_dispatches WHERE event_id=? ORDER BY sink`, event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sinks []string
+	for rows.Next() {
+		var sink string
+		if err := rows.Scan(&sink); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		sinks = append(sinks, sink)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sinks) != 2 || sinks[0] != "discord" || sinks[1] != "webhook" {
+		t.Fatalf("dispatch sinks = %#v, want original plus newly requested sink", sinks)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:extra-sink'`); got != 1 {
+		t.Fatalf("event rows = %d, want original event unchanged", got)
+	}
+}
+
+func TestAlertEventDedupeUsesRawHashNotRedactedDisplayKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.AddRedactionValues("secret-one", "secret-two")
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	first, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:secret-one",
+		CreatedAt: base,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("first insert suppressed")
+	}
+	second, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:secret-two",
+		CreatedAt: base.Add(time.Second),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("second insert suppressed by redacted display key, want distinct raw hash")
+	}
+	if first.DedupeKey != second.DedupeKey {
+		t.Fatalf("display keys = %q and %q, want same redacted display key", first.DedupeKey, second.DedupeKey)
+	}
+	if first.DedupeHash == second.DedupeHash {
+		t.Fatalf("dedupe hashes both %q, want distinct raw-key hashes", first.DedupeHash)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE dedupe_key='health:svc:[REDACTED]'`); got != 2 {
+		t.Fatalf("redacted-display event rows = %d, want 2", got)
+	}
+}
+
+func TestAlertEventConcurrentEnqueueSameKeyCreatesOnePendingEvent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const workers = 12
+	start := make(chan struct{})
+	type result struct {
+		event    AlertEvent
+		inserted bool
+		err      error
+	}
+	results := make(chan result, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+				Kind:      "health_transition",
+				ServiceID: "svc",
+				Target:    "docker/serenity",
+				NewState:  "unhealthy",
+				Reason:    fmt.Sprintf("attempt %d", i),
+				DedupeKey: "health:svc:docker/serenity:unhealthy",
+				CreatedAt: time.Date(2026, 7, 9, 12, 0, i, 0, time.UTC),
+			}, []string{"discord"}, time.Hour)
+			results <- result{event: event, inserted: inserted, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	insertedCount := 0
+	eventIDs := map[int64]struct{}{}
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.inserted {
+			insertedCount++
+		}
+		eventIDs[result.event.ID] = struct{}{}
+	}
+	if insertedCount != 1 {
+		t.Fatalf("inserted count = %d, want 1", insertedCount)
+	}
+	if len(eventIDs) != 1 {
+		t.Fatalf("event IDs = %#v, want all callers to see one pending event", eventIDs)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE status='pending' AND dedupe_hash='`+store.alertDedupeHash("health:svc:docker/serenity:unhealthy")+`'`); got != 1 {
+		t.Fatalf("pending dedupe rows = %d, want 1", got)
+	}
+}
+
+func TestAlertDispatchesKeepEventPendingUntilAllSinksTerminalAcrossRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		Target:    "docker/serenity",
+		OldState:  "healthy",
+		NewState:  "unhealthy",
+		Reason:    "container unhealthy",
+		DedupeKey: "health:svc:docker/serenity:unhealthy",
+		CreatedAt: createdAt,
+	}, []string{"discord", "webhook"}, time.Hour)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want true")
+	}
+	deliveries, err := store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if got, want := alertDeliverySinks(deliveries), []string{"discord", "webhook"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		_ = store.Close()
+		t.Fatalf("pending delivery sinks = %#v, want %#v", got, want)
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Dispatch.Sink != "discord" {
+		_ = store.Close()
+		t.Fatalf("claimed = %#v, want discord", claimed)
+	}
+	dispatch, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, "")
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if dispatch.Attempts != 1 || dispatch.LastError != "" || dispatch.DeliveredAt == nil || dispatch.Status != AlertDispatchStatusDelivered {
+		_ = store.Close()
+		t.Fatalf("delivered dispatch = %#v", dispatch)
+	}
+	deliveries, err = store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if got, want := alertDeliverySinks(deliveries), []string{"webhook"}; len(got) != len(want) || got[0] != want[0] {
+		_ = store.Close()
+		t.Fatalf("pending delivery sinks after one success = %#v, want %#v", got, want)
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusPending {
+		_ = store.Close()
+		t.Fatalf("event status = %q, want pending until every sink is terminal", got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	deliveries, err = store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := alertDeliverySinks(deliveries), []string{"webhook"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("pending delivery sinks after restart = %#v, want %#v", got, want)
+	}
+	claimed, err = store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Dispatch.Sink != "webhook" {
+		t.Fatalf("claimed after restart = %#v, want webhook", claimed)
+	}
+	dispatch, err = store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-b", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.Status != AlertDispatchStatusDelivered || dispatch.DeliveredAt == nil {
+		t.Fatalf("second delivered dispatch = %#v", dispatch)
+	}
+	deliveries, err = store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 0 {
+		t.Fatalf("undelivered after both sinks terminal = %#v, want none", deliveries)
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusDelivered {
+		t.Fatalf("event status = %q, want delivered after every sink is terminal", got)
+	}
+}
+
+func TestAlertDispatchClaimersGetDisjointRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord", "home-assistant", "webhook-a", "webhook-b"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	start := make(chan struct{})
+	results := make(chan []AlertDelivery, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, worker := range []string{"worker-a", "worker-b"} {
+		wg.Add(1)
+		go func(worker string) {
+			defer wg.Done()
+			<-start
+			deliveries, err := store.ClaimPendingAlertDeliveries(ctx, worker, time.Minute, 2)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- deliveries
+		}(worker)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	seen := map[int64]string{}
+	total := 0
+	for deliveries := range results {
+		total += len(deliveries)
+		for _, delivery := range deliveries {
+			if previous, ok := seen[delivery.Dispatch.ID]; ok {
+				t.Fatalf("dispatch %d claimed by both %s and %s", delivery.Dispatch.ID, previous, delivery.Dispatch.WorkerID)
+			}
+			seen[delivery.Dispatch.ID] = delivery.Dispatch.WorkerID
+		}
+	}
+	if total != 4 {
+		t.Fatalf("claimed deliveries = %d, want 4", total)
+	}
+}
+
+func TestAlertDispatchBatchDeliveryKeysAreDistinct(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:delivery-keys",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord", "home-assistant", "webhook"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("claimed = %#v, want three dispatches", claimed)
+	}
+	keys := map[string]struct{}{}
+	for _, delivery := range claimed {
+		key := delivery.Dispatch.DeliveryKey()
+		if key != fmt.Sprint(delivery.Dispatch.ID) {
+			t.Fatalf("delivery key = %q for dispatch %#v, want stable dispatch ID", key, delivery.Dispatch)
+		}
+		keys[key] = struct{}{}
+	}
+	if len(keys) != 3 {
+		t.Fatalf("delivery keys = %#v, want one distinct key per dispatch", keys)
+	}
+}
+
+func TestAlertDispatchSameWorkerRepeatedClaimsUseDisjointClaimIDs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord", "home-assistant", "webhook-a", "webhook-b"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	first, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("claim batches = %d/%d, want 2/2", len(first), len(second))
+	}
+	firstClaimID := first[0].Dispatch.ClaimID
+	secondClaimID := second[0].Dispatch.ClaimID
+	if firstClaimID == "" || secondClaimID == "" || firstClaimID == secondClaimID {
+		t.Fatalf("claim IDs = %q/%q, want non-empty distinct IDs", firstClaimID, secondClaimID)
+	}
+	seen := map[int64]struct{}{}
+	for _, delivery := range append(first, second...) {
+		if _, ok := seen[delivery.Dispatch.ID]; ok {
+			t.Fatalf("dispatch %d was returned by repeated claims", delivery.Dispatch.ID)
+		}
+		seen[delivery.Dispatch.ID] = struct{}{}
+	}
+}
+
+func TestAlertDispatchExpiredLeaseIsReclaimed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	firstDeliveryKey := claimed[0].Dispatch.DeliveryKey()
+	expired := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET lease_expires_at=?, lease_expires_at_ns=? WHERE id=?`, expired.Format(time.RFC3339Nano), expired.UnixNano(), claimed[0].Dispatch.ID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Dispatch.ID != claimed[0].Dispatch.ID || reclaimed[0].Dispatch.WorkerID != "worker-b" {
+		t.Fatalf("reclaimed = %#v, want worker-b to reclaim dispatch %d", reclaimed, claimed[0].Dispatch.ID)
+	}
+	if reclaimed[0].Dispatch.DeliveryKey() != firstDeliveryKey {
+		t.Fatalf("reclaimed delivery key = %q, want stable key %q across retries", reclaimed[0].Dispatch.DeliveryKey(), firstDeliveryKey)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); !errors.Is(err, ErrAlertDispatchClaimNotHeld) {
+		t.Fatalf("old worker completion err = %v, want ErrAlertDispatchClaimNotHeld", err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, reclaimed[0].Dispatch.ID, "worker-b", reclaimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusDelivered {
+		t.Fatalf("event status = %q, want delivered", got)
+	}
+}
+
+func TestAlertDispatchExpiredLeaseCompletionIsRejectedAndRemainsDue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	policy := AlertRetryPolicy{
+		MaxAttempts:     2,
+		InitialInterval: time.Second,
+		MaxInterval:     time.Second,
+	}
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:late-completion",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-a", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	expired := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET lease_expires_at=?, lease_expires_at_ns=? WHERE id=?`, expired.Format(time.RFC3339Nano), expired.UnixNano(), claimed[0].Dispatch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordAlertDispatchResultWithRetryPolicy(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, "", policy); !errors.Is(err, ErrAlertDispatchLeaseExpired) {
+		t.Fatalf("late completion err = %v, want ErrAlertDispatchLeaseExpired", err)
+	}
+	var attempts int
+	var status, lastError string
+	var deliveredAt sql.NullString
+	if err := store.db.QueryRowContext(ctx, `SELECT attempts, status, last_error, delivered_at FROM alert_dispatches WHERE id=?`, claimed[0].Dispatch.ID).Scan(&attempts, &status, &lastError, &deliveredAt); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || status != AlertDispatchStatusInFlight || lastError != alertDispatchLeaseExpiredError || deliveredAt.Valid {
+		t.Fatalf("dispatch after late completion = attempts %d status %q error %q delivered %v; want in-flight expired retry note", attempts, status, lastError, deliveredAt.Valid)
+	}
+	reclaimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-b", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Dispatch.ID != claimed[0].Dispatch.ID || reclaimed[0].Dispatch.Attempts != 1 {
+		t.Fatalf("reclaimed after late completion = %#v, want expired row still due with attempts=1", reclaimed)
+	}
+}
+
+func TestAlertDispatchTransientFailureBackoffAndRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	policy := AlertRetryPolicy{
+		MaxAttempts:     5,
+		InitialInterval: time.Hour,
+		MaxInterval:     3 * time.Hour,
+	}
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:backoff",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	} else if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-a", time.Minute, 1, policy)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		_ = store.Close()
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	firstFailure, err := store.RecordAlertDispatchResultWithRetryPolicy(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusPending, "temporary failure", policy)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if firstFailure.Status != AlertDispatchStatusPending || firstFailure.Attempts != 1 || firstFailure.NextAttemptAt == nil {
+		_ = store.Close()
+		t.Fatalf("first failure dispatch = %#v, want pending attempt with next attempt", firstFailure)
+	}
+	if got := firstFailure.NextAttemptAt.Sub(firstFailure.UpdatedAt); got != policy.InitialInterval {
+		_ = store.Close()
+		t.Fatalf("first backoff = %s, want %s", got, policy.InitialInterval)
+	}
+	replayedFailure, err := store.RecordAlertDispatchResultWithRetryPolicy(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusPending, "temporary failure", policy)
+	if err != nil {
+		_ = store.Close()
+		t.Fatalf("replayed requeue completion failed: %v", err)
+	}
+	if replayedFailure.ID != firstFailure.ID || replayedFailure.Status != AlertDispatchStatusPending || replayedFailure.Attempts != firstFailure.Attempts || replayedFailure.NextAttemptAt == nil || !replayedFailure.NextAttemptAt.Equal(*firstFailure.NextAttemptAt) {
+		_ = store.Close()
+		t.Fatalf("replayed failure = %#v, want persisted first failure %#v", replayedFailure, firstFailure)
+	}
+	claimed, err = store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-b", time.Minute, 1, policy)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		_ = store.Close()
+		t.Fatalf("claimed before next_attempt_at = %#v, want none", claimed)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	claimed, err = store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-c", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed before next_attempt_at after restart = %#v, want none", claimed)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET next_attempt_at_ns=? WHERE id=?`, time.Now().UTC().Add(-time.Second).UnixNano(), firstFailure.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-d", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Dispatch.ID != firstFailure.ID || claimed[0].Dispatch.Attempts != 1 {
+		t.Fatalf("claimed after due = %#v, want same dispatch with attempts still 1", claimed)
+	}
+	secondFailure, err := store.RecordAlertDispatchResultWithRetryPolicy(ctx, claimed[0].Dispatch.ID, "worker-d", claimed[0].Dispatch.ClaimID, AlertDispatchStatusPending, "temporary failure again", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondFailure.Attempts != 2 || secondFailure.NextAttemptAt == nil {
+		t.Fatalf("second failure dispatch = %#v, want second pending attempt", secondFailure)
+	}
+	if got, want := secondFailure.NextAttemptAt.Sub(secondFailure.UpdatedAt), 2*policy.InitialInterval; got != want {
+		t.Fatalf("second backoff = %s, want %s", got, want)
+	}
+}
+
+func TestAlertDispatchExpiredLeaseCountsAttemptsAndDeadLettersAtMax(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	policy := AlertRetryPolicy{
+		MaxAttempts:     2,
+		InitialInterval: time.Second,
+		MaxInterval:     time.Second,
+	}
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:crash",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-a", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Dispatch.Attempts != 0 {
+		t.Fatalf("initial claim = %#v, want one dispatch with 0 attempts", claimed)
+	}
+	expired := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET lease_expires_at=?, lease_expires_at_ns=? WHERE id=?`, expired.Format(time.RFC3339Nano), expired.UnixNano(), claimed[0].Dispatch.ID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-b", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Dispatch.ID != claimed[0].Dispatch.ID || reclaimed[0].Dispatch.Attempts != 1 {
+		t.Fatalf("first reclaim = %#v, want attempts incremented to 1", reclaimed)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET lease_expires_at=?, lease_expires_at_ns=? WHERE id=?`, expired.Format(time.RFC3339Nano), expired.UnixNano(), reclaimed[0].Dispatch.ID); err != nil {
+		t.Fatal(err)
+	}
+	finalClaim, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-c", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalClaim) != 0 {
+		t.Fatalf("claim at max attempts = %#v, want none", finalClaim)
+	}
+	var attempts int
+	var status, lastError string
+	if err := store.db.QueryRowContext(ctx, `SELECT attempts, status, last_error FROM alert_dispatches WHERE id=?`, reclaimed[0].Dispatch.ID).Scan(&attempts, &status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || status != AlertDispatchStatusDeadLettered || lastError != alertDispatchLeaseExpiredError {
+		t.Fatalf("dispatch attempts/status/error = %d/%q/%q, want 2/%q/%q", attempts, status, lastError, AlertDispatchStatusDeadLettered, alertDispatchLeaseExpiredError)
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusFailed {
+		t.Fatalf("event status = %q, want failed after max-attempt timeout", got)
+	}
+}
+
+func TestAlertDispatchFinalLeaseTimeoutReplacesTransientError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	policy := AlertRetryPolicy{
+		MaxAttempts:     2,
+		InitialInterval: time.Hour,
+		MaxInterval:     time.Hour,
+	}
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:timeout-replaces-error",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-a", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	failed, err := store.RecordAlertDispatchResultWithRetryPolicy(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusPending, "temporary network failure", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Attempts != 1 || failed.LastError != "temporary network failure" {
+		t.Fatalf("first failure = %#v, want transient error at attempt 1", failed)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET next_attempt_at_ns=? WHERE id=?`, time.Now().UTC().Add(-time.Second).UnixNano(), failed.ID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-b", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 {
+		t.Fatalf("reclaimed = %#v, want one dispatch", reclaimed)
+	}
+	expired := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET lease_expires_at=?, lease_expires_at_ns=? WHERE id=?`, expired.Format(time.RFC3339Nano), expired.UnixNano(), reclaimed[0].Dispatch.ID); err != nil {
+		t.Fatal(err)
+	}
+	finalClaim, err := store.ClaimPendingAlertDeliveriesWithRetryPolicy(ctx, "worker-c", time.Minute, 1, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finalClaim) != 0 {
+		t.Fatalf("final claim = %#v, want dead-letter instead of reclaim", finalClaim)
+	}
+	var attempts int
+	var status, lastError string
+	if err := store.db.QueryRowContext(ctx, `SELECT attempts, status, last_error FROM alert_dispatches WHERE id=?`, failed.ID).Scan(&attempts, &status, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || status != AlertDispatchStatusDeadLettered || lastError != alertDispatchLeaseExpiredError {
+		t.Fatalf("terminal dispatch = attempts %d status %q error %q, want timeout dead-letter", attempts, status, lastError)
+	}
+}
+
+func TestAlertDispatchLeaseReclaimUsesIntegerTimestamp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:lease-order",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"expired-by-ns", "future-by-ns"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Hour, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %#v, want two dispatches", claimed)
+	}
+	expiredID := claimed[0].Dispatch.ID
+	futureID := claimed[1].Dispatch.ID
+	expiredNS := time.Now().UTC().Add(-time.Second)
+	futureNS := time.Now().UTC().Add(time.Hour)
+	if _, err := store.db.ExecContext(ctx, `
+UPDATE alert_dispatches
+SET lease_expires_at='2999-01-01T00:00:00.9Z', lease_expires_at_ns=?
+WHERE id=?
+`, expiredNS.UnixNano(), expiredID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+UPDATE alert_dispatches
+SET lease_expires_at='1970-01-01T00:00:00.1Z', lease_expires_at_ns=?
+WHERE id=?
+`, futureNS.UnixNano(), futureID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].Dispatch.ID != expiredID {
+		t.Fatalf("reclaimed = %#v, want only dispatch %d expired by integer ns", reclaimed, expiredID)
+	}
+}
+
+func TestAlertDispatchCompletedRowNotClaimedAfterRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	} else if !inserted {
+		_ = store.Close()
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		_ = store.Close()
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if retry, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		_ = store.Close()
+		t.Fatalf("retry after committed completion failed: %v", err)
+	} else if retry.Status != AlertDispatchStatusDelivered || retry.Attempts != 1 {
+		_ = store.Close()
+		t.Fatalf("retry dispatch = %#v, want delivered without duplicate attempt", retry)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reclaimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("claimed after completed restart = %#v, want none", reclaimed)
+	}
+}
+
+func TestAlertEnqueueRetriesSQLiteBusyBeyondShortBudget(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	locker, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	if _, err := locker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	type enqueueResult struct {
+		event    AlertEvent
+		inserted bool
+		err      error
+	}
+	done := make(chan enqueueResult, 1)
+	go func() {
+		event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+			Kind:      "health_transition",
+			ServiceID: "svc",
+			NewState:  "unhealthy",
+			DedupeKey: "health:svc:enqueue-busy",
+			CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+		}, []string{"discord"}, time.Hour)
+		done <- enqueueResult{event: event, inserted: inserted, err: err}
+	}()
+	time.Sleep(600 * time.Millisecond)
+	if _, err := locker.ExecContext(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("enqueue after busy retry failed: %v", result.err)
+		}
+		if !result.inserted || result.event.ID == 0 {
+			t.Fatalf("enqueue result = inserted %v event %#v, want inserted event", result.inserted, result.event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue did not complete after busy lock was released")
+	}
+}
+
+func TestAlertClaimRetriesSQLiteBusyBeyondShortBudget(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:claim-busy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	locker, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	if _, err := locker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	type claimResult struct {
+		deliveries []AlertDelivery
+		err        error
+	}
+	done := make(chan claimResult, 1)
+	go func() {
+		deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+		done <- claimResult{deliveries: deliveries, err: err}
+	}()
+	time.Sleep(600 * time.Millisecond)
+	if _, err := locker.ExecContext(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("claim after busy retry failed: %v", result.err)
+		}
+		if len(result.deliveries) != 1 || result.deliveries[0].Dispatch.Status != AlertDispatchStatusInFlight {
+			t.Fatalf("claim result = %#v, want one leased dispatch", result.deliveries)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim did not complete after busy lock was released")
+	}
+}
+
+func TestAlertDispatchCompletionRetriesSQLiteBusy(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:busy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	locker, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	if _, err := locker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locker.ExecContext(ctx, `UPDATE alert_dispatches SET updated_at=updated_at WHERE id=?`, claimed[0].Dispatch.ID); err != nil {
+		_, _ = locker.ExecContext(ctx, `ROLLBACK`)
+		t.Fatal(err)
+	}
+	type recordResult struct {
+		dispatch AlertDispatch
+		err      error
+	}
+	done := make(chan recordResult, 1)
+	go func() {
+		dispatch, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, "")
+		done <- recordResult{dispatch: dispatch, err: err}
+	}()
+	time.Sleep(600 * time.Millisecond)
+	if _, err := locker.ExecContext(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("record after busy retry failed: %v", result.err)
+		}
+		if result.dispatch.Status != AlertDispatchStatusDelivered {
+			t.Fatalf("dispatch status = %q, want delivered", result.dispatch.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("record did not complete after busy lock was released")
+	}
+}
+
+func TestAlertPartialOutcomeSuppressesWithinCooldown(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	base := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:partial",
+		CreatedAt: base,
+	}, []string{"discord", "webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %#v, want two dispatches", claimed)
+	}
+	for _, delivery := range claimed {
+		status := AlertDispatchStatusDelivered
+		if delivery.Dispatch.Sink == "webhook" {
+			status = AlertDispatchStatusDeadLettered
+		}
+		if _, err := store.RecordAlertDispatchResult(ctx, delivery.Dispatch.ID, "worker-a", delivery.Dispatch.ClaimID, status, "permanent failure"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusPartial {
+		t.Fatalf("event status = %q, want partial", got)
+	}
+	closedAt := base.Add(5 * time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE alert_dispatches SET delivered_at=COALESCE(delivered_at, ?), delivered_at_ns=COALESCE(delivered_at_ns, ?), updated_at=?, updated_at_ns=? WHERE event_id=?`, closedAt.Format(time.RFC3339Nano), closedAt.UnixNano(), closedAt.Format(time.RFC3339Nano), closedAt.UnixNano(), event.ID); err != nil {
+		t.Fatal(err)
+	}
+	again, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "inside partial cooldown",
+		DedupeKey: "health:svc:partial",
+		CreatedAt: base.Add(10 * time.Minute),
+	}, []string{"discord", "webhook"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("inserted = true, want partial outcome to suppress inside cooldown")
+	}
+	if again.ID != event.ID {
+		t.Fatalf("suppressed event ID = %d, want original %d", again.ID, event.ID)
+	}
+}
+
+func TestAlertDeadLetteredDispatchClosesSingleSinkEvent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "container unhealthy",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Dispatch.Sink != "discord" {
+		t.Fatalf("claimed = %#v, want discord", claimed)
+	}
+	dispatch, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDeadLettered, "permanent failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.Status != AlertDispatchStatusDeadLettered || dispatch.LastError != "permanent failure" || dispatch.DeliveredAt != nil {
+		t.Fatalf("dead-lettered dispatch = %#v", dispatch)
+	}
+	deliveries, err := store.ListUndeliveredAlertDeliveries(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 0 {
+		t.Fatalf("undelivered after dead-letter = %#v, want none", deliveries)
+	}
+	if got := alertEventStatus(t, store, event.ID); got != AlertEventStatusFailed {
+		t.Fatalf("event status = %q, want failed after all sinks dead-letter", got)
+	}
+	next, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		Reason:    "same incident after failed delivery",
+		DedupeKey: "health:svc:unhealthy",
+		CreatedAt: time.Date(2026, 7, 9, 12, 1, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want failed events not to suppress follow-up incidents")
+	}
+	if next.ID == event.ID {
+		t.Fatalf("next event reused failed event ID %d, want fresh row", next.ID)
+	}
+}
+
+func TestAlertDeadLetteredDispatchSynthesizesMissingDiagnostic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:empty-dead-letter",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	dispatch, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDeadLettered, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.Status != AlertDispatchStatusDeadLettered || dispatch.LastError != alertDispatchDeadNoDiagnostic {
+		t.Fatalf("dead-letter dispatch = %#v, want synthesized diagnostic %q", dispatch, alertDispatchDeadNoDiagnostic)
+	}
+}
+
+func TestAlertStorageRedactsSinkSecretsWhenPersisting(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	token := "alert-secret-token"
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.AddRedactionValues(token)
+	event, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:       "health_transition",
+		ServiceID:  "svc",
+		Target:     "routes: https://user:" + token + "@example.com/app",
+		Repository: "repo-" + token,
+		OldState:   "healthy",
+		NewState:   "unhealthy",
+		Reason:     "discord webhook https://hooks.example.test/" + token + " failed with " + token,
+		DedupeKey:  "health:svc:" + token,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	if event.ID == 0 {
+		t.Fatal("event ID is zero")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-"+token, time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-"+token, claimed[0].Dispatch.ClaimID, AlertDispatchStatusDeadLettered, "POST failed with "+token); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`SELECT target FROM alert_events`,
+		`SELECT repository FROM alert_events`,
+		`SELECT reason FROM alert_events`,
+		`SELECT dedupe_key FROM alert_events`,
+		`SELECT worker_id FROM alert_dispatches`,
+		`SELECT last_error FROM alert_dispatches`,
+	} {
+		rows, err := store.db.QueryContext(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			assertRedacted(t, value, token)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func alertDeliverySinks(deliveries []AlertDelivery) []string {
+	sinks := make([]string, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		sinks = append(sinks, delivery.Dispatch.Sink)
+	}
+	return sinks
+}
+
+func alertEventStatus(t *testing.T, store *Store, eventID int64) string {
+	t.Helper()
+	var status string
+	if err := store.db.QueryRowContext(context.Background(), `SELECT status FROM alert_events WHERE id=?`, eventID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+func tableHasColumn(t *testing.T, store *Store, table, column string) bool {
+	t.Helper()
+	rows, err := store.db.QueryContext(context.Background(), "PRAGMA table_info("+table+")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return false
+}
+
+func writeTestAlertDedupeKey(t *testing.T, dbPath string) {
+	t.Helper()
+	keyPath := filepath.Join(filepath.Dir(dbPath), "alert-dedupe.key")
+	if err := os.WriteFile(keyPath, []byte(strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := readAlertDedupeKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := ensureStorageMetadataTable(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAlertDedupeKeyFingerprint(context.Background(), db, key); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertRedacted(t *testing.T, value, token string) {
 	t.Helper()
 	if strings.Contains(value, token) {
@@ -2124,3 +6476,12 @@ func sqliteFilesContainToken(t *testing.T, dbPath, token string) bool {
 	}
 	return false
 }
+
+type failingAlertDedupeKeyFile struct {
+	writeErr error
+	closeErr error
+}
+
+func (f *failingAlertDedupeKeyFile) WriteString(string) (int, error) { return 0, f.writeErr }
+func (f *failingAlertDedupeKeyFile) Sync() error                     { return nil }
+func (f *failingAlertDedupeKeyFile) Close() error                    { return f.closeErr }

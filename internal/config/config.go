@@ -1,7 +1,12 @@
 package config
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +15,7 @@ import (
 	"time"
 
 	"github.com/example/gitops-dashboard/internal/routetarget"
+	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"gopkg.in/yaml.v3"
 )
 
@@ -21,6 +27,7 @@ type Config struct {
 	Repositories []RepositoryConfig `yaml:"repositories"`
 	Runtime      RuntimeConfig      `yaml:"runtime"`
 	Monitoring   MonitoringConfig   `yaml:"monitoring"`
+	Alerting     AlertingConfig     `yaml:"alerting"`
 	Agent        AgentConfig        `yaml:"agent"`
 }
 
@@ -126,6 +133,82 @@ type MonitoringConfig struct {
 	DefaultInterval string `yaml:"defaultInterval"`
 }
 
+type AlertingConfig struct {
+	Debounce          string              `yaml:"debounce"`
+	Cooldown          string              `yaml:"cooldown"`
+	ResetOnMissingKey bool                `yaml:"resetOnMissingKey"`
+	ResetToken        string              `yaml:"resetToken"`
+	Retry             AlertRetryConfig    `yaml:"retry"`
+	Sinks             AlertingSinksConfig `yaml:"sinks"`
+	RedactionValues   []string            `yaml:"-"`
+}
+
+type AlertRetryConfig struct {
+	MaxAttempts     int    `yaml:"maxAttempts"`
+	InitialInterval string `yaml:"initialInterval"`
+	MaxInterval     string `yaml:"maxInterval"`
+}
+
+type AlertingSinksConfig struct {
+	Webhook       WebhookAlertSinkConfig       `yaml:"webhook"`
+	Discord       DiscordAlertSinkConfig       `yaml:"discord"`
+	HomeAssistant HomeAssistantAlertSinkConfig `yaml:"homeAssistant"`
+}
+
+type AlertSinkFilterConfig struct {
+	Services []string `yaml:"services"`
+	Targets  []string `yaml:"targets"`
+}
+
+type WebhookAlertSinkConfig struct {
+	Enabled           bool                  `yaml:"enabled"`
+	Name              string                `yaml:"name"`
+	URL               string                `yaml:"url"`
+	URLEnv            string                `yaml:"urlEnv"`
+	URLFile           string                `yaml:"urlFile"`
+	RedactValues      []string              `yaml:"redactValues"`
+	InsecureAllowHTTP bool                  `yaml:"insecureAllowHTTP"`
+	Method            string                `yaml:"method"`
+	Headers           map[string]string     `yaml:"headers"`
+	HeaderEnv         map[string]string     `yaml:"headerEnv"`
+	HeaderFile        map[string]string     `yaml:"headerFile"`
+	BodyTemplate      string                `yaml:"bodyTemplate"`
+	Timeout           string                `yaml:"timeout"`
+	Include           AlertSinkFilterConfig `yaml:"include"`
+	Exclude           AlertSinkFilterConfig `yaml:"exclude"`
+}
+
+type DiscordAlertSinkConfig struct {
+	Enabled        bool                  `yaml:"enabled"`
+	Name           string                `yaml:"name"`
+	WebhookURL     string                `yaml:"webhookURL"`
+	WebhookURLEnv  string                `yaml:"webhookURLEnv"`
+	WebhookURLFile string                `yaml:"webhookURLFile"`
+	RedactValues   []string              `yaml:"redactValues"`
+	Timeout        string                `yaml:"timeout"`
+	Include        AlertSinkFilterConfig `yaml:"include"`
+	Exclude        AlertSinkFilterConfig `yaml:"exclude"`
+}
+
+type HomeAssistantAlertSinkConfig struct {
+	Enabled           bool                  `yaml:"enabled"`
+	Name              string                `yaml:"name"`
+	BaseURL           string                `yaml:"baseURL"`
+	BaseURLEnv        string                `yaml:"baseURLEnv"`
+	BaseURLFile       string                `yaml:"baseURLFile"`
+	RedactValues      []string              `yaml:"redactValues"`
+	InsecureAllowHTTP bool                  `yaml:"insecureAllowHTTP"`
+	Token             string                `yaml:"token"`
+	TokenEnv          string                `yaml:"tokenEnv"`
+	TokenFile         string                `yaml:"tokenFile"`
+	WebhookID         string                `yaml:"webhookID"`
+	WebhookIDEnv      string                `yaml:"webhookIDEnv"`
+	WebhookIDFile     string                `yaml:"webhookIDFile"`
+	Timeout           string                `yaml:"timeout"`
+	Include           AlertSinkFilterConfig `yaml:"include"`
+	Exclude           AlertSinkFilterConfig `yaml:"exclude"`
+}
+
 type AgentConfig struct {
 	ServerURL string       `yaml:"serverUrl"`
 	Target    string       `yaml:"target"`
@@ -214,11 +297,49 @@ func (cfg *Config) applyServerDefaults() {
 	if cfg.Monitoring.DefaultInterval == "" {
 		cfg.Monitoring.DefaultInterval = "30s"
 	}
+	cfg.applyAlertingDefaults()
 	for i := range cfg.Repositories {
 		if cfg.Repositories[i].DefaultRef == "" {
 			cfg.Repositories[i].DefaultRef = "HEAD"
 		}
 	}
+}
+
+func (cfg *Config) applyAlertingDefaults() {
+	if cfg.Alerting.Debounce == "" {
+		cfg.Alerting.Debounce = "30s"
+	}
+	if cfg.Alerting.Cooldown == "" {
+		cfg.Alerting.Cooldown = "5m"
+	}
+	if cfg.Alerting.Retry.MaxAttempts == 0 {
+		cfg.Alerting.Retry.MaxAttempts = 3
+	}
+	if cfg.Alerting.Retry.InitialInterval == "" {
+		cfg.Alerting.Retry.InitialInterval = "10s"
+	}
+	if cfg.Alerting.Retry.MaxInterval == "" {
+		cfg.Alerting.Retry.MaxInterval = "5m"
+	}
+	if cfg.Alerting.Sinks.Webhook.Method == "" {
+		cfg.Alerting.Sinks.Webhook.Method = "POST"
+	} else {
+		cfg.Alerting.Sinks.Webhook.Method = strings.ToUpper(cfg.Alerting.Sinks.Webhook.Method)
+	}
+	if cfg.Alerting.Sinks.Webhook.Timeout == "" {
+		cfg.Alerting.Sinks.Webhook.Timeout = "10s"
+	}
+	if cfg.Alerting.Sinks.Discord.Timeout == "" {
+		cfg.Alerting.Sinks.Discord.Timeout = "10s"
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.Timeout == "" {
+		cfg.Alerting.Sinks.HomeAssistant.Timeout = "10s"
+	}
+	// Persist the effective identity so every caller uses the same validated,
+	// canonical sink name rather than having to repeat defaulting rules.
+	cfg.Alerting.Sinks.Webhook.Name = alertSinkName("webhook", cfg.Alerting.Sinks.Webhook.Name)
+	cfg.Alerting.Sinks.Discord.Name = alertSinkName("discord", cfg.Alerting.Sinks.Discord.Name)
+	cfg.Alerting.Sinks.HomeAssistant.Name = alertSinkName("home-assistant", cfg.Alerting.Sinks.HomeAssistant.Name)
 }
 
 func (cfg *Config) resolveServerSecrets() error {
@@ -269,7 +390,356 @@ func (cfg *Config) resolveServerSecrets() error {
 		}
 		cfg.Runtime.Docker[i].AgentToken = token
 	}
+	if err := cfg.resolveAlertingSecrets(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (cfg *Config) resolveAlertingSecrets() error {
+	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.Webhook.RedactValues...)
+	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.Discord.RedactValues...)
+	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.HomeAssistant.RedactValues...)
+	if cfg.Alerting.Sinks.Webhook.Enabled {
+		url, err := resolveSecret(
+			cfg.Alerting.Sinks.Webhook.URL,
+			cfg.Alerting.Sinks.Webhook.URLEnv,
+			cfg.Alerting.Sinks.Webhook.URLFile,
+			"alerting.sinks.webhook.url",
+			"alerting.sinks.webhook.urlEnv",
+			"alerting.sinks.webhook.urlFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.Webhook.URL = url
+		cfg.Alerting.Sinks.Webhook.URLEnv = ""
+		cfg.Alerting.Sinks.Webhook.URLFile = ""
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, url)
+		headers, err := resolveSecretMap(
+			cfg.Alerting.Sinks.Webhook.Headers,
+			cfg.Alerting.Sinks.Webhook.HeaderEnv,
+			cfg.Alerting.Sinks.Webhook.HeaderFile,
+			"alerting.sinks.webhook.headers",
+			"alerting.sinks.webhook.headerEnv",
+			"alerting.sinks.webhook.headerFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.Webhook.Headers = headers
+		cfg.Alerting.Sinks.Webhook.HeaderEnv = nil
+		cfg.Alerting.Sinks.Webhook.HeaderFile = nil
+		for name, value := range headers {
+			cfg.Alerting.RedactionValues = appendAlertHeaderRedactValues(cfg.Alerting.RedactionValues, name, value)
+		}
+	} else {
+		url := resolveSecretBestEffort(
+			cfg.Alerting.Sinks.Webhook.URL,
+			cfg.Alerting.Sinks.Webhook.URLEnv,
+			cfg.Alerting.Sinks.Webhook.URLFile,
+			"alerting.sinks.webhook.url",
+			"alerting.sinks.webhook.urlEnv",
+			"alerting.sinks.webhook.urlFile",
+		)
+		cfg.Alerting.Sinks.Webhook.URL = url.Value
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, url.RedactionValues...)
+		headers, err := resolveSecretMapBestEffort(
+			cfg.Alerting.Sinks.Webhook.Headers,
+			cfg.Alerting.Sinks.Webhook.HeaderEnv,
+			cfg.Alerting.Sinks.Webhook.HeaderFile,
+			"alerting.sinks.webhook.headers",
+			"alerting.sinks.webhook.headerEnv",
+			"alerting.sinks.webhook.headerFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.Webhook.Headers = headers.Values
+		cfg.Alerting.RedactionValues = append(cfg.Alerting.RedactionValues, headers.RedactionValues...)
+	}
+	if cfg.Alerting.Sinks.Discord.Enabled {
+		webhookURL, err := resolveSecret(
+			cfg.Alerting.Sinks.Discord.WebhookURL,
+			cfg.Alerting.Sinks.Discord.WebhookURLEnv,
+			cfg.Alerting.Sinks.Discord.WebhookURLFile,
+			"alerting.sinks.discord.webhookURL",
+			"alerting.sinks.discord.webhookURLEnv",
+			"alerting.sinks.discord.webhookURLFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.Discord.WebhookURL = webhookURL
+		cfg.Alerting.Sinks.Discord.WebhookURLEnv = ""
+		cfg.Alerting.Sinks.Discord.WebhookURLFile = ""
+		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, webhookURL)
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, webhookURL)
+	} else {
+		webhookURL := resolveSecretBestEffort(
+			cfg.Alerting.Sinks.Discord.WebhookURL,
+			cfg.Alerting.Sinks.Discord.WebhookURLEnv,
+			cfg.Alerting.Sinks.Discord.WebhookURLFile,
+			"alerting.sinks.discord.webhookURL",
+			"alerting.sinks.discord.webhookURLEnv",
+			"alerting.sinks.discord.webhookURLFile",
+		)
+		cfg.Alerting.Sinks.Discord.WebhookURL = webhookURL.Value
+		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, webhookURL.RedactionValues...)
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, webhookURL.RedactionValues...)
+	}
+	if cfg.Alerting.Sinks.HomeAssistant.Enabled {
+		baseURL, err := resolveSecret(
+			cfg.Alerting.Sinks.HomeAssistant.BaseURL,
+			cfg.Alerting.Sinks.HomeAssistant.BaseURLEnv,
+			cfg.Alerting.Sinks.HomeAssistant.BaseURLFile,
+			"alerting.sinks.homeAssistant.baseURL",
+			"alerting.sinks.homeAssistant.baseURLEnv",
+			"alerting.sinks.homeAssistant.baseURLFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.HomeAssistant.BaseURL = baseURL
+		cfg.Alerting.Sinks.HomeAssistant.BaseURLEnv = ""
+		cfg.Alerting.Sinks.HomeAssistant.BaseURLFile = ""
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, baseURL)
+		token, err := resolveSecret(
+			cfg.Alerting.Sinks.HomeAssistant.Token,
+			cfg.Alerting.Sinks.HomeAssistant.TokenEnv,
+			cfg.Alerting.Sinks.HomeAssistant.TokenFile,
+			"alerting.sinks.homeAssistant.token",
+			"alerting.sinks.homeAssistant.tokenEnv",
+			"alerting.sinks.homeAssistant.tokenFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.HomeAssistant.Token = token
+		cfg.Alerting.Sinks.HomeAssistant.TokenEnv = ""
+		cfg.Alerting.Sinks.HomeAssistant.TokenFile = ""
+		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, token)
+		webhookID, err := resolveSecret(
+			cfg.Alerting.Sinks.HomeAssistant.WebhookID,
+			cfg.Alerting.Sinks.HomeAssistant.WebhookIDEnv,
+			cfg.Alerting.Sinks.HomeAssistant.WebhookIDFile,
+			"alerting.sinks.homeAssistant.webhookID",
+			"alerting.sinks.homeAssistant.webhookIDEnv",
+			"alerting.sinks.homeAssistant.webhookIDFile",
+		)
+		if err != nil {
+			return err
+		}
+		cfg.Alerting.Sinks.HomeAssistant.WebhookID = webhookID
+		cfg.Alerting.Sinks.HomeAssistant.WebhookIDEnv = ""
+		cfg.Alerting.Sinks.HomeAssistant.WebhookIDFile = ""
+		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, webhookID)
+	} else {
+		baseURL := resolveSecretBestEffort(
+			cfg.Alerting.Sinks.HomeAssistant.BaseURL,
+			cfg.Alerting.Sinks.HomeAssistant.BaseURLEnv,
+			cfg.Alerting.Sinks.HomeAssistant.BaseURLFile,
+			"alerting.sinks.homeAssistant.baseURL",
+			"alerting.sinks.homeAssistant.baseURLEnv",
+			"alerting.sinks.homeAssistant.baseURLFile",
+		)
+		cfg.Alerting.Sinks.HomeAssistant.BaseURL = baseURL.Value
+		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, baseURL.RedactionValues...)
+		token := resolveSecretBestEffort(
+			cfg.Alerting.Sinks.HomeAssistant.Token,
+			cfg.Alerting.Sinks.HomeAssistant.TokenEnv,
+			cfg.Alerting.Sinks.HomeAssistant.TokenFile,
+			"alerting.sinks.homeAssistant.token",
+			"alerting.sinks.homeAssistant.tokenEnv",
+			"alerting.sinks.homeAssistant.tokenFile",
+		)
+		cfg.Alerting.Sinks.HomeAssistant.Token = token.Value
+		cfg.Alerting.RedactionValues = append(cfg.Alerting.RedactionValues, token.RedactionValues...)
+		webhookID := resolveSecretBestEffort(
+			cfg.Alerting.Sinks.HomeAssistant.WebhookID,
+			cfg.Alerting.Sinks.HomeAssistant.WebhookIDEnv,
+			cfg.Alerting.Sinks.HomeAssistant.WebhookIDFile,
+			"alerting.sinks.homeAssistant.webhookID",
+			"alerting.sinks.homeAssistant.webhookIDEnv",
+			"alerting.sinks.homeAssistant.webhookIDFile",
+		)
+		cfg.Alerting.Sinks.HomeAssistant.WebhookID = webhookID.Value
+		cfg.Alerting.RedactionValues = append(cfg.Alerting.RedactionValues, webhookID.RedactionValues...)
+	}
+	return nil
+}
+
+func appendAlertRedactValues(values []string, extra ...string) []string {
+	for _, value := range extra {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func appendAlertURLRedactValues(values []string, urls ...string) []string {
+	for _, raw := range urls {
+		values = appendAlertRedactValues(values, alertURLRedactionValues(raw)...)
+	}
+	return values
+}
+
+func appendAlertHeaderRedactValues(values []string, name, raw string) []string {
+	return appendAlertRedactValues(values, alertHeaderRedactionValues(name, raw)...)
+}
+
+func AlertingRedactionValues(alerting AlertingConfig) []string {
+	values := []string{}
+	values = appendAlertURLRedactValues(values, alerting.Sinks.Webhook.URL)
+	for name, value := range alerting.Sinks.Webhook.Headers {
+		values = appendAlertHeaderRedactValues(values, name, value)
+	}
+	values = appendAlertRedactValues(values, alerting.Sinks.Webhook.RedactValues...)
+	values = appendAlertURLRedactValues(values, alerting.Sinks.Discord.WebhookURL)
+	values = appendAlertRedactValues(values, alerting.Sinks.Discord.RedactValues...)
+	values = appendAlertURLRedactValues(values, alerting.Sinks.HomeAssistant.BaseURL)
+	values = appendAlertRedactValues(values, alerting.Sinks.HomeAssistant.Token, alerting.Sinks.HomeAssistant.WebhookID)
+	values = appendAlertRedactValues(values, alerting.Sinks.HomeAssistant.RedactValues...)
+	values = appendAlertRedactValues(values, alerting.RedactionValues...)
+	return values
+}
+
+func alertURLRedactionValues(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	values := []string{}
+	values = appendAlertRedactValues(values, sanitizer.URLUserinfoValues(raw)...)
+	for _, escapedPath := range alertEscapedPathVariants(parsed) {
+		for _, part := range strings.Split(escapedPath, "/") {
+			if unescaped, err := url.PathUnescape(part); err == nil && looksLikeAlertSecretComponent(unescaped) {
+				values = appendAlertRedactValues(values, alertEscapedSecretVariants(part, unescaped)...)
+			}
+		}
+	}
+	values = appendAlertURLQueryRedactValues(values, parsed.RawQuery)
+	for key, queryValues := range parsed.Query() {
+		if !isAlertSecretParameterName(key) {
+			continue
+		}
+		for _, value := range queryValues {
+			values = appendAlertRedactValues(values, alertEscapedSecretVariants(url.QueryEscape(value), value)...)
+		}
+	}
+	return values
+}
+
+func alertEscapedPathVariants(parsed *url.URL) []string {
+	variants := []string{}
+	for _, value := range []string{parsed.RawPath, parsed.EscapedPath()} {
+		if value == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range variants {
+			if existing == value {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			variants = append(variants, value)
+		}
+	}
+	return variants
+}
+
+func appendAlertURLQueryRedactValues(values []string, rawQuery string) []string {
+	for _, part := range strings.Split(rawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		keyPart, valuePart, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(keyPart)
+		if err != nil || !isAlertSecretParameterName(key) {
+			continue
+		}
+		value, err := url.QueryUnescape(valuePart)
+		if err != nil {
+			value = valuePart
+		}
+		values = appendAlertRedactValues(values, alertEscapedSecretVariants(valuePart, value)...)
+	}
+	return values
+}
+
+func alertEscapedSecretVariants(escaped, decoded string) []string {
+	variants := []string{decoded}
+	if escaped != "" {
+		variants = append(variants, escaped)
+	}
+	if decoded != "" {
+		variants = append(variants, url.PathEscape(decoded), url.QueryEscape(decoded))
+	}
+	return variants
+}
+
+func alertHeaderRedactionValues(name, raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	name = textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
+	fields := strings.Fields(raw)
+	if strings.EqualFold(name, "Authorization") && len(fields) == 2 {
+		return appendAlertRedactValues(nil, raw, fields[1])
+	}
+	if isAlertSecretParameterName(name) {
+		return appendAlertRedactValues(nil, raw)
+	}
+	return nil
+}
+
+func isAlertSecretParameterName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	switch normalized {
+	case "access-token", "api-key", "apikey", "auth", "authorization", "bearer", "client-secret", "key", "password", "secret", "signature", "sig", "token", "webhook-token":
+		return true
+	default:
+		return strings.HasSuffix(normalized, "-token") ||
+			strings.HasSuffix(normalized, "-secret") ||
+			strings.HasSuffix(normalized, "-key")
+	}
+}
+
+func looksLikeAlertSecretComponent(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 8 {
+		return false
+	}
+	classes := 0
+	var hasLower, hasUpper, hasDigit, hasSymbol bool
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasLower = true
+		case r >= 'A' && r <= 'Z':
+			hasUpper = true
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		default:
+			hasSymbol = true
+		}
+	}
+	for _, has := range []bool{hasLower, hasUpper, hasDigit, hasSymbol} {
+		if has {
+			classes++
+		}
+	}
+	return classes >= 2
 }
 
 func (cfg *Config) resolveAgentSecrets() error {
@@ -309,6 +779,203 @@ func resolveSecret(value, envName, filePath, valueField, envField, fileField str
 		return resolveFileSecret(fileField, filePath)
 	}
 	return value, nil
+}
+
+type bestEffortSecret struct {
+	Value           string
+	RedactionValues []string
+}
+
+func resolveSecretBestEffort(value, envName, filePath, valueField, envField, fileField string) bestEffortSecret {
+	result := bestEffortSecret{Value: value}
+	addRedactionValue := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			result.RedactionValues = append(result.RedactionValues, raw)
+		}
+	}
+	addRedactionValue(value)
+	if envName != "" {
+		if resolved, err := resolveEnvSecret(envField, envName); err == nil {
+			if result.Value == "" {
+				result.Value = resolved
+			}
+			addRedactionValue(resolved)
+		} else {
+			slog.Default().Warn("disabled alerting redaction source unavailable", "field", envField, "source", envName, "error", err)
+		}
+	}
+	if filePath != "" {
+		if resolved, err := resolveFileSecret(fileField, filePath); err == nil {
+			if result.Value == "" {
+				result.Value = resolved
+			}
+			addRedactionValue(resolved)
+		} else {
+			slog.Default().Warn("disabled alerting redaction source unavailable", "field", fileField, "source", filePath, "error", err)
+		}
+	}
+	return result
+}
+
+func resolveSecretMap(values, envNames, filePaths map[string]string, valueField, envField, fileField string) (map[string]string, error) {
+	resolved := map[string]string{}
+	sources := map[string]string{}
+	for key, value := range values {
+		canonicalKey, err := canonicalAlertHeaderName(valueField, key)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateAlertHeaderValue(valueField, canonicalKey, value); err != nil {
+			return nil, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return nil, fmt.Errorf("%s[%s] duplicates %s", valueField, key, previous)
+		}
+		sources[canonicalKey] = fmt.Sprintf("%s[%s]", valueField, key)
+		resolved[canonicalKey] = value
+	}
+	for key, envName := range envNames {
+		canonicalKey, err := canonicalAlertHeaderName(envField, key)
+		if err != nil {
+			return nil, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return nil, fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", envField, key, valueField, envField, fileField, previous)
+		}
+		value, err := resolveEnvSecret(fmt.Sprintf("%s[%s]", envField, key), envName)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateAlertHeaderValue(envField, canonicalKey, value); err != nil {
+			return nil, err
+		}
+		sources[canonicalKey] = fmt.Sprintf("%s[%s]", envField, key)
+		resolved[canonicalKey] = value
+	}
+	for key, filePath := range filePaths {
+		canonicalKey, err := canonicalAlertHeaderName(fileField, key)
+		if err != nil {
+			return nil, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return nil, fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", fileField, key, valueField, envField, fileField, previous)
+		}
+		value, err := resolveFileSecret(fmt.Sprintf("%s[%s]", fileField, key), filePath)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateAlertHeaderValue(fileField, canonicalKey, value); err != nil {
+			return nil, err
+		}
+		sources[canonicalKey] = fmt.Sprintf("%s[%s]", fileField, key)
+		resolved[canonicalKey] = value
+	}
+	if len(resolved) == 0 {
+		return nil, nil
+	}
+	return resolved, nil
+}
+
+func canonicalAlertHeaderName(field, name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("%s contains an empty key", field)
+	}
+	for i := 0; i < len(name); i++ {
+		if !isAlertHeaderNameByte(name[i]) {
+			return "", fmt.Errorf("%s[%s] is not a valid HTTP header name", field, name)
+		}
+	}
+	return textproto.CanonicalMIMEHeaderKey(name), nil
+}
+
+func isAlertHeaderNameByte(value byte) bool {
+	return (value >= 'A' && value <= 'Z') ||
+		(value >= 'a' && value <= 'z') ||
+		(value >= '0' && value <= '9') ||
+		strings.ContainsRune("!#$%&'*+-.^_`|~", rune(value))
+}
+
+func validateAlertHeaderValue(field, name, value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("%s[%s] must not contain CR or LF characters", field, name)
+	}
+	return nil
+}
+
+type bestEffortSecretMap struct {
+	Values          map[string]string
+	RedactionValues []string
+}
+
+func resolveSecretMapBestEffort(values, envNames, filePaths map[string]string, valueField, envField, fileField string) (bestEffortSecretMap, error) {
+	result := bestEffortSecretMap{Values: map[string]string{}}
+	addRedactionValue := func(key, raw string) {
+		result.RedactionValues = appendAlertHeaderRedactValues(result.RedactionValues, key, raw)
+	}
+	sources := map[string]string{}
+	for key, value := range values {
+		canonicalKey, err := canonicalAlertHeaderName(valueField, key)
+		if err != nil {
+			return result, err
+		}
+		if err := validateAlertHeaderValue(valueField, canonicalKey, value); err != nil {
+			return result, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return result, fmt.Errorf("%s[%s] duplicates %s", valueField, key, previous)
+		}
+		sources[canonicalKey] = fmt.Sprintf("%s[%s]", valueField, key)
+		result.Values[canonicalKey] = value
+		addRedactionValue(canonicalKey, value)
+	}
+	for key, envName := range envNames {
+		canonicalKey, err := canonicalAlertHeaderName(envField, key)
+		if err != nil {
+			return result, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return result, fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", envField, key, valueField, envField, fileField, previous)
+		}
+		if value, err := resolveEnvSecret(fmt.Sprintf("%s[%s]", envField, key), envName); err == nil {
+			if err := validateAlertHeaderValue(envField, canonicalKey, value); err != nil {
+				return result, err
+			}
+			if _, ok := result.Values[canonicalKey]; !ok {
+				result.Values[canonicalKey] = value
+			}
+			sources[canonicalKey] = fmt.Sprintf("%s[%s]", envField, key)
+			addRedactionValue(canonicalKey, value)
+		} else {
+			slog.Default().Warn("disabled alerting redaction source unavailable", "field", fmt.Sprintf("%s[%s]", envField, key), "source", envName, "error", err)
+		}
+	}
+	for key, filePath := range filePaths {
+		canonicalKey, err := canonicalAlertHeaderName(fileField, key)
+		if err != nil {
+			return result, err
+		}
+		if previous := sources[canonicalKey]; previous != "" {
+			return result, fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", fileField, key, valueField, envField, fileField, previous)
+		}
+		if value, err := resolveFileSecret(fmt.Sprintf("%s[%s]", fileField, key), filePath); err == nil {
+			if err := validateAlertHeaderValue(fileField, canonicalKey, value); err != nil {
+				return result, err
+			}
+			if _, ok := result.Values[canonicalKey]; !ok {
+				result.Values[canonicalKey] = value
+			}
+			sources[canonicalKey] = fmt.Sprintf("%s[%s]", fileField, key)
+			addRedactionValue(canonicalKey, value)
+		} else {
+			slog.Default().Warn("disabled alerting redaction source unavailable", "field", fmt.Sprintf("%s[%s]", fileField, key), "source", filePath, "error", err)
+		}
+	}
+	if len(result.Values) == 0 {
+		result.Values = nil
+	}
+	return result, nil
 }
 
 func resolveEnvSecret(field, envName string) (string, error) {
@@ -410,6 +1077,9 @@ func (cfg Config) Validate() error {
 			return err
 		}
 	}
+	if err := cfg.Alerting.Validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -435,6 +1105,265 @@ func (cfg Config) DefaultInterval() (time.Duration, error) {
 		return 0, fmt.Errorf("monitoring.defaultInterval: %w", err)
 	}
 	return interval, nil
+}
+
+func (cfg AlertingConfig) Enabled() bool {
+	return cfg.Sinks.Webhook.Enabled || cfg.Sinks.Discord.Enabled || cfg.Sinks.HomeAssistant.Enabled
+}
+
+func (cfg AlertingConfig) Validate() error {
+	if _, err := cfg.DebounceDuration(); err != nil {
+		return err
+	}
+	if _, err := cfg.CooldownDuration(); err != nil {
+		return err
+	}
+	if cfg.Retry.MaxAttempts <= 0 {
+		return fmt.Errorf("alerting.retry.maxAttempts must be greater than zero")
+	}
+	initial, err := cfg.RetryInitialIntervalDuration()
+	if err != nil {
+		return err
+	}
+	maximum, err := cfg.RetryMaxIntervalDuration()
+	if err != nil {
+		return err
+	}
+	if maximum < initial {
+		return fmt.Errorf("alerting.retry.maxInterval must be greater than or equal to alerting.retry.initialInterval")
+	}
+	if err := cfg.validateSinkNames(); err != nil {
+		return err
+	}
+	if cfg.Sinks.Webhook.Enabled {
+		if err := cfg.Sinks.Webhook.Validate(); err != nil {
+			return err
+		}
+	}
+	if cfg.Sinks.Discord.Enabled {
+		if err := cfg.Sinks.Discord.Validate(); err != nil {
+			return err
+		}
+	}
+	if cfg.Sinks.HomeAssistant.Enabled {
+		if err := cfg.Sinks.HomeAssistant.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// EnabledSinkNames returns validated, canonical identities declared by the
+// configured sink set. Disabled sinks remain valid historical identities; the
+// delivery layer decides whether they are active.
+func (cfg AlertingConfig) EnabledSinkNames() []string {
+	return []string{
+		alertSinkName("webhook", cfg.Sinks.Webhook.Name),
+		alertSinkName("discord", cfg.Sinks.Discord.Name),
+		alertSinkName("home-assistant", cfg.Sinks.HomeAssistant.Name),
+	}
+}
+
+func (cfg AlertingConfig) validateSinkNames() error {
+	sinks := []struct {
+		field       string
+		defaultName string
+		name        string
+	}{
+		{field: "alerting.sinks.webhook.name", defaultName: "webhook", name: cfg.Sinks.Webhook.Name},
+		{field: "alerting.sinks.discord.name", defaultName: "discord", name: cfg.Sinks.Discord.Name},
+		{field: "alerting.sinks.homeAssistant.name", defaultName: "home-assistant", name: cfg.Sinks.HomeAssistant.Name},
+	}
+	seen := map[string]string{}
+	for _, sink := range sinks {
+		name := alertSinkName(sink.defaultName, sink.name)
+		if name == "" {
+			return fmt.Errorf("%s must not be empty", sink.field)
+		}
+		if previous, ok := seen[name]; ok {
+			return fmt.Errorf("%s %q duplicates %s", sink.field, name, previous)
+		}
+		seen[name] = sink.field
+		if secret := alertSinkNameSecretMatch(name, cfg.RedactionValues); secret != "" {
+			return fmt.Errorf("%s must not contain configured secret values", sink.field)
+		}
+	}
+	return nil
+}
+
+func alertSinkName(defaultName, configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return defaultName
+	}
+	return configured
+}
+
+func alertSinkNameSecretMatch(name string, secrets []string) string {
+	for _, secret := range secrets {
+		secret = strings.TrimSpace(secret)
+		if secret == "" {
+			continue
+		}
+		for _, variant := range alertSecretNameVariants(secret) {
+			if variant != "" && strings.Contains(name, variant) {
+				return secret
+			}
+		}
+	}
+	return ""
+}
+
+func alertSecretNameVariants(secret string) []string {
+	hexValue := hex.EncodeToString([]byte(secret))
+	variants := []string{
+		secret,
+		url.PathEscape(secret),
+		strings.ToLower(url.PathEscape(secret)),
+		strings.ToUpper(url.PathEscape(secret)),
+		url.QueryEscape(secret),
+		strings.ToLower(url.QueryEscape(secret)),
+		strings.ToUpper(url.QueryEscape(secret)),
+		base64.StdEncoding.EncodeToString([]byte(secret)),
+		base64.RawStdEncoding.EncodeToString([]byte(secret)),
+		base64.URLEncoding.EncodeToString([]byte(secret)),
+		base64.RawURLEncoding.EncodeToString([]byte(secret)),
+		hexValue,
+		strings.ToUpper(hexValue),
+	}
+	seen := map[string]struct{}{}
+	deduped := make([]string, 0, len(variants))
+	for _, variant := range variants {
+		if variant == "" {
+			continue
+		}
+		if _, ok := seen[variant]; ok {
+			continue
+		}
+		seen[variant] = struct{}{}
+		deduped = append(deduped, variant)
+	}
+	return deduped
+}
+
+func (cfg AlertingConfig) DebounceDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Debounce, "alerting.debounce")
+}
+
+func (cfg AlertingConfig) CooldownDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Cooldown, "alerting.cooldown")
+}
+
+func (cfg AlertingConfig) RetryInitialIntervalDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Retry.InitialInterval, "alerting.retry.initialInterval")
+}
+
+func (cfg AlertingConfig) RetryMaxIntervalDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Retry.MaxInterval, "alerting.retry.maxInterval")
+}
+
+func (sink WebhookAlertSinkConfig) Validate() error {
+	if err := validateHTTPURL("alerting.sinks.webhook.url", sink.URL); err != nil {
+		return err
+	}
+	if parsed, _ := url.Parse(sink.URL); parsed != nil && parsed.Scheme == "http" && !sink.InsecureAllowHTTP {
+		return fmt.Errorf("alerting.sinks.webhook.url must use https unless alerting.sinks.webhook.insecureAllowHTTP is true")
+	}
+	switch sink.Method {
+	case "GET", "POST", "PUT", "PATCH":
+	default:
+		return fmt.Errorf("alerting.sinks.webhook.method must be one of GET, POST, PUT, or PATCH")
+	}
+	if _, err := sink.TimeoutDuration(); err != nil {
+		return err
+	}
+	if err := validateAlertHeaderSources(sink.Headers, sink.HeaderEnv, sink.HeaderFile, "alerting.sinks.webhook.headers", "alerting.sinks.webhook.headerEnv", "alerting.sinks.webhook.headerFile"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAlertHeaderSources(values, envNames, filePaths map[string]string, valueField, envField, fileField string) error {
+	seen := map[string]string{}
+	for key, value := range values {
+		canonicalKey, err := canonicalAlertHeaderName(valueField, key)
+		if err != nil {
+			return err
+		}
+		if err := validateAlertHeaderValue(valueField, canonicalKey, value); err != nil {
+			return err
+		}
+		if previous := seen[canonicalKey]; previous != "" {
+			return fmt.Errorf("%s[%s] duplicates %s", valueField, key, previous)
+		}
+		seen[canonicalKey] = fmt.Sprintf("%s[%s]", valueField, key)
+	}
+	for key := range envNames {
+		canonicalKey, err := canonicalAlertHeaderName(envField, key)
+		if err != nil {
+			return err
+		}
+		if previous := seen[canonicalKey]; previous != "" {
+			return fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", envField, key, valueField, envField, fileField, previous)
+		}
+		seen[canonicalKey] = fmt.Sprintf("%s[%s]", envField, key)
+	}
+	for key := range filePaths {
+		canonicalKey, err := canonicalAlertHeaderName(fileField, key)
+		if err != nil {
+			return err
+		}
+		if previous := seen[canonicalKey]; previous != "" {
+			return fmt.Errorf("%s[%s] must use only one of %s, %s, or %s (already set by %s)", fileField, key, valueField, envField, fileField, previous)
+		}
+		seen[canonicalKey] = fmt.Sprintf("%s[%s]", fileField, key)
+	}
+	return nil
+}
+
+func (sink WebhookAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
+	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.webhook.timeout")
+}
+
+func (sink DiscordAlertSinkConfig) Validate() error {
+	if err := validateHTTPURL("alerting.sinks.discord.webhookURL", sink.WebhookURL); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(sink.WebhookURL)
+	if parsed != nil && parsed.Scheme != "https" {
+		return fmt.Errorf("alerting.sinks.discord.webhookURL must use https")
+	}
+	if _, err := sink.TimeoutDuration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sink DiscordAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
+	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.discord.timeout")
+}
+
+func (sink HomeAssistantAlertSinkConfig) Validate() error {
+	if err := validateHTTPURL("alerting.sinks.homeAssistant.baseURL", sink.BaseURL); err != nil {
+		return err
+	}
+	if parsed, _ := url.Parse(sink.BaseURL); parsed != nil && parsed.Scheme == "http" && !sink.InsecureAllowHTTP {
+		return fmt.Errorf("alerting.sinks.homeAssistant.baseURL must use https unless alerting.sinks.homeAssistant.insecureAllowHTTP is true")
+	}
+	if strings.TrimSpace(sink.Token) == "" {
+		return fmt.Errorf("alerting.sinks.homeAssistant.token, tokenEnv, or tokenFile is required")
+	}
+	if strings.TrimSpace(sink.WebhookID) == "" {
+		return fmt.Errorf("alerting.sinks.homeAssistant.webhookID, webhookIDEnv, or webhookIDFile is required")
+	}
+	if _, err := sink.TimeoutDuration(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sink HomeAssistantAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
+	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.homeAssistant.timeout")
 }
 
 func (target DockerTarget) CheckInterval(defaultInterval time.Duration) time.Duration {
@@ -546,6 +1475,27 @@ func optionalPositiveDuration(value, field string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be greater than zero", field)
 	}
 	return interval, nil
+}
+
+func requiredPositiveDuration(value, field string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, fmt.Errorf("%s is required", field)
+	}
+	return optionalPositiveDuration(value, field)
+}
+
+func validateHTTPURL(field, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("%s must be a valid http or https URL", field)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%s must be a valid http or https URL", field)
+	}
+	return nil
 }
 
 func validateRepoRelativePath(field, value string) error {
