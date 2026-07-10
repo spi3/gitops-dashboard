@@ -285,6 +285,9 @@ jobs:
           SHORT_SHA: ${{ steps.version.outputs.short_sha }}
         run: |
           set -euo pipefail
+          imagetools_manifest_digest() {
+            docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'
+          }
           [[ "$VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
           major="v${BASH_REMATCH[1]}"; minor="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
           highest_compatible_release() {
@@ -298,8 +301,8 @@ jobs:
           }
           minor_version="$(highest_compatible_release "^${minor}\\.[0-9]+$")"
           major_version="$(highest_compatible_release "^${major}\\.[0-9]+\\.[0-9]+$")"
-          minor_digest="$(docker buildx imagetools inspect "$IMAGE:$minor_version" --format '{{.Digest}}')"
-          major_digest="$(docker buildx imagetools inspect "$IMAGE:$major_version" --format '{{.Digest}}')"
+          minor_digest="$(imagetools_manifest_digest "$IMAGE:$minor_version")"
+          major_digest="$(imagetools_manifest_digest "$IMAGE:$major_version")"
           [[ "$minor_digest" =~ ^sha256:[0-9a-f]{64}$ && "$major_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'channel source image has no OCI digest' >&2; exit 1; }
           # Recompute both channels from all exact tags. This makes a delayed
           # release converge forward instead of retargeting a channel backward.
@@ -314,7 +317,7 @@ jobs:
               }
             ' | sort -u -V | tail -1)"
             [[ -n "$advanced_version" ]] || return 1
-            advanced_digest="$(docker buildx imagetools inspect "$IMAGE:$advanced_version" --format '{{.Digest}}' 2>/dev/null || true)"
+            advanced_digest="$(imagetools_manifest_digest "$IMAGE:$advanced_version" 2>/dev/null || true)"
             [[ "$advanced_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
             docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$advanced_digest"
           }
@@ -332,7 +335,7 @@ jobs:
             # prior pointer exists and advanced main has not released yet, the
             # just-published digest remains latest until that release converges
             # the pointer forward.
-            prior_latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Digest}}' 2>/dev/null || true)"
+            prior_latest_digest="$(imagetools_manifest_digest "$IMAGE:latest" 2>/dev/null || true)"
             latest_allowed=false
             git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
             [[ "$COMMIT" == "$(git rev-parse origin/main)" ]] && latest_allowed=true
@@ -377,6 +380,9 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
         run: |
           set -euo pipefail
+          imagetools_manifest_digest() {
+            docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'
+          }
           commit="$(git rev-parse HEAD)"
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           main_commit="$(git rev-parse origin/main)"
@@ -417,9 +423,9 @@ jobs:
           # latest-or-newer pointer, and GitHub Release all converge.
           complete=false
           if [[ -n "$version" ]]; then
-            exact_digest="$(docker buildx imagetools inspect "$IMAGE:$version" --format '{{.Digest}}' 2>/dev/null || true)"
-            sha_digest="$(docker buildx imagetools inspect "$IMAGE:sha-${main_commit:0:12}" --format '{{.Digest}}' 2>/dev/null || true)"
-            latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Digest}}' 2>/dev/null || true)"
+            exact_digest="$(imagetools_manifest_digest "$IMAGE:$version" 2>/dev/null || true)"
+            sha_digest="$(imagetools_manifest_digest "$IMAGE:sha-${main_commit:0:12}" 2>/dev/null || true)"
+            latest_digest="$(imagetools_manifest_digest "$IMAGE:latest" 2>/dev/null || true)"
             latest_at_or_past=false
             if [[ "$latest_digest" == "$exact_digest" && "$exact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
               latest_at_or_past=true
@@ -427,7 +433,7 @@ jobs:
               while IFS=$'\t' read -r candidate _; do
                 candidate="${candidate#refs/tags/}"
                 [[ "$(printf '%s\n%s\n' "$version" "$candidate" | sort -V | tail -n1)" == "$candidate" ]] || continue
-                candidate_digest="$(docker buildx imagetools inspect "$IMAGE:$candidate" --format '{{.Digest}}' 2>/dev/null || true)"
+                candidate_digest="$(imagetools_manifest_digest "$IMAGE:$candidate" 2>/dev/null || true)"
                 [[ "$candidate_digest" == "$latest_digest" && "$latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] && { latest_at_or_past=true; break; }
               done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" | jq -r '
                 .[] | select(.ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) |

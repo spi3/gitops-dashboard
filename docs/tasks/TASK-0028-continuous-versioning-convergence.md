@@ -54,6 +54,89 @@ allocates v0.0.1; non-strict tags do not affect that result.
 
 ## Verification Evidence
 
+### Round 9 (2026-07-10)
+
+The imagetools regression test now walks the parsed checked-in workflow YAML
+and extracts every `imagetools inspect --format` expression from its scalar
+nodes. Each extracted field path is traversed through the vendored Buildx
+`{{json .}}` capture decoded as `map[string]any`; no test-only Go struct
+redeclares that schema. The validator accepts the production
+`{{.Manifest.Digest}}` formats and rejects `.Digest`, `{{ .Digest }}`, and an
+appended `{{ .Bogus }}` on every extracted production format.
+
+The following commands were executed verbatim from the repository root:
+
+```text
+$ GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go test ./internal/ci ./internal/...
+ok  	github.com/example/gitops-dashboard/internal/ci	(cached)
+ok  	github.com/example/gitops-dashboard/internal/agent	(cached)
+ok  	github.com/example/gitops-dashboard/internal/app	(cached)
+ok  	github.com/example/gitops-dashboard/internal/auth	(cached)
+ok  	github.com/example/gitops-dashboard/internal/config	(cached)
+ok  	github.com/example/gitops-dashboard/internal/core	(cached)
+ok  	github.com/example/gitops-dashboard/internal/dockerapi	(cached)
+ok  	github.com/example/gitops-dashboard/internal/environment	(cached)
+?   	github.com/example/gitops-dashboard/internal/hostinventory	[no test files]
+ok  	github.com/example/gitops-dashboard/internal/monitor	(cached)
+ok  	github.com/example/gitops-dashboard/internal/parser	(cached)
+ok  	github.com/example/gitops-dashboard/internal/routetarget	(cached)
+ok  	github.com/example/gitops-dashboard/internal/sanitizer	(cached)
+ok  	github.com/example/gitops-dashboard/internal/scanner	(cached)
+ok  	github.com/example/gitops-dashboard/internal/storage	(cached)
+?   	github.com/example/gitops-dashboard/internal/ui	[no test files]
+?   	github.com/example/gitops-dashboard/internal/version	[no test files]
+
+$ make build
+npm run build
+
+> gitops-dashboard@1.0.0 build
+> vite build
+
+(node:20) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+vite v8.1.0 building client environment for production...
+transforming...
+✓ 24 modules transformed.
+rendering chunks...
+computing gzip size...
+✓ built in 272ms
+GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go build -buildvcs=false -ldflags "-X github.com/example/gitops-dashboard/internal/version.Version=dev-d6e20a05b8f7 -X github.com/example/gitops-dashboard/internal/version.Commit=d6e20a05b8f7 -X github.com/example/gitops-dashboard/internal/version.BuildDate=2026-07-10T21:16:46Z" ./cmd/gitops-dashboard
+
+$ /tmp/gitops-dashboard-bin/actionlint .github/workflows/ci.yml
+
+$ git diff --check
+```
+
+All commands exited 0. No remote release was triggered from this workspace.
+
+### Round 8 (2026-07-10)
+
+Run 29122614648 allocated and pushed the immutable `v0.0.2` exact image, then
+failed in `Publish moving image channels` before the moving channels, `latest`,
+commit-SHA image, and GitHub Release were created. That partial state remains
+intentional: immutable tags and exact images are never retargeted or deleted.
+The next successful release recomputes major/minor from all exact tags and
+advances `latest` only to the current main release, so it converges those
+forward without incorrectly treating `v0.0.2` as a complete release.
+
+Every workflow `imagetools inspect` now calls the local
+`imagetools_manifest_digest` helper, which uses `{{.Manifest.Digest}}`. The
+regression fixture is a real `{{json .}}` capture from Docker Buildx v0.34.1;
+the test renders templates against that input schema and rejects the former
+nonexistent top-level `{{.Digest}}` field.
+
+The following commands were executed verbatim from the repository root:
+
+```text
+$ GOCACHE=/tmp/gitops-dashboard-go-cache GOTOOLCHAIN=local go test ./internal/ci ./internal/...
+$ make build
+$ /tmp/gitops-dashboard-bin/actionlint .github/workflows/ci.yml
+$ git diff --check
+```
+
+All commands exited 0. The exact command output is retained in the task
+delivery record for this round; no remote release was triggered from this
+workspace.
+
 ### Round 7 (2026-07-10)
 
 The following commands were executed verbatim from the repository root after

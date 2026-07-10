@@ -1,10 +1,12 @@
 package ci
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -12,6 +14,29 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestReleaseWorkflowUsesManifestDigestFromBuildxInspectInputs(t *testing.T) {
+	t.Parallel()
+	shape := readImagetoolsInspectShape(t)
+	formats := imagetoolsFormats(t, workflowNode(t, readWorkflow(t)))
+	for _, format := range formats {
+		if err := validateImagetoolsFormat(format, shape); err != nil {
+			t.Fatalf("production imagetools format %q: %v", format, err)
+		}
+	}
+
+	for _, format := range []string{"{{.Digest}}", "{{ .Digest }}"} {
+		if err := validateImagetoolsFormat(format, shape); err == nil {
+			t.Fatalf("validator accepted nonexistent imagetools field in %q", format)
+		}
+	}
+	for _, format := range formats {
+		mutated := format + "{{ .Bogus }}"
+		if err := validateImagetoolsFormat(mutated, shape); err == nil {
+			t.Fatalf("validator accepted unknown field appended to production format %q", format)
+		}
+	}
+}
 
 func TestReleaseWorkflowTriggersAndSerialization(t *testing.T) {
 	t.Parallel()
@@ -100,7 +125,7 @@ func TestReleaseWorkflowAllocatesAndPublishesAllMainTags(t *testing.T) {
 	if strings.Contains(releaseJob, "IGNORECASE") || strings.Contains(releaseJob, "targetCommitish") || !strings.Contains(releaseJob, "gitops-dashboard-release:start") {
 		t.Fatal("release repair must use delimited metadata and peeled-tag authority")
 	}
-	if !strings.Contains(releaseJob, `if [[ "$latest_allowed" == true ]]; then`) || !strings.Contains(releaseJob, `prior_latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest"`) || !strings.Contains(releaseJob, `[[ "$COMMIT" == "$(git rev-parse origin/main)" ]] && latest_allowed=true`) {
+	if !strings.Contains(releaseJob, `if [[ "$latest_allowed" == true ]]; then`) || !strings.Contains(releaseJob, `prior_latest_digest="$(imagetools_manifest_digest "$IMAGE:latest"`) || !strings.Contains(releaseJob, `[[ "$COMMIT" == "$(git rev-parse origin/main)" ]] && latest_allowed=true`) {
 		t.Fatal("latest must be guarded by the current origin/main revision")
 	}
 	if !strings.Contains(releaseJob, `docker buildx imagetools create -t "$IMAGE:sha-$SHORT_SHA" "$IMAGE@$EXACT_DIGEST"`) {
@@ -923,6 +948,104 @@ func readWorkflow(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+var imagetoolsFormatPattern = regexp.MustCompile(`--format\s+(?:'([^']*)'|"([^"]*)"|(\S+))`)
+var imagetoolsTemplateActionPattern = regexp.MustCompile(`\{\{\s*([^{}]+?)\s*\}\}`)
+var imagetoolsTemplateFieldPattern = regexp.MustCompile(`^\.([[:alpha:]_][[:alnum:]_]*(?:\.[[:alpha:]_][[:alnum:]_]*)*)$`)
+
+func imagetoolsFormats(t *testing.T, workflow *yaml.Node) []string {
+	t.Helper()
+	var formats []string
+	var walk func(*yaml.Node)
+	walk = func(node *yaml.Node) {
+		if node == nil {
+			return
+		}
+		if node.Kind == yaml.ScalarNode {
+			for _, match := range imagetoolsFormatPattern.FindAllStringSubmatch(node.Value, -1) {
+				for _, format := range match[1:] {
+					if format != "" {
+						formats = append(formats, format)
+						break
+					}
+				}
+			}
+		}
+		for _, child := range node.Content {
+			walk(child)
+		}
+	}
+	walk(workflow)
+	if len(formats) == 0 {
+		t.Fatal("parsed workflow contains no imagetools --format expressions")
+	}
+	return formats
+}
+
+func validateImagetoolsFormat(format string, shape map[string]any) error {
+	actions := imagetoolsTemplateActionPattern.FindAllStringSubmatch(format, -1)
+	if len(actions) == 0 {
+		return fmt.Errorf("contains no template fields")
+	}
+	if leftover := imagetoolsTemplateActionPattern.ReplaceAllString(format, ""); strings.Contains(leftover, "{{") || strings.Contains(leftover, "}}") {
+		return fmt.Errorf("contains malformed template delimiters")
+	}
+	for _, action := range actions {
+		match := imagetoolsTemplateFieldPattern.FindStringSubmatch(strings.TrimSpace(action[1]))
+		if match == nil {
+			return fmt.Errorf("unsupported template action %q", action[1])
+		}
+		if err := validateImagetoolsFieldPath(strings.Split(match[1], "."), shape); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateImagetoolsFieldPath(path []string, shape map[string]any) error {
+	var current any = shape
+	for _, field := range path {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return fmt.Errorf("field %q is not an object", field)
+		}
+		value, ok := jsonShapeField(object, field)
+		if !ok {
+			return fmt.Errorf("field %q does not exist", strings.Join(path, "."))
+		}
+		current = value
+	}
+	return nil
+}
+
+func jsonShapeField(object map[string]any, want string) (any, bool) {
+	for key, value := range object {
+		if strings.EqualFold(key, want) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func readImagetoolsInspectShape(t *testing.T) map[string]any {
+	t.Helper()
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	// This is a vendored captured `{{json .}}` input shape, not a hand-written
+	// digest-only response: buildx templates receive Name, Manifest, and Image.
+	fixturePath := filepath.Join(filepath.Dir(filename), "testdata", "imagetools-inspect-buildx-v0.34.1.json")
+	data, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape map[string]any
+	if err := json.Unmarshal(data, &shape); err != nil {
+		t.Fatalf("parse imagetools inspect fixture: %v", err)
+	}
+	return shape
 }
 
 func readDockerfile(t *testing.T) string {
