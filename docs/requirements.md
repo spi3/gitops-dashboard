@@ -311,7 +311,9 @@ The dashboard must support:
 
 ## Explicit Non-Goals
 
-- Mutating Git repositories.
+- The dashboard, scanner, and monitor never mutate Git repositories. Release
+  tooling (`cmd/release` and the CI release workflow) is authorized to create
+  release tags and its own lock refs in this repository only.
 - Mutating Docker hosts.
 - Mutating Kubernetes clusters.
 - Running deployments.

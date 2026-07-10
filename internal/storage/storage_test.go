@@ -430,6 +430,39 @@ VALUES(?, 'error', ?, ?)
 	}
 }
 
+func TestCanonicalizeRouteCredentialsCompactsPersistedPages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	secret := "route-password-t026"
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	target := "routes: https://user:" + secret + "@app.example.test"
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO status_results(service_id, target, health, message, checked_at, observed_images_json)
+VALUES(?, ?, 'error', 'failed', ?, '[]')`, "svc-route", target, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	if !sqliteFilesContainToken(t, dbPath, secret) {
+		t.Fatal("test setup did not write credential into sqlite files")
+	}
+	if err := store.CanonicalizeHTTPRouteTargets(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if sqliteFilesContainToken(t, dbPath, secret) {
+		t.Fatal("credential remains in sqlite files after canonicalization compaction")
+	}
+}
+
 func TestReplaceConfiguredServicesPreservesStableStatusHistory(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

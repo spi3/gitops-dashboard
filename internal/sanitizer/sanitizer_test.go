@@ -46,8 +46,19 @@ func TestURLUserinfoValuesIgnoresBareUsername(t *testing.T) {
 	if !strings.Contains(got, "git clone") || !strings.Contains(got, "github.com") {
 		t.Fatalf("redaction altered non-secret text: %q", got)
 	}
-	if strings.Contains(got, "git@github.com") {
-		t.Fatalf("URL userinfo was not stripped structurally: %q", got)
+	if !strings.Contains(got, "ssh://github.com") {
+		t.Fatalf("redaction did not remove URL userinfo structurally: %q", got)
+	}
+}
+
+func TestStripURLUserinfoStripsEmbeddedAndUsernameOnlyHTTPCredentials(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"routes: https://user:password@host.example/path", "routes: https://host.example/path"},
+		{"https://token@host.example/path", "https://host.example/path"},
+	} {
+		if got := StripURLUserinfo(tt.in); got != tt.want {
+			t.Errorf("StripURLUserinfo(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }
 
