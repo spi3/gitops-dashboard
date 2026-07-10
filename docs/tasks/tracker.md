@@ -34,10 +34,11 @@ status board.
 | TASK-0014 | Done | P0 | Quality | Complete Playwright UI feature coverage | `docs/tasks/TASK-0014-complete-playwright-ui-feature-coverage.md` | TASK-0013 | 2026-06-27 | Expanded browser coverage for all dashboard controls, health states, metrics, filtering, live status, and error display. |
 | TASK-0015 | Done | P1 | Release | CI versioning process | `docs/tasks/TASK-0015-ci-versioning-process.md` | TASK-0011 | 2026-07-08 | Build metadata, SemVer CI tags, OCI labels, and desired-versus-observed image comparison implemented. |
 | TASK-0026 | In Review | P1 | Release | SemVer allocator and manual release | `docs/tasks/TASK-0026-semver-allocator-and-manual-release.md` | TASK-0015 | 2026-07-10 | Guarded allocator, release-tag publication, and release-path E2E coverage. |
+| TASK-0047 | In Review | P1 | CI Reliability | CI publish wedge hotfix | `docs/tasks/TASK-0047-ci-publish-wedge-hotfix.md` | TASK-0015 | 2026-07-10 | Native UI build platform, bounded CI jobs, and exact Docker variable-reference guards. |
 
 ## Next Task ID
 
-`TASK-0027`
+`TASK-0048`
 
 Reserved-task traceability:
 

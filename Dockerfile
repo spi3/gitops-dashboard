@@ -3,7 +3,7 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 ARG SOURCE=https://github.com/spi3/gitops-dashboard
 
-FROM node:22-alpine AS ui
+FROM --platform=$BUILDPLATFORM node:22-alpine AS ui
 WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci
