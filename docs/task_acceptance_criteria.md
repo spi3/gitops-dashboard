@@ -10,8 +10,10 @@ shared expectations.
 
 ### Task Scope
 
-- The task has a dedicated file under `docs/tasks/`.
-- The task is listed in `docs/tasks/tracker.md`.
+- The external orchestration workspace is the task system of record for task
+  status, assignment, and priority. The repository mirrors implementation
+  evidence in a dedicated file under `docs/tasks/` and an index row in
+  `docs/tasks/tracker.md`; those mirrors do not override external status.
 - The task file clearly defines scope, out-of-scope work, dependencies, and
   task-specific acceptance criteria.
 - Any scope change discovered during implementation is reflected in the task
@@ -102,8 +104,8 @@ shared expectations.
 
 ### Tracker And Evidence
 
-- The task tracker points to the correct task definition file.
-- The task status is accurate.
+- The task tracker points to the correct task definition file and reflects the
+  external orchestration state when it is known.
 - Dependencies are recorded and updated.
 - Verification evidence is recorded in the task file.
 - Known limitations or follow-up tasks are documented before closing.

@@ -119,16 +119,25 @@ sees it. That is more reliable than host-side `stat` on systems with user
 namespaces, symlinked sockets, or Docker socket proxies.
 
 Pushes to `main` run the GitHub Actions workflow in `.github/workflows/ci.yml`.
-After tests pass, the workflow publishes the image to GitHub Container Registry:
+All revisions are accepted and tested, while the serialized release queue keeps
+one running and one pending job and replaces intermediate pending jobs during a
+burst. Each executed job allocates the next immutable patch release and
+publishes its digest to GitHub Container Registry:
 
 - `ghcr.io/spi3/gitops-dashboard:latest`
 - `ghcr.io/spi3/gitops-dashboard:sha-<short-sha>`
-- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR.PATCH` on release tags
-- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR` on release tags
-- `ghcr.io/spi3/gitops-dashboard:vMAJOR` on release tags
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR.PATCH`
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR.MINOR`
+- `ghcr.io/spi3/gitops-dashboard:vMAJOR`
 
-The full container and service versioning process, including release tags and
-GitOps deployment pinning guidance, is documented in
+`latest`, `vMAJOR.MINOR`, and `vMAJOR` move and must not be production
+deployment pins. `latest` remains at the newest successfully released main
+commit until a newer release completes, then converges forward; CI never
+deletes registry content. The final executed job for the current main commit
+converges those pointers after a burst; every executed release still publishes
+its commit-specific `sha-<short-sha>` tag. Use an exact tag plus digest. Manual
+major/minor release, the no-skip-marker policy (skip markers bypass the
+observable bounded queue), queue behavior, and recovery are in
 [versioning.md](versioning.md).
 
 The image and binary carry the same build metadata: version, commit revision,

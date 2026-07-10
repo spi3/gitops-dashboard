@@ -25,6 +25,10 @@ on:
         description: Main revision verified by cmd/release
         required: false
         type: string
+      reconciliation_source:
+        description: Main revision for which this bounded reconciliation run was dispatched
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -129,6 +133,9 @@ jobs:
     permissions:
       contents: write
       packages: write
+      # A stale serialized release may need to dispatch the current main head
+      # through this workflow's normal test-gated release front door.
+      actions: write
 
     steps:
       - name: Check out repository
@@ -272,6 +279,7 @@ jobs:
         env:
           IMAGE: ghcr.io/${{ github.repository }}
           VERSION: ${{ steps.version.outputs.value }}
+          COMMIT: ${{ steps.version.outputs.commit }}
           EXACT_DIGEST: ${{ steps.push.outputs.digest || steps.existing.outputs.digest }}
           MAIN_RELEASE: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
           SHORT_SHA: ${{ steps.version.outputs.short_sha }}
@@ -279,10 +287,167 @@ jobs:
           set -euo pipefail
           [[ "$VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
           major="v${BASH_REMATCH[1]}"; minor="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-          tags=(-t "$IMAGE:$minor" -t "$IMAGE:$major")
-          if [[ "$MAIN_RELEASE" == true ]]; then tags+=(-t "$IMAGE:latest" -t "$IMAGE:sha-$SHORT_SHA"); fi
-          docker buildx imagetools create "${tags[@]}" "$IMAGE@$EXACT_DIGEST"
+          highest_compatible_release() {
+            local pattern="$1" candidate
+            candidate="$(git ls-remote --tags origin 'refs/tags/v*' | awk '
+              { ref=$2; sub("refs/tags/", "", ref); sub(/\^\{\}$/, "", ref) }
+              ref ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ { print ref }
+            ' | sort -u -V | while IFS= read -r tag; do [[ "$tag" =~ $pattern ]] && printf '%s\n' "$tag"; done | tail -1)"
+            [[ -n "$candidate" ]] || { echo "no compatible strict SemVer release for $pattern" >&2; return 1; }
+            printf '%s\n' "$candidate"
+          }
+          minor_version="$(highest_compatible_release "^${minor}\\.[0-9]+$")"
+          major_version="$(highest_compatible_release "^${major}\\.[0-9]+\\.[0-9]+$")"
+          minor_digest="$(docker buildx imagetools inspect "$IMAGE:$minor_version" --format '{{.Digest}}')"
+          major_digest="$(docker buildx imagetools inspect "$IMAGE:$major_version" --format '{{.Digest}}')"
+          [[ "$minor_digest" =~ ^sha256:[0-9a-f]{64}$ && "$major_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'channel source image has no OCI digest' >&2; exit 1; }
+          # Recompute both channels from all exact tags. This makes a delayed
+          # release converge forward instead of retargeting a channel backward.
+          docker buildx imagetools create -t "$IMAGE:$minor" "$IMAGE@$minor_digest"
+          docker buildx imagetools create -t "$IMAGE:$major" "$IMAGE@$major_digest"
+          advance_latest_to_advanced_main() {
+            local advanced_commit="$1" advanced_version advanced_digest
+            advanced_version="$(git ls-remote --tags origin 'refs/tags/v*' | awk -v commit="$advanced_commit" '
+              {
+                ref=$2; sub("refs/tags/", "", ref); peeled=(ref ~ /\^\{\}$/); sub(/\^\{\}$/, "", ref)
+                if (ref ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ && $1 == commit) print ref
+              }
+            ' | sort -u -V | tail -1)"
+            [[ -n "$advanced_version" ]] || return 1
+            advanced_digest="$(docker buildx imagetools inspect "$IMAGE:$advanced_version" --format '{{.Digest}}' 2>/dev/null || true)"
+            [[ "$advanced_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+            docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$advanced_digest"
+          }
+          sha_published=false
+          latest_published=false
+          if [[ "$MAIN_RELEASE" == true ]]; then
+            # The commit-specific reference is immutable evidence for every
+            # accepted release, even when this queued run is no longer main.
+            docker buildx imagetools create -t "$IMAGE:sha-$SHORT_SHA" "$IMAGE@$EXACT_DIGEST"
+            sha_published=true
+
+            # Keep the previous pointer so a main advance between the precheck
+            # and registry write can be undone while this release job owns the
+            # serialization group. CI never deletes registry content: if no
+            # prior pointer exists and advanced main has not released yet, the
+            # just-published digest remains latest until that release converges
+            # the pointer forward.
+            prior_latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Digest}}' 2>/dev/null || true)"
+            latest_allowed=false
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            [[ "$COMMIT" == "$(git rev-parse origin/main)" ]] && latest_allowed=true
+            if [[ "$latest_allowed" == true ]]; then
+              docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$EXACT_DIGEST"
+              latest_published=true
+            fi
+
+            # Fetch again immediately after the write. If main advanced during
+            # it, restore the previous pointer. With no usable previous
+            # pointer, advance to advanced main's immutable release image when
+            # available. Otherwise leave this successful release as latest;
+            # the pending/queued advanced-main release converges it forward.
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            if [[ "$latest_published" == true && "$COMMIT" != "$(git rev-parse origin/main)" ]]; then
+              if [[ "$prior_latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$prior_latest_digest"
+                latest_published=false
+              elif advance_latest_to_advanced_main "$(git rev-parse origin/main)"; then
+                latest_published=false
+              fi
+            fi
+          fi
           echo "digest=$EXACT_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "minor_digest=$minor_digest" >> "$GITHUB_OUTPUT"
+          echo "major_digest=$major_digest" >> "$GITHUB_OUTPUT"
+          echo "sha_published=$sha_published" >> "$GITHUB_OUTPUT"
+          echo "latest_published=$latest_published" >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile displaced main release
+        # This repair must still evaluate when an earlier publication step
+        # fails: a displaced current main head can already carry its allocated
+        # tag while its exact image is absent. `!cancelled()` still preserves
+        # the earlier failure in the job result, but never dispatches a new
+        # release after an operator cancels the workflow.
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RECONCILIATION_SOURCE: ${{ inputs.reconciliation_source || '' }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          main_commit="$(git rev-parse origin/main)"
+          [[ "$commit" != "$main_commit" ]] || exit 0
+
+          # A reconciliation-dispatched run may move on only to a strictly
+          # newer main head. It never re-dispatches its own source head, so a
+          # chain makes progress one head at a time instead of fanning out.
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$RECONCILIATION_SOURCE" == "$main_commit" ]]; then
+            echo "reconciliation for $main_commit already dispatched by this run"
+            exit 0
+          fi
+          if [[ "$EVENT_NAME" == workflow_dispatch && -n "$RECONCILIATION_SOURCE" ]] && ! git merge-base --is-ancestor "$RECONCILIATION_SOURCE" "$main_commit"; then
+            echo "reconciliation target is not newer than its source" >&2
+            exit 1
+          fi
+
+          version=""
+          while IFS=$'\t' read -r tag tag_object; do
+            tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.object.sha')"
+            if [[ "$tag_commit" == "$main_commit" ]]; then
+              version="${tag#refs/tags/}"
+              break
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" | jq -r '
+            .[] | select(.ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) |
+            select(.object.type == "tag") | [.ref, .object.sha] | @tsv
+          ')
+
+          active="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&per_page=100" | jq -r --arg commit "$main_commit" '
+            any(.workflow_runs[]?; .head_sha == $commit and (.status == "queued" or .status == "in_progress"))
+          ')"
+          [[ "$active" == true ]] && exit 0
+
+          # An allocated tag alone is not completion: the job creates it
+          # before publishing every immutable and moving artifact. Re-dispatch
+          # the same source/patch path until its exact image, SHA image,
+          # latest-or-newer pointer, and GitHub Release all converge.
+          complete=false
+          if [[ -n "$version" ]]; then
+            exact_digest="$(docker buildx imagetools inspect "$IMAGE:$version" --format '{{.Digest}}' 2>/dev/null || true)"
+            sha_digest="$(docker buildx imagetools inspect "$IMAGE:sha-${main_commit:0:12}" --format '{{.Digest}}' 2>/dev/null || true)"
+            latest_digest="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Digest}}' 2>/dev/null || true)"
+            latest_at_or_past=false
+            if [[ "$latest_digest" == "$exact_digest" && "$exact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              latest_at_or_past=true
+            else
+              while IFS=$'\t' read -r candidate _; do
+                candidate="${candidate#refs/tags/}"
+                [[ "$(printf '%s\n%s\n' "$version" "$candidate" | sort -V | tail -n1)" == "$candidate" ]] || continue
+                candidate_digest="$(docker buildx imagetools inspect "$IMAGE:$candidate" --format '{{.Digest}}' 2>/dev/null || true)"
+                [[ "$candidate_digest" == "$latest_digest" && "$latest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] && { latest_at_or_past=true; break; }
+              done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" | jq -r '
+                .[] | select(.ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) |
+                select(.object.type == "tag") | [.ref, .object.sha] | @tsv
+              ')
+            fi
+            if [[ "$exact_digest" =~ ^sha256:[0-9a-f]{64}$ && "$sha_digest" == "$exact_digest" && "$latest_at_or_past" == true ]] && gh api "repos/$GITHUB_REPOSITORY/releases/tags/$version" >/dev/null 2>&1; then
+              complete=true
+            fi
+          fi
+          [[ "$complete" == true ]] && exit 0
+
+          # The duplicate-dispatch race is harmless: the dispatched run
+          # reuses an existing exact source/patch allocation if one appears.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/dispatches" \
+            -f ref=main \
+            -f 'inputs[bump]=patch' \
+            -f "inputs[expected_revision]=$main_commit" \
+            -f "inputs[reconciliation_source]=$main_commit" \
+            -f "inputs[dispatch_token]=reconcile-${main_commit:0:12}"
 
       - name: Create or repair GitHub Release
         shell: bash
@@ -294,16 +459,19 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           MAIN_RELEASE: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
           SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+          SHA_PUBLISHED: ${{ steps.channels.outputs.sha_published }}
+          LATEST_PUBLISHED: ${{ steps.channels.outputs.latest_published }}
+          MINOR_DIGEST: ${{ steps.channels.outputs.minor_digest }}
+          MAJOR_DIGEST: ${{ steps.channels.outputs.major_digest }}
           CREATED: ${{ steps.buildmeta.outputs.created }}
         run: |
           set -euo pipefail
           tag_commit="$(git rev-parse "$VERSION^{}")"
           [[ "$tag_commit" == "$COMMIT" ]] || { echo "release tag $VERSION peels to a different commit" >&2; exit 1; }
           release_image_refs() {
-            printf '%s\n' "- $IMAGE:$VERSION" "- $IMAGE:${VERSION%.*}" "- $IMAGE:${VERSION%%.*}"
-            if [[ "$MAIN_RELEASE" == true ]]; then
-              printf '%s\n' "- $IMAGE:latest" "- $IMAGE:sha-$SHORT_SHA"
-            fi
+            printf '%s\n' "- $IMAGE:$VERSION@$DIGEST" "- $IMAGE:${VERSION%.*}@$MINOR_DIGEST" "- $IMAGE:${VERSION%%.*}@$MAJOR_DIGEST"
+            if [[ "$SHA_PUBLISHED" == true ]]; then printf '%s\n' "- $IMAGE:sha-$SHORT_SHA"; fi
+            if [[ "$LATEST_PUBLISHED" == true ]]; then printf '%s\n' "- $IMAGE:latest@$DIGEST"; fi
           }
           generated_release_block() {
             cat <<EOF

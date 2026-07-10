@@ -161,12 +161,19 @@ dashboard as UID/GID `10001`. It does not change `/ssh` or `/kube`; SSH private
 keys should be owned by UID `10001` with mode `0600`, and kubeconfigs should be
 owner- or group-readable by UID/GID `10001`.
 
-Pushes to `main` run tests and publish the container image to GitHub Container
-Registry as `ghcr.io/spi3/gitops-dashboard:latest` and `sha-<short-sha>`.
-Pushing a `vMAJOR.MINOR.PATCH` tag publishes `vMAJOR.MINOR.PATCH`,
-`vMAJOR.MINOR`, and `vMAJOR` tags from the same image digest. The versioning
-policy for release tags, immutable image pins, and service version inventory is
-documented in [docs/versioning.md](docs/versioning.md).
+Every accepted push to `main` runs tests, but GitHub's bounded release queue
+keeps one running and one pending job, replacing intermediate pending jobs
+during a burst. Each executed release job publishes its immutable SemVer image
+and `sha-<short-sha>`; the final executed current-main job converges `latest`,
+`vMAJOR.MINOR`, and `vMAJOR`. `latest` is the newest successfully released
+main commit: a delayed run restores a captured pointer, advances to an already
+released newer digest, or temporarily leaves its successful digest until the
+newer release converges it. CI never deletes registry content; channels use
+the highest compatible exact release. Use exact tags plus digests for
+deployments, not moving channels.
+Manual `major`/`minor` releases use `scripts/release.sh`; skip markers are
+prohibited because they bypass the observable queue/admission path. The
+operator and recovery model is in [docs/versioning.md](docs/versioning.md).
 
 The agent connects outbound to `/api/agents/connect` over WebSocket and sends an
 `X-Agent-Token` value. Tokens are sent only by header and are authorized against

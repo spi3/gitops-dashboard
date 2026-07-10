@@ -1,214 +1,134 @@
-# Versioning Process
+# Continuous Versioning
 
-## Purpose
+GitOps Dashboard accepts every push to `main`, but it does not promise an
+executed release job for every accepted revision. GitHub Actions serializes the
+release group with one running and one pending job; a newer push replaces the
+pending job. The pipeline produces immutable images and GitHub Releases;
+downstream GitOps decides when and whether to deploy them.
 
-This document defines how GitOps Dashboard versions its own container image and
-how it should track versions of the services it discovers. The process keeps
-GitHub Actions responsible for repeatable build metadata and image publication,
-while keeping GitOps deployment repositories responsible for choosing which
-version is deployed.
+If a delayed release observes that `origin/main` advanced beyond its checkout,
+CI reconciles the displaced current head through the existing test-gated
+`workflow_dispatch` release path. It waits for no queued/in-progress run for
+that head, then dispatches one patch repair unless convergence is already
+complete: the exact image and commit SHA image exist, `latest` points at that
+release or a later one, and its GitHub Release exists. An allocated strict
+SemVer tag alone never marks the head complete, because it is pushed before
+all artifacts publish. The release job has `actions: write` only so this repair
+can re-enter the workflow's normal test-gated front door.
 
-## Version Types
+A reconciliation-marked run may observe a strictly newer `main` head and
+dispatch that newer head once. Thus reconciliation is an intentional bounded
+per-head chain, not a blanket recursion: every link targets a descendant of
+its source, no run re-dispatches its source head, and same-source/patch reuse
+makes a repeated repair idempotent. Intermediate releases may still be
+coalesced by the bounded queue, but the final current `main` head is
+reintroduced and converges the release channels and `latest`.
 
-- Source revision: the Git commit SHA that produced a build or service scan.
-- Product release version: a SemVer tag in the form `vMAJOR.MINOR.PATCH`.
-- Container image version: the GHCR image tag and immutable digest produced by
-  CI.
-- Desired service version: the image references declared in scanned Compose and
-  Kubernetes manifests.
-- Observed service version: the image reference, image ID, or digest reported by
-  a live Docker or Kubernetes target.
+## Versions and image tags
 
-The source revision and image digest are the immutable identifiers. Human
-readable tags are convenience handles for operators and automation.
+Product releases use strict SemVer with a `v` prefix: `vMAJOR.MINOR.PATCH`.
+After tests pass, each executed `main` or manual-dispatch release job
+serializes allocation and publishes one multi-platform digest under the
+immutable exact tag, `sha-<short-sha>`, `vMAJOR.MINOR`, and `vMAJOR`. `latest`
+is published only when the job's commit remains `origin/main` through its
+registry write; the commit-specific SHA tag is published even for a stale
+queued job.
 
-## Tag Policy
+Exact release tags and their image tags are immutable. Never delete, recreate,
+or retarget them. `sha-*` is also commit-specific. The channels and `latest`
+are convenience pointers, not deployment pins; deployments should use an exact
+SemVer tag with its digest, or the digest alone.
 
-GitHub Actions should publish these tags:
+CI recomputes every channel from all strict exact release tags and points it at
+the highest compatible release digest. Thus a delayed release cannot move
+`v1.4` back from `v1.4.3` to `v1.4.2`, and `v1` resolves to the highest
+release in major line 1. `latest` is the newest successfully released `main`
+commit. A delayed main run cannot move it backward: it rechecks `origin/main`
+after publication and restores the prior pointer if main advanced during the
+write. If no prior pointer is readable, CI advances `latest` to the advanced
+main commit only when that commit already has an immutable release digest.
+Otherwise it leaves `latest` at the just-published newest successful release;
+the displaced-run reconciliation above restores a release path for the
+advancing current-main commit and converges it forward when that release
+completes. This brief state is semantically correct: a commit that never
+releases successfully must not receive `latest`. CI never deletes registry
+content. After a burst, the final executed current-main job converges `latest`;
+its highest exact releases converge major/minor channels.
 
-| Trigger | Tags | Purpose |
-| --- | --- | --- |
-| Pull request | None | Validate the code and image build without publishing. |
-| Push to `main` | `latest`, `sha-<short-sha>` | Provide a fast-moving integration image and an immutable commit image. |
-| Push tag `vMAJOR.MINOR.PATCH` | `vMAJOR.MINOR.PATCH`, `vMAJOR.MINOR`, `vMAJOR` | Publish a stable release line for GitOps deployment updates. |
+## Automatic patch releases and bootstrap
 
-Rules:
+Every `main` push is an automatic patch-release event, subject to the bounded
+queue above: an intermediate pending job may be replaced before execution and
+therefore has no release artifact. Do not add CI skip markers such as `[skip
+ci]`, `[ci skip]`, or equivalents. They bypass the test/release admission path
+without the queue's explicit, observable replacement behavior and make it
+unclear whether a revision was deliberately coalesced or silently skipped.
 
-- Release tags are immutable. Never delete and recreate a release tag after it
-  has published an image.
-- GitOps deployments should pin either an image digest or a SemVer tag plus
-  digest. They should not pin `latest`.
-- `latest` is only an integration channel for local testing and compatibility
-  with the current workflow.
-- `sha-<short-sha>` is the best tag for reproducing a specific `main` build.
-- Major and minor moving tags are convenience release channels. The exact image
-  digest in the release notes remains the audit target.
+If no strict SemVer release tag exists, the allocator starts at `v0.0.1`. If an
+operator first creates a manual major release, automatic pushes continue
+patching that selected line. Non-strict tags are ignored. Re-running a release
+for the same commit reuses its exact tag only when it already points at that
+commit; a conflict fails closed.
 
-## CI Responsibilities
+## Manual major and minor releases
 
-### Pull Requests
+Only major and minor bumps are operator initiated. From a clean checkout at
+the current `main` revision:
 
-PR CI should:
-
-- Run the full project check target.
-- Build the container image without pushing it.
-- Verify the image can report its build metadata.
-- Fail if version metadata is missing or malformed.
-
-PRs must not publish packages. This keeps unreviewed code out of GHCR and makes
-the package registry reflect accepted repository state only.
-
-### Main Branch
-
-Pushes to `main` should:
-
-- Run the same checks as PR CI.
-- Publish the image to `ghcr.io/spi3/gitops-dashboard`.
-- Tag the image as `latest` and `sha-<short-sha>`.
-- Add OCI labels for source repository, commit revision, build timestamp, and
-  version.
-- Emit the pushed image digest in the workflow summary.
-
-The current workflow already publishes `latest` and short SHA tags from `main`.
-The next improvement is to make the metadata visible from the running binary.
-
-### Release Tags
-
-Pushing a SemVer tag such as `v1.4.2` should:
-
-- Confirm the tag points at a commit reachable from `main`.
-- Run the full project checks.
-- Build and publish the image once.
-- Publish SemVer tags from the same digest:
-  - `v1.4.2`
-  - `v1.4`
-  - `v1`
-- Create or update a GitHub Release with the image digest, commit SHA, and
-  upgrade notes.
-
-Release CI should not mutate deployment repositories directly. Downstream
-GitOps repositories should consume the new version through Renovate or a
-reviewed pull request.
-
-## Build Metadata
-
-The binary and image should expose the same build metadata:
-
-- Version: SemVer tag for release builds, otherwise a development version based
-  on the commit SHA.
-- Commit SHA.
-- Build timestamp.
-- Image digest when available after publication.
-
-Recommended surfaces:
-
-- `gitops-dashboard -version`
-- `GET /api/version`
-- Dashboard footer and per-service image version detail.
-- OCI labels on the container image.
-- GitHub Actions workflow summary.
-
-This metadata lets an operator compare what is deployed, what was built, and
-what Git commit produced it without inspecting the registry manually.
-
-## Service Version Inventory
-
-For discovered services, the dashboard should treat Git as the source of the
-desired version and runtime targets as the source of the observed version.
-
-Desired service version should come from scanned manifests:
-
-- Compose `services[].image`
-- Kubernetes workload container and init-container images
-- The scan commit SHA and source path that declared the image
-
-The scanner should normalize each image reference into:
-
-- Registry
-- Repository
-- Tag, when present
-- Digest, when present
-- Original image string
-
-Observed service version should come from live targets:
-
-- Docker image reference, image ID, and repo digest when available.
-- Kubernetes container image, container image ID, and pod status image ID when
-  available.
-
-Image observations should come only from live runtime objects. Docker excludes
-stopped containers. Kubernetes excludes deleting Pods and terminal
-`Succeeded`/`Failed` Pods; it includes `Running` Pods and `Pending` Pods only
-when Pod status already reports container image metadata.
-
-The dashboard can then show:
-
-- Desired version from Git.
-- Observed version from the runtime.
-- Whether desired and observed appear to match.
-- Whether the service is using a mutable tag such as `latest`.
-- The source commit that last declared the desired version.
-
-Mutable or unpinned service image references should be warnings, not hard
-failures. The dashboard is read-only and should surface the risk without
-blocking scans.
-
-Digest-pinned references are immutable. Full SemVer tags such as `v1.2.3` are
-treated as immutable release references, while partial SemVer channel tags such
-as `v1` and `v1.2`, empty tags, `latest`, and unknown non-SemVer tag schemes
-are treated as mutable because they can move without a manifest change.
-
-## GitOps Update Flow
-
-The release workflow publishes images; it does not deploy them.
-
-The deployment update flow should be:
-
-1. GitHub Actions publishes a release image and digest.
-2. Renovate or a human opens a pull request in the GitOps deployment repo.
-3. The pull request updates image tags or digests in Compose or Kubernetes
-   manifests.
-4. CI in the deployment repo validates the manifest change.
-5. The GitOps controller or deployment process applies the merged change.
-6. GitOps Dashboard scans the repository and reports the new desired version.
-7. Runtime monitoring reports the observed version after rollout.
-
-This keeps the product build pipeline separate from environment rollout policy.
-
-## Rollback And Hotfixes
-
-Rollbacks should be GitOps changes, not registry mutation:
-
-- Revert the deployment repository to a previously known good tag or digest.
-- Keep the bad release tag in GHCR for auditability.
-- Publish a new patch release for fixes, for example `v1.4.3` after `v1.4.2`.
-
-Hotfixes should branch from the relevant release commit when needed, publish a
-new patch tag, then merge the fix back to `main`.
-
-## Implementation Sketch
-
-The existing workflow can evolve into three jobs:
-
-- `test`: run `make check`.
-- `build`: build the image on PRs without pushing.
-- `publish`: push GHCR tags on `main` and `v*` tag events.
-
-The metadata action tag configuration should include the existing `latest` and
-short SHA tags for `main`, plus SemVer tags for release events:
-
-```yaml
-tags: |
-  type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-  type=sha,format=short
-  type=semver,pattern=v{{version}}
-  type=semver,pattern=v{{major}}.{{minor}}
-  type=semver,pattern=v{{major}}
+```sh
+scripts/release.sh minor
+scripts/release.sh major
 ```
 
-The `v` prefix is intentional because the metadata action's SemVer variables
-are the numeric version components.
+The normal path verifies successful `main` CI, verifies `HEAD == origin/main`,
+and dispatches the serialized CI release job. It needs `gh` authenticated to
+GitHub with repository access and an SSH-capable Git remote for fetching.
 
-When release deployment policy is mature, the project can decide whether
-`latest` should continue following `main` or move to the latest stable release.
-Until then, production GitOps pins should avoid `latest`.
+`--local-fallback` is only for an unavailable CI dispatcher:
+
+```sh
+scripts/release.sh --local-fallback --burn-version minor
+```
+
+It is deliberately SSH-GitHub-only and requires `--burn-version`, because it
+may irreversibly consume an exact version before CI publishes its image. It
+uses a remote allocator lock and a create-only tag push; it never retargets an
+existing version. Prefer the normal CI path.
+
+## Recovery and GitHub Releases
+
+Each exact release has a GitHub Release with digest, commit, timestamp, and
+image references. If publication or release-note repair fails after a tag
+exists, do not move or burn that tag: rerun CI for the same tag/commit so its
+immutable-image and release-repair checks reconcile it. If fallback burns a
+version without completing the release, preserve the tag, repair CI, and
+complete that exact release; the next allocation advances instead.
+
+Fallback removes its lock on success, error, and handled signals. After a hard
+process death, inspect `refs/releases/locks/version-allocator`, confirm no
+release job/operator is active, and record its remote OID. Only then may an
+operator with the SSH remote delete that exact stale lock with a lease:
+
+```sh
+git push --no-follow-tags \
+  --force-with-lease=refs/releases/locks/version-allocator=<observed-oid> \
+  origin :refs/releases/locks/version-allocator
+```
+
+If the OID changes or deletion cannot be verified, stop: another allocator owns
+the lock. Recommended GitHub policy is a `v*` tag ruleset that blocks deletion
+and force updates; configuring it is outside this repository.
+
+## Hotfixes and rollback
+
+Fixes merge through `main` and receive the next patch release. Do not tag a
+commit outside `main`: CI requires release commits to be ancestors of
+`origin/main`. For urgent rollback, change downstream GitOps to a known-good
+exact tag or digest; never retarget registry tags.
+
+## Service inventory
+
+The dashboard distinguishes source revision, product release, image digest,
+desired image reference, and observed runtime image. Full SemVer tags and
+digests are immutable; `latest`, `vMAJOR`, `vMAJOR.MINOR`, empty tags, and
+unknown schemes are mutable warnings. Inventory remains read-only.
