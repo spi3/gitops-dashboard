@@ -7,9 +7,29 @@ on:
       - main
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Release component to bump
+        required: true
+        type: choice
+        default: minor
+        options:
+          - major
+          - minor
+      dispatch_token:
+        description: Idempotency token supplied by cmd/release
+        required: false
+        type: string
+      expected_revision:
+        description: Main revision verified by cmd/release
+        required: false
+        type: string
 
 permissions:
   contents: read
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}', inputs.dispatch_token) || github.workflow }}
 
 jobs:
   test:
@@ -94,14 +114,20 @@ jobs:
           grep -F "${{ steps.buildmeta.outputs.commit }}" <<< "$output"
           grep -F "${{ steps.buildmeta.outputs.created }}" <<< "$output"
 
-  publish:
-    name: Publish Container
+  release:
+    name: Release Container
     needs: test
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: gitops-dashboard-release
+      # GitHub Actions supports one running and one pending run per group; a
+      # newer pending run replaces the older one. `queue: max` is not supported
+      # by Actions, so a durable unbounded queue requires an external broker.
+      cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -110,28 +136,68 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify release tag ancestry
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Select effective release version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BUMP: ${{ inputs.bump || 'patch' }}
+          EXPECTED_REVISION: ${{ inputs.expected_revision || '' }}
         run: |
-          git fetch origin main
+          set -euo pipefail
           commit="$(git rev-parse HEAD)"
-          git merge-base --is-ancestor "$commit" origin/main
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$commit" != "$EXPECTED_REVISION" ]]; then
+            echo 'dispatch revision does not match checked-out main revision' >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/* ]]; then
+            [[ "$REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'release tag is not strict SemVer' >&2; exit 1; }
+            git fetch origin main
+            git merge-base --is-ancestor "$commit" origin/main
+            version="$REF_NAME"
+          else
+            [[ "$BUMP" =~ ^(patch|minor|major)$ ]] || { echo 'unsupported release bump' >&2; exit 1; }
+            # The queue normally serializes writers; the compare-and-create
+            # push below remains the authority when a runner is retried.
+            for attempt in 1 2 3; do
+              git fetch --tags --force origin
+              tags="$({ git ls-remote --tags origin 'refs/tags/*' | awk '
+                { ref=$2; sub("refs/tags/", "", ref); peeled=(ref ~ /\^\{\}$/); sub(/\^\{\}$/, "", ref); if (peeled || !(ref in value)) value[ref]=$1 }
+                END { for (ref in value) print ref "\t" value[ref] }
+              '; } | sort)"
+              version="$(printf '%s' "$tags" | go run ./cmd/version-allocator --source "$commit" --bump "$BUMP")"
+              if git ls-remote --exit-code --tags origin "refs/tags/$version" >/dev/null 2>&1; then
+                remote_commit="$(git ls-remote --tags origin "refs/tags/$version^{}" | awk 'NR==1 {print $1}')"
+                [[ -n "$remote_commit" ]] || remote_commit="$(git ls-remote --tags origin "refs/tags/$version" | awk 'NR==1 {print $1}')"
+                [[ "$remote_commit" == "$commit" ]] || { echo "immutable release tag $version points at a different revision" >&2; exit 1; }
+                break
+              fi
+              git -c user.name='gitops-dashboard release' -c user.email='release@localhost' tag -a "$version" -m "Release $version" "$commit"
+              tag_oid="$(git rev-parse "refs/tags/$version")"
+              if git push --no-follow-tags --force-with-lease="refs/tags/$version:" origin "refs/tags/$version"; then
+                break
+              fi
+              remote_refs="$(git ls-remote --tags origin "refs/tags/$version" "refs/tags/$version^{}")"
+              remote_direct="$(awk -v ref="refs/tags/$version" '$2 == ref { print $1; exit }' <<< "$remote_refs")"
+              remote_peeled="$(awk -v ref="refs/tags/$version^{}" '$2 == ref { print $1; exit }' <<< "$remote_refs")"
+              if [[ "$remote_direct" == "$tag_oid" && "$remote_peeled" == "$commit" ]]; then
+                break
+              fi
+              git tag -d "$version"
+              [[ -n "$remote_direct" || -n "$remote_peeled" ]] && { echo "immutable release tag $version was allocated concurrently" >&2; exit 1; }
+              [[ "$attempt" == 3 ]] && { echo 'could not atomically allocate a release tag' >&2; exit 1; }
+            done
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${commit::12}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare build metadata
         id: buildmeta
         shell: bash
         run: |
-          created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          commit="$(git rev-parse HEAD)"
-          short_sha="${commit::12}"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="$GITHUB_REF_NAME"
-          else
-            version="dev-${short_sha}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
-          echo "created=${created}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
           echo "source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
@@ -147,51 +213,146 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          # Keep :latest controlled by the explicit main-only raw tag below;
-          # semver release tag pushes must not publish or overwrite :latest.
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern=v{{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern=v{{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern=v{{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-          labels: |
-            org.opencontainers.image.version=${{ steps.buildmeta.outputs.version }}
-            org.opencontainers.image.revision=${{ steps.buildmeta.outputs.commit }}
-            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
-            org.opencontainers.image.source=${{ steps.buildmeta.outputs.source }}
+      - name: Verify immutable exact image
+        id: existing
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.value }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # A full image index has no config itself. Verify every platform
+          # manifest's config labels before reusing an immutable exact tag.
+          headers="$(mktemp)"
+          trap 'rm -f "$headers"' EXIT
+          auth="$(curl --fail --silent --show-error -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" "https://ghcr.io/token?service=ghcr.io&scope=repository:${GITHUB_REPOSITORY}:pull")"
+          token="$(jq -er '.token // .access_token' <<< "$auth")"
+          status="$(curl --silent --show-error -D "$headers" -o /tmp/release-index.json -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/$VERSION")"
+          if [[ "$status" == 404 ]]; then echo 'reuse=false' >> "$GITHUB_OUTPUT"; exit 0; fi
+          [[ "$status" == 200 ]] || { echo "cannot inspect immutable image: HTTP $status" >&2; exit 1; }
+          digest="$(awk 'tolower($1) == "docker-content-digest:" {print $2}' "$headers" | tr -d '\r' | tail -1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'immutable image response has no digest' >&2; exit 1; }
+          for architecture in amd64 arm64; do
+            count="$(jq --arg architecture "$architecture" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture)] | length' /tmp/release-index.json)"
+            [[ "$count" == 1 ]] || { echo "immutable image must have exactly one linux/$architecture descriptor" >&2; exit 1; }
+          done
+          jq -er '.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .digest' /tmp/release-index.json | while read -r manifest; do
+            curl --fail --silent --show-error -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' "https://ghcr.io/v2/${GITHUB_REPOSITORY}/manifests/$manifest" -o /tmp/release-manifest.json
+            config="$(jq -er '.config.digest' /tmp/release-manifest.json)"
+            curl --fail --silent --show-error -H "Authorization: Bearer $token" "https://ghcr.io/v2/${GITHUB_REPOSITORY}/blobs/$config" -o /tmp/release-config.json
+            jq -e --arg version "$VERSION" --arg commit "$COMMIT" '.config.Labels["org.opencontainers.image.version"] == $version and .config.Labels["org.opencontainers.image.revision"] == $commit' /tmp/release-config.json >/dev/null || { echo "immutable image $VERSION has different version or revision metadata" >&2; exit 1; }
+          done
+          echo 'reuse=true' >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish image
+      - name: Build and publish immutable exact image
         id: push
+        if: steps.existing.outputs.reuse != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.value }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.revision=${{ steps.version.outputs.commit }}
+            org.opencontainers.image.created=${{ steps.buildmeta.outputs.created }}
+            org.opencontainers.image.source=${{ steps.buildmeta.outputs.source }}
           build-args: |
-            VERSION=${{ steps.buildmeta.outputs.version }}
-            COMMIT=${{ steps.buildmeta.outputs.commit }}
+            VERSION=${{ steps.version.outputs.value }}
+            COMMIT=${{ steps.version.outputs.commit }}
             BUILD_DATE=${{ steps.buildmeta.outputs.created }}
             SOURCE=${{ steps.buildmeta.outputs.source }}
+
+      - name: Publish moving image channels
+        id: channels
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.value }}
+          EXACT_DIGEST: ${{ steps.push.outputs.digest || steps.existing.outputs.digest }}
+          MAIN_RELEASE: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          major="v${BASH_REMATCH[1]}"; minor="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          tags=(-t "$IMAGE:$minor" -t "$IMAGE:$major")
+          if [[ "$MAIN_RELEASE" == true ]]; then tags+=(-t "$IMAGE:latest" -t "$IMAGE:sha-$SHORT_SHA"); fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE@$EXACT_DIGEST"
+          echo "digest=$EXACT_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Create or repair GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+          DIGEST: ${{ steps.channels.outputs.digest }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          MAIN_RELEASE: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
+          SHORT_SHA: ${{ steps.version.outputs.short_sha }}
+          CREATED: ${{ steps.buildmeta.outputs.created }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "$VERSION^{}")"
+          [[ "$tag_commit" == "$COMMIT" ]] || { echo "release tag $VERSION peels to a different commit" >&2; exit 1; }
+          release_image_refs() {
+            printf '%s\n' "- $IMAGE:$VERSION" "- $IMAGE:${VERSION%.*}" "- $IMAGE:${VERSION%%.*}"
+            if [[ "$MAIN_RELEASE" == true ]]; then
+              printf '%s\n' "- $IMAGE:latest" "- $IMAGE:sha-$SHORT_SHA"
+            fi
+          }
+          generated_release_block() {
+            cat <<EOF
+          <!-- gitops-dashboard-release:start -->
+          Digest: $DIGEST
+          Commit: $COMMIT
+          Timestamp: $CREATED
+          Image refs:
+          $(release_image_refs)
+          <!-- gitops-dashboard-release:end -->
+          EOF
+          }
+          generated="$(generated_release_block)"
+          # generated-release-block validation start
+          valid_generated_release_block() {
+            local block="$1"
+            grep -Fxq '<!-- gitops-dashboard-release:start -->' <<< "$block" &&
+              grep -Fxq '<!-- gitops-dashboard-release:end -->' <<< "$block" &&
+              grep -Fxq "Digest: $DIGEST" <<< "$block" &&
+              grep -Fxq "Commit: $COMMIT" <<< "$block" &&
+              grep -Eq '^Timestamp: .+$' <<< "$block" &&
+              grep -Fxq 'Image refs:' <<< "$block" &&
+              while IFS= read -r ref; do grep -Fxq -- "$ref" <<< "$block" || return 1; done < <(release_image_refs)
+          }
+          release_needs_repair() {
+            local body="$1" block
+            block="$(sed -n '/<!-- gitops-dashboard-release:start -->/,/<!-- gitops-dashboard-release:end -->/p' <<< "$body")"
+            ! valid_generated_release_block "$block"
+          }
+          # generated-release-block validation end
+          if existing="$(gh release view "$VERSION" --json body 2>/dev/null)"; then
+            body="$(jq -r '.body // ""' <<< "$existing")"
+            if ! release_needs_repair "$body"; then
+              exit 0
+            fi
+            # Only append a missing generated block; never replace operator notes
+            # or the release's original timestamp.
+            gh release edit "$VERSION" --notes "$body
+
+            $generated"
+          else
+            gh release create "$VERSION" --target "$COMMIT" --title "$VERSION" --notes "$generated"
+          fi
 
       - name: Write image summary
         run: |
           {
-            echo "## Published image"
-            echo "- Image: ghcr.io/${{ github.repository }}"
-            echo "- Tags:"
-            printf '%s\n' "${{ steps.meta.outputs.tags }}" | sed 's/^/  - /'
-            echo "- Digest: ${{ steps.push.outputs.digest }}"
-            echo "- Version: ${{ steps.buildmeta.outputs.version }}"
-            echo "- Commit: ${{ steps.buildmeta.outputs.commit }}"
-            echo "- Build timestamp: ${{ steps.buildmeta.outputs.created }}"
+            echo "## Published release image"
+            echo "- Version: ${{ steps.version.outputs.value }}"
+            echo "- Digest: ${{ steps.channels.outputs.digest }}"
+            echo "- Commit: ${{ steps.version.outputs.commit }}"
           } >> "$GITHUB_STEP_SUMMARY"

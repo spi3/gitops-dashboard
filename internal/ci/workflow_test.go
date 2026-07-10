@@ -3,6 +3,7 @@ package ci
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -12,31 +13,98 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestPublishWorkflowDoesNotAutoTagLatestOnReleaseTags(t *testing.T) {
+func TestReleaseWorkflowTriggersAndSerialization(t *testing.T) {
 	t.Parallel()
-	workflow := readWorkflow(t)
-	if !strings.Contains(workflow, "flavor: |\n            latest=false") {
-		t.Fatal("publish metadata action must disable automatic latest tags")
+	root := workflowNode(t, readWorkflow(t))
+	dispatch := mappingValue(mappingValue(root, "on", nil, 0), "workflow_dispatch", nil, 0)
+	if mappingValue(mappingValue(dispatch, "inputs", nil, 0), "bump", nil, 0) == nil || mappingValue(mappingValue(dispatch, "inputs", nil, 0), "expected_revision", nil, 0) == nil {
+		t.Fatal("workflow_dispatch inputs are incomplete")
 	}
-	if !strings.Contains(workflow, "type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}") {
-		t.Fatal("publish workflow must keep the explicit latest tag gated to main")
+	release := mappingValue(mappingValue(root, "jobs", nil, 0), "release", nil, 0)
+	if scalarValue(release, "needs") != "test" || !strings.Contains(scalarValue(release, "if"), "workflow_dispatch") || !strings.Contains(scalarValue(release, "if"), "github.ref == 'refs/heads/main'") {
+		t.Fatal("release admission is not main-only and test-gated")
+	}
+	concurrency := mappingValue(release, "concurrency", nil, 0)
+	if scalarValue(concurrency, "group") != "gitops-dashboard-release" || scalarValue(concurrency, "queue") != "" || scalarValue(concurrency, "cancel-in-progress") != "false" {
+		t.Fatal("release concurrency must use the supported non-cancelling form")
+	}
+	permissions := mappingValue(release, "permissions", nil, 0)
+	if scalarValue(permissions, "contents") != "write" || scalarValue(permissions, "packages") != "write" {
+		t.Fatal("release permissions are not scoped")
 	}
 }
 
-func TestPublishWorkflowUsesCheckedOutCommitForReleaseMetadata(t *testing.T) {
+func TestEmptyRemoteTagFixtureAllocatesFirstPatch(t *testing.T) {
+	remote := filepath.Join(t.TempDir(), "empty.git")
+	if out, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("create empty remote: %v: %s", err, out)
+	}
+	out, err := exec.Command("git", "ls-remote", "--tags", remote, "refs/tags/*").Output()
+	if err != nil || len(out) != 0 {
+		t.Fatalf("empty remote tags = %q, %v", out, err)
+	}
+	got, err := AllocateVersion(nil, "source", BumpPatch)
+	if err != nil || got != "v0.0.1" {
+		t.Fatalf("first allocation = %q, %v", got, err)
+	}
+}
+
+func TestCheckedInWorkflowProvidesDispatchReleaseCapability(t *testing.T) {
 	t.Parallel()
-	workflow := readWorkflow(t)
-	publishJob := workflowSection(t, workflow, "  publish:")
+	ok, err := WorkflowSupportsReleaseDispatch([]byte(readWorkflow(t)))
+	if err != nil {
+		t.Fatalf("inspect checked-in workflow capability: %v", err)
+	}
+	if !ok {
+		t.Fatal("cmd/release must dispatch only to a workflow that allocates and publishes a release")
+	}
+}
+
+func TestReleaseWorkflowAllocatesAndPublishesAllMainTags(t *testing.T) {
+	t.Parallel()
+	release := mappingValue(mappingValue(workflowNode(t, readWorkflow(t)), "jobs", nil, 0), "release", nil, 0)
+	encoded, err := yaml.Marshal(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseJob := string(encoded)
+	// Step names and fields are parsed as YAML above; run snippets below are
+	// executable behavior, not comments or broad document substrings.
+	versionStep := namedStepNode(mappingValue(release, "steps", nil, 0), "Select effective release version")
+	channelsStep := namedStepNode(mappingValue(release, "steps", nil, 0), "Publish moving image channels")
+	releaseStep := namedStepNode(mappingValue(release, "steps", nil, 0), "Create or repair GitHub Release")
+	releaseJob += "\n" + scalarValue(versionStep, "run") + "\n" + scalarValue(channelsStep, "run") + "\n" + scalarValue(releaseStep, "run")
 	for _, want := range []string{
 		`commit="$(git rev-parse HEAD)"`,
-		`short_sha="${commit::12}"`,
-		`echo "commit=${commit}" >> "$GITHUB_OUTPUT"`,
+		`echo "short_sha=${commit::12}" >> "$GITHUB_OUTPUT"`,
 		`git merge-base --is-ancestor "$commit" origin/main`,
-		`COMMIT=${{ steps.buildmeta.outputs.commit }}`,
-		`org.opencontainers.image.revision=${{ steps.buildmeta.outputs.commit }}`,
+		`go run ./cmd/version-allocator --source "$commit" --bump "$BUMP"`,
+		`--force-with-lease="refs/tags/$version:"`,
+		`linux/amd64,linux/arm64`,
+		`-t "$IMAGE:latest"`,
+		`-t "$IMAGE:sha-$SHORT_SHA"`,
+		`-t "$IMAGE:$minor"`,
+		`-t "$IMAGE:$major"`,
 	} {
-		if !strings.Contains(publishJob, want) {
-			t.Fatalf("publish workflow missing checked-out commit metadata wiring %q", want)
+		if !strings.Contains(releaseJob, want) {
+			t.Fatalf("release workflow missing %q", want)
+		}
+	}
+	if !strings.Contains(releaseJob, `printf '%s' "$tags"`) || strings.Contains(releaseJob, `printf '%s\n' "$tags"`) {
+		t.Fatal("empty remote tag output must remain empty for bootstrap allocation")
+	}
+	if !strings.Contains(releaseJob, `tolower($1) == "docker-content-digest:"`) {
+		t.Fatal("immutable image digest header matching must be awk-portable")
+	}
+	if strings.Contains(releaseJob, "IGNORECASE") || strings.Contains(releaseJob, "targetCommitish") || !strings.Contains(releaseJob, "gitops-dashboard-release:start") {
+		t.Fatal("release repair must use delimited metadata and peeled-tag authority")
+	}
+	if !strings.Contains(releaseJob, `if [[ "$MAIN_RELEASE" == true ]]; then tags+=(-t "$IMAGE:latest" -t "$IMAGE:sha-$SHORT_SHA"); fi`) {
+		t.Fatal("latest and sha tags must stay main-only")
+	}
+	for _, want := range []string{"Verify immutable exact image", "immutable image $VERSION has different version or revision metadata", "reuse=true", "Create or repair GitHub Release"} {
+		if !strings.Contains(releaseJob, want) {
+			t.Fatalf("release workflow lacks immutable exact-tag behavior %q", want)
 		}
 	}
 	for _, disallowed := range []string{
@@ -44,10 +112,70 @@ func TestPublishWorkflowUsesCheckedOutCommitForReleaseMetadata(t *testing.T) {
 		`echo "commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"`,
 		`git merge-base --is-ancestor "$GITHUB_SHA" origin/main`,
 	} {
-		if strings.Contains(publishJob, disallowed) {
-			t.Fatalf("publish workflow must not use raw GITHUB_SHA for release metadata: found %q", disallowed)
+		if strings.Contains(releaseJob, disallowed) {
+			t.Fatalf("release workflow must not use raw GITHUB_SHA for release metadata: found %q", disallowed)
 		}
 	}
+}
+
+func TestGeneratedReleaseBlockValidationRequiresExactFields(t *testing.T) {
+	release := mappingValue(mappingValue(workflowNode(t, readWorkflow(t)), "jobs", nil, 0), "release", nil, 0)
+	run := scalarValue(namedStepNode(mappingValue(release, "steps", nil, 0), "Create or repair GitHub Release"), "run")
+	const startMarker = "release_image_refs() {"
+	const endMarker = "# generated-release-block validation end"
+	start, end := strings.Index(run, startMarker), strings.Index(run, endMarker)
+	if start < 0 || end < start {
+		t.Fatal("release workflow lacks extractable generated-block helpers")
+	}
+	helpers := run[start:end]
+	runHelpers := func(script string, input string) error {
+		cmd := exec.Command("bash", "-ceu", helpers+"\n"+script)
+		cmd.Stdin = strings.NewReader(input)
+		cmd.Env = append(os.Environ(), "DIGEST=sha256:deadbeef", "COMMIT=0123456789abcdef", "IMAGE=ghcr.io/acme/repo", "VERSION=v1.2.3", "MAIN_RELEASE=true", "SHORT_SHA=0123456789ab", "CREATED=2026-07-10T00:00:00Z")
+		return cmd.Run()
+	}
+	if err := runHelpers("block=\"$(generated_release_block)\"\nvalid_generated_release_block \"$block\"", ""); err != nil {
+		t.Fatalf("block generated by production helper rejected: %v", err)
+	}
+	if err := runHelpers("body=\"operator note\n$(generated_release_block)\"\nappend=0\nif ! release_needs_repair \"$body\"; then :; else append=1; fi\n[[ \"$append\" == 0 ]]", ""); err != nil {
+		t.Fatalf("rerun would append to its own generated block: %v", err)
+	}
+	var output strings.Builder
+	cmd := exec.Command("bash", "-ceu", helpers+"\ngenerated_release_block")
+	cmd.Env = append(os.Environ(), "DIGEST=sha256:deadbeef", "COMMIT=0123456789abcdef", "IMAGE=ghcr.io/acme/repo", "VERSION=v1.2.3", "MAIN_RELEASE=true", "SHORT_SHA=0123456789ab", "CREATED=2026-07-10T00:00:00Z")
+	cmd.Stdout = &output
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("generate production block: %v", err)
+	}
+	block := strings.TrimSuffix(output.String(), "\n")
+	for _, field := range []string{
+		"<!-- gitops-dashboard-release:start -->", "Digest: sha256:deadbeef", "Commit: 0123456789abcdef", "Timestamp: 2026-07-10T00:00:00Z", "Image refs:",
+		"- ghcr.io/acme/repo:v1.2.3", "- ghcr.io/acme/repo:v1.2", "- ghcr.io/acme/repo:v1", "- ghcr.io/acme/repo:latest", "- ghcr.io/acme/repo:sha-0123456789ab", "<!-- gitops-dashboard-release:end -->",
+	} {
+		t.Run("missing "+field, func(t *testing.T) {
+			if err := runHelpers("block=\"$(cat)\"\nvalid_generated_release_block \"$block\"", strings.Replace(block, field, "", 1)); err == nil {
+				t.Fatalf("validator accepted missing field %q", field)
+			}
+		})
+		t.Run("corrupt "+field, func(t *testing.T) {
+			corrupt := field + "-corrupt"
+			if strings.HasPrefix(field, "Timestamp: ") {
+				corrupt = "Timestamp:"
+			}
+			if err := runHelpers("block=\"$(cat)\"\nvalid_generated_release_block \"$block\"", strings.Replace(block, field, corrupt, 1)); err == nil {
+				t.Fatalf("validator accepted corrupt field %q", field)
+			}
+		})
+	}
+}
+
+func workflowNode(t *testing.T, text string) *yaml.Node {
+	t.Helper()
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(text), &doc); err != nil {
+		t.Fatalf("parse workflow YAML: %v", err)
+	}
+	return doc.Content[0]
 }
 
 func TestUIStageBuildsOnNativeBuildPlatform(t *testing.T) {
@@ -300,7 +428,7 @@ func validateJobTimeouts(workflow string) error {
 	if jobs == nil || jobs.Kind != yaml.MappingNode {
 		return fmt.Errorf("workflow must define a jobs mapping")
 	}
-	for job, want := range map[string]int{"test": 15, "build": 45, "publish": 45} {
+	for job, want := range map[string]int{"test": 15, "build": 45, "release": 45} {
 		jobNode := mappingValue(jobs, job, map[*yaml.Node]bool{}, 0)
 		if jobNode == nil || jobNode.Kind != yaml.MappingNode {
 			return fmt.Errorf("workflow must define %s job", job)

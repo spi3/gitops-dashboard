@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	mathrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,13 +38,16 @@ type release struct {
 	git                               *git
 	api                               *github
 	lockHeld                          bool
+	releaseJobName                    string
 	// Test-only seams leave the production path unchanged (nil selects the
 	// concrete guards and signal context below).
-	localFallbackOK func(string) bool
-	signalContext   func() (context.Context, context.CancelFunc)
-	afterLock       func()
-	beforePush      func(string, localTagRef)
-	push            func(context.Context, string, localTagRef) error
+	localFallbackOK   func(string) bool
+	signalContext     func() (context.Context, context.CancelFunc)
+	afterLock         func()
+	beforePush        func(string, localTagRef)
+	push              func(context.Context, string, localTagRef) error
+	sleep             func(context.Context, time.Duration) error
+	observationBudget time.Duration
 }
 type localTagRef struct{ name, oid string }
 type configEntry struct {
@@ -177,12 +182,28 @@ type github struct {
 	client      *http.Client
 }
 
+type apiError struct {
+	path       string
+	statusCode int
+	status     string
+	retryAfter time.Duration
+}
+
+func (e *apiError) Error() string { return fmt.Sprintf("GitHub API %s: %s", e.path, e.status) }
+
 type workflowRun struct {
-	ID         int64     `json:"id"`
-	RunAttempt int       `json:"run_attempt"`
-	Status     string    `json:"status"`
-	Conclusion string    `json:"conclusion"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID           int64     `json:"id"`
+	RunAttempt   int       `json:"run_attempt"`
+	Status       string    `json:"status"`
+	Conclusion   string    `json:"conclusion"`
+	CreatedAt    time.Time `json:"created_at"`
+	DisplayTitle string    `json:"display_title"`
+}
+
+type workflowJob struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
 }
 
 func (a *github) request(ctx context.Context, method, path string, body, out any) error {
@@ -207,10 +228,25 @@ func (a *github) request(ctx context.Context, method, path string, body, out any
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
-		return fmt.Errorf("GitHub API %s: %s", path, res.Status)
+		e := &apiError{path: path, statusCode: res.StatusCode, status: res.Status}
+		// GitHub uses 403 for some rate-limit responses. Do not turn an
+		// ordinary permanent 4xx into a multi-hour retry merely because it
+		// includes the standard rate-limit headers.
+		if (res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusTooManyRequests) && strings.TrimSpace(res.Header.Get("X-RateLimit-Remaining")) == "0" {
+			if seconds, parseErr := strconv.Atoi(res.Header.Get("Retry-After")); parseErr == nil && seconds > 0 {
+				e.retryAfter = time.Duration(seconds) * time.Second
+			} else if reset, parseErr := strconv.ParseInt(res.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+				if until := time.Until(time.Unix(reset, 0)); until > 0 {
+					e.retryAfter = until
+				}
+			}
+		}
+		return e
 	}
 	if out != nil {
-		return json.NewDecoder(res.Body).Decode(out)
+		if err := json.NewDecoder(res.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
 	}
 	return nil
 }
@@ -249,7 +285,6 @@ func main() {
 	}
 	local := flag.Bool("local-fallback", false, "permit guarded local tag publication")
 	burn := flag.Bool("burn-version", false, "acknowledge fallback immutable version cost")
-	experimentalDispatch := flag.Bool("experimental-dispatch", false, "enable the unfinished release workflow dispatch integration")
 	flag.Parse()
 	if flag.NArg() != 1 || (flag.Arg(0) != "major" && flag.Arg(0) != "minor") {
 		fatal("usage: release [--local-fallback --burn-version] major|minor")
@@ -258,7 +293,7 @@ func main() {
 	if e != nil {
 		fatal("%v", e)
 	}
-	if e = r.run(ci.Bump(flag.Arg(0)), *local, *burn, *experimentalDispatch); e != nil {
+	if e = r.run(ci.Bump(flag.Arg(0)), *local, *burn); e != nil {
 		fatal("%v", e)
 	}
 }
@@ -473,16 +508,13 @@ func githubPath(p string) (string, error) {
 	return p, nil
 }
 
-func (r *release) run(b ci.Bump, local, burn, experimentalDispatch bool) error {
+func (r *release) run(b ci.Bump, local, burn bool) error {
 	contextFactory := releaseSignalContext
 	if r.signalContext != nil {
 		contextFactory = r.signalContext
 	}
 	ctx, stop := contextFactory()
 	defer stop()
-	if !experimentalDispatch && !local {
-		return errors.New("dispatch integration completes with the release workflow task")
-	}
 	allowLocal := localFallbackRemoteOK
 	if r.localFallbackOK != nil {
 		allowLocal = r.localFallbackOK
@@ -516,15 +548,16 @@ func (r *release) run(b ci.Bump, local, burn, experimentalDispatch bool) error {
 	if e = r.green(ctx); e != nil {
 		return e
 	}
-	if experimentalDispatch {
-		supported, e := r.dispatchSupported(ctx)
+	if !local {
+		jobName, supported, e := r.dispatchSupported(ctx)
 		if e != nil {
 			return e
 		}
 		if supported {
+			r.releaseJobName = jobName
 			return r.dispatch(ctx, b)
 		}
-		return errors.New("dispatch integration completes with the release workflow task")
+		return errors.New("remote CI workflow does not provide the required serialized release capability")
 	}
 	if !burn {
 		return errors.New("--local-fallback requires --burn-version to acknowledge immutable-version cost")
@@ -602,26 +635,26 @@ func (r *release) green(ctx context.Context) error {
 	}
 	return fmt.Errorf("CI is not green for HEAD: newest run %d status=%s conclusion=%s", newest.ID, newest.Status, newest.Conclusion)
 }
-func (r *release) dispatchSupported(ctx context.Context) (bool, error) {
+func (r *release) dispatchSupported(ctx context.Context) (string, bool, error) {
 	req, e := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/repos/"+r.repo+"/contents/.github/workflows/ci.yml?ref=main", nil)
 	if e != nil {
-		return false, e
+		return "", false, e
 	}
 	req.Header.Set("Authorization", "Bearer "+r.api.token)
 	req.Header.Set("Accept", "application/vnd.github.raw")
 	res, e := r.api.client.Do(req)
 	if e != nil {
-		return false, e
+		return "", false, e
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return false, fmt.Errorf("cannot fetch remote CI workflow capability: %s", res.Status)
+		return "", false, fmt.Errorf("cannot fetch remote CI workflow capability: %s", res.Status)
 	}
 	b, e := io.ReadAll(io.LimitReader(res.Body, 10<<20))
 	if e != nil {
-		return false, e
+		return "", false, e
 	}
-	return ci.WorkflowSupportsReleaseDispatch(b)
+	return ci.WorkflowReleaseJobName(b)
 }
 func dispatchToken() (string, error) {
 	b := make([]byte, 16)
@@ -635,44 +668,154 @@ func (r *release) dispatch(ctx context.Context, b ci.Bump) error {
 	if e != nil {
 		return e
 	}
-	if e = r.api.request(ctx, "POST", "/actions/workflows/ci.yml/dispatches", map[string]any{"ref": "main", "inputs": map[string]string{"bump": string(b), "dispatch_token": token}}, nil); e != nil {
-		return e
+	// This is an idempotency key, not a credential. Persist it in the operator
+	// transcript before POST so an ambiguous response can be recovered later.
+	if _, e = fmt.Fprintln(releaseStdout, "release dispatch token: "+token); e != nil {
+		return fmt.Errorf("cannot persist release dispatch token: %w", e)
 	}
-	return r.waitDispatch(token)
+	var accepted struct {
+		RunID       int64 `json:"workflow_run_id"`
+		WorkflowRun struct {
+			ID int64 `json:"id"`
+		} `json:"workflow_run"`
+	}
+	if e = r.api.request(ctx, "POST", "/actions/workflows/ci.yml/dispatches", map[string]any{"ref": "main", "inputs": map[string]string{"bump": string(b), "dispatch_token": token, "expected_revision": r.head}, "return_run_details": true}, &accepted); e != nil {
+		// A lost response may follow server-side acceptance; reconcile the exact
+		// token over the normal visibility window before reporting failure.
+		if permanentAPIError(e) {
+			return e
+		}
+	}
+	if accepted.RunID == 0 {
+		accepted.RunID = accepted.WorkflowRun.ID
+	}
+	return r.waitDispatch(ctx, token, accepted.RunID)
 }
-func (r *release) waitDispatch(token string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+
+const dispatchObservationBudget = 2*time.Hour + 15*time.Minute
+
+func (r *release) findDispatch(ctx context.Context, token string) (*workflowRun, error) {
+	var v struct {
+		WorkflowRuns []workflowRun `json:"workflow_runs"`
+	}
+	if err := r.api.request(ctx, "GET", "/actions/workflows/ci.yml/runs?event=workflow_dispatch", nil, &v); err != nil {
+		return nil, err
+	}
+	for _, run := range v.WorkflowRuns {
+		if strings.Contains(run.DisplayTitle, token) {
+			return &run, nil
+		}
+	}
+	return nil, nil
+}
+func (r *release) waitDispatch(parent context.Context, token string, runID int64) error {
+	budget := dispatchObservationBudget
+	if r.observationBudget > 0 {
+		budget = r.observationBudget
+	}
+	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
+	delay := 2 * time.Second
 	for {
-		var v struct {
-			WorkflowRuns []struct {
-				ID           int64  `json:"id"`
-				Status       string `json:"status"`
-				Conclusion   string `json:"conclusion"`
-				DisplayTitle string `json:"display_title"`
-			} `json:"workflow_runs"`
-		}
-		e := r.api.request(ctx, "GET", "/actions/workflows/ci.yml/runs?event=workflow_dispatch", nil, &v)
-		if e == nil {
-			for _, x := range v.WorkflowRuns {
-				if strings.Contains(x.DisplayTitle, token) {
-					if x.Status != "completed" {
-						break
-					}
-					if x.Conclusion == "success" {
-						return nil
-					}
-					return fmt.Errorf("release dispatch run %d concluded %s", x.ID, x.Conclusion)
+		var err error
+		if runID == 0 {
+			var found *workflowRun
+			found, err = r.findDispatch(ctx, token)
+			if found != nil {
+				runID = found.ID
+			}
+		} else {
+			var current workflowRun
+			err = r.api.request(ctx, "GET", fmt.Sprintf("/actions/runs/%d", runID), nil, &current)
+			if err == nil {
+				if current.Status != "completed" {
+					goto wait
 				}
+				if current.Conclusion == "success" {
+					return r.releaseJobSucceeded(ctx, current.ID)
+				}
+				return fmt.Errorf("release dispatch run %d concluded %s (%s)", current.ID, current.Conclusion, r.runURL(current.ID))
 			}
 		}
+		if err != nil && permanentAPIError(err) {
+			return err
+		}
+	wait:
 		if ctx.Err() != nil {
-			if e != nil {
-				return e
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("release dispatch run %s was not completed before timeout", r.runReference(runID, token))
 			}
-			return errors.New("release dispatch run was not completed before timeout")
+			return fmt.Errorf("release dispatch observation interrupted for %s: %w", r.runReference(runID, token), ctx.Err())
 		}
-		time.Sleep(500 * time.Millisecond)
+		wait := delay + time.Duration(mathrand.Int64N(int64(time.Second)))
+		var apiErr *apiError
+		if errors.As(err, &apiErr) && apiErr.retryAfter > wait {
+			wait = apiErr.retryAfter
+		}
+		if r.sleep != nil {
+			err = r.sleep(ctx, wait)
+		} else {
+			err = sleepContext(ctx, wait)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return fmt.Errorf("release dispatch run %s was not completed before timeout", r.runReference(runID, token))
+				}
+				return fmt.Errorf("release dispatch observation interrupted for %s: %w", r.runReference(runID, token), ctx.Err())
+			}
+			return err
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (r *release) runURL(runID int64) string {
+	return fmt.Sprintf("https://github.com/%s/actions/runs/%d", r.repo, runID)
+}
+
+func (r *release) runReference(runID int64, token string) string {
+	if runID != 0 {
+		return fmt.Sprintf("%d (%s)", runID, r.runURL(runID))
+	}
+	return "dispatch token " + token
+}
+
+func (r *release) releaseJobSucceeded(ctx context.Context, runID int64) error {
+	var jobs struct {
+		Jobs []workflowJob `json:"jobs"`
+	}
+	if err := r.api.request(ctx, "GET", fmt.Sprintf("/actions/runs/%d/jobs", runID), nil, &jobs); err != nil {
+		return fmt.Errorf("release dispatch run %d jobs: %w", runID, err)
+	}
+	for _, job := range jobs.Jobs {
+		if job.Name == r.releaseJobName {
+			if job.Status == "completed" && job.Conclusion == "success" {
+				return nil
+			}
+			return fmt.Errorf("release dispatch run %d %q job status=%s conclusion=%s (%s)", runID, r.releaseJobName, job.Status, job.Conclusion, r.runURL(runID))
+		}
+	}
+	return fmt.Errorf("release dispatch run %d has no %q job (%s)", runID, r.releaseJobName, r.runURL(runID))
+}
+
+func permanentAPIError(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.statusCode >= 400 && apiErr.statusCode < 500 && apiErr.statusCode != http.StatusTooManyRequests && apiErr.retryAfter == 0
+}
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 func (r *release) active(ctx context.Context) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -34,6 +36,38 @@ func TestGitHubRepo(t *testing.T) {
 		if (err == nil) != tt.ok || got != tt.want {
 			t.Errorf("githubRepo(%q) = %q, %v", tt.remote, got, err)
 		}
+	}
+}
+
+func TestGitHubRequestOnlyDefersExhaustedRateLimits(t *testing.T) {
+	future := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusUnprocessableEntity} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			a := &github{repo: "acme/repo", token: "test", client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				header := make(http.Header)
+				header.Set("X-RateLimit-Remaining", "42")
+				header.Set("X-RateLimit-Reset", future)
+				return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d test", status), Header: header, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+			})}}
+			err := a.request(context.Background(), "GET", "/fixture", nil, nil)
+			if !permanentAPIError(err) {
+				t.Fatalf("status %d error was not permanent: %v", status, err)
+			}
+		})
+	}
+}
+
+func TestGitHubRequestDefersOnlyExhaustedRateLimit(t *testing.T) {
+	a := &github{repo: "acme/repo", token: "test", client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("X-RateLimit-Remaining", "0")
+		header.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 test", Header: header, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+	})}}
+	err := a.request(context.Background(), "GET", "/fixture", nil, nil)
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.retryAfter <= 0 || permanentAPIError(err) {
+		t.Fatalf("exhausted rate limit = %v, retry=%v", err, apiErr.retryAfter)
 	}
 }
 
@@ -384,7 +418,7 @@ func TestGreenRequiresNewestMatchingRunToSucceed(t *testing.T) {
 
 func TestGreenPaginatesBeforeSelectingNewestRun(t *testing.T) {
 	requests := 0
-	r := &release{head: "head", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	r := &release{head: "head", releaseJobName: "Release Container", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requests++
 		body := `{"total_count":2,"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","created_at":"2026-01-01T00:00:00Z"}]}`
 		if strings.HasPrefix(req.URL.Path, "/repos/acme/repo/actions/runs/") {
@@ -401,7 +435,7 @@ func TestGreenPaginatesBeforeSelectingNewestRun(t *testing.T) {
 }
 
 func TestGreenRejectsDuplicatePaginationRows(t *testing.T) {
-	r := &release{head: "head", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	r := &release{head: "head", releaseJobName: "Release Container", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"total_count":2,"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","created_at":"2026-01-01T00:00:00Z"}]}`
 		if req.URL.Query().Get("page") == "2" {
 			body = `{"total_count":2,"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","created_at":"2026-01-01T00:00:00Z"}]}`
@@ -428,6 +462,305 @@ func TestGreenUsesRefetchedRerunState(t *testing.T) {
 		t.Fatalf("green = %v after %d requests, want refetched rerun to abort", err, requests)
 	}
 }
+
+func TestDispatchUsesReturnedRunAndRequiresReleaseJob(t *testing.T) {
+	var post map[string]any
+	r := &release{head: "head", releaseJobName: "Release Container", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := "{}"
+		switch {
+		case req.Method == http.MethodPost:
+			if err := json.NewDecoder(req.Body).Decode(&post); err != nil {
+				t.Fatal(err)
+			}
+			body = `{"workflow_run_id":42}`
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/42"):
+			body = `{"id":42,"status":"completed","conclusion":"success"}`
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/42/jobs"):
+			body = `{"jobs":[{"name":"Release Container","status":"completed","conclusion":"success"}]}`
+		default:
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+		return &http.Response{StatusCode: 200, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}}
+	old := releaseStdout
+	releaseStdout = io.Discard
+	t.Cleanup(func() { releaseStdout = old })
+	if err := r.dispatch(context.Background(), ci.BumpMinor); err != nil {
+		t.Fatal(err)
+	}
+	if post["return_run_details"] != true {
+		t.Fatalf("dispatch did not request returned run details: %#v", post)
+	}
+}
+
+func TestDispatchFailsBeforePostWhenTokenCannotBeRecorded(t *testing.T) {
+	requests := 0
+	r := &release{head: "head", api: &github{repo: "acme/repo", token: "token", client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { requests++; return nil, errors.New("must not post") })}}}
+	old := releaseStdout
+	releaseStdout = errWriter{}
+	t.Cleanup(func() { releaseStdout = old })
+	if err := r.dispatch(context.Background(), ci.BumpMinor); err == nil || requests != 0 {
+		t.Fatalf("dispatch = %v, requests=%d", err, requests)
+	}
+}
+
+func TestRemoteDispatchEndToEndUsesCheckedInWorkflow(t *testing.T) {
+	gitBin, _ := toolPath("git")
+	ghBin, _ := toolPath("gh")
+	root, remote := t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	for _, args := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", root}, {"-C", root, "config", "user.name", "test"}, {"-C", root, "config", "user.email", "test@example.invalid"}} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "fixture"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", root, "add", "fixture"}, {"-C", root, "commit", "-m", "fixture"}, {"-C", root, "remote", "add", "origin", remote}, {"-C", root, "push", "origin", "main"}} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	g := &git{root: root, bin: gitBin, env: cleanEnv(gitBin, ghBin)}
+	r := &release{root: root, remote: remote, repo: "acme/repo", git: g}
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobName, supported, err := ci.WorkflowReleaseJobName(workflow)
+	if err != nil || !supported {
+		t.Fatalf("workflow release job name = %q, %t, %v", jobName, supported, err)
+	}
+	r.api = &github{repo: r.repo, token: "test", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch {
+		case strings.Contains(req.URL.Path, "/contents/.github/workflows/ci.yml"):
+			body = string(workflow)
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/dispatches"):
+			body = `{"workflow_run_id":99}`
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/99/jobs"):
+			body = fmt.Sprintf(`{"jobs":[{"name":%q,"status":"completed","conclusion":"success"}]}`, jobName)
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/99"):
+			body = `{"id":99,"status":"completed","conclusion":"success"}`
+		case strings.Contains(req.URL.Path, "/actions/workflows/ci.yml/runs"):
+			body = `{"total_count":1,"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","created_at":"2026-07-10T00:00:00Z"}]}`
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/1"):
+			body = `{"id":1,"status":"completed","conclusion":"success"}`
+		default:
+			t.Fatalf("unexpected API request %s %s", req.Method, req.URL.Path)
+		}
+		return &http.Response{StatusCode: 200, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	old := releaseStdout
+	releaseStdout = io.Discard
+	t.Cleanup(func() { releaseStdout = old })
+	if err := r.run(ci.BumpMinor, false, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type fakeDispatchAPI struct {
+	token     string
+	posts     int
+	listCalls int
+	runCalls  int
+}
+
+func TestRemoteDispatchEndToEndRemainingMatrix(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name string
+		run  func(t *testing.T, r *release, api *fakeDispatchAPI)
+	}{
+		{
+			name: "delayed visibility correlates token",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				r.sleep = func(context.Context, time.Duration) error { return nil }
+				err := r.run(ci.BumpMinor, false, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if api.listCalls != 4 {
+					t.Fatalf("dispatch list calls = %d, want 4", api.listCalls)
+				}
+			},
+		},
+		{
+			name: "ambiguous acceptance reconciles without redispatch",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				r.sleep = func(context.Context, time.Duration) error { return nil }
+				err := r.run(ci.BumpMinor, false, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if api.posts != 1 {
+					t.Fatalf("dispatch posts = %d, want 1", api.posts)
+				}
+			},
+		},
+		{
+			name: "successful real display-name job",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				if err := r.run(ci.BumpMinor, false, false); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "failed real display-name job includes run URL",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				err := r.run(ci.BumpMinor, false, false)
+				if err == nil || !strings.Contains(err.Error(), `"Release Container" job status=completed conclusion=failure`) || !strings.Contains(err.Error(), r.runURL(99)) {
+					t.Fatalf("failure = %v", err)
+				}
+			},
+		},
+		{
+			name: "skipped real display-name job includes run URL",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				err := r.run(ci.BumpMinor, false, false)
+				if err == nil || !strings.Contains(err.Error(), `"Release Container" job status=completed conclusion=skipped`) || !strings.Contains(err.Error(), r.runURL(99)) {
+					t.Fatalf("skipped = %v", err)
+				}
+			},
+		},
+		{
+			name: "timeout includes run reference",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				r.observationBudget = time.Millisecond
+				r.sleep = func(ctx context.Context, _ time.Duration) error { <-ctx.Done(); return ctx.Err() }
+				err := r.run(ci.BumpMinor, false, false)
+				if err == nil || !strings.Contains(err.Error(), "before timeout") || !strings.Contains(err.Error(), r.runURL(99)) {
+					t.Fatalf("timeout = %v", err)
+				}
+			},
+		},
+		{
+			name: "signal cancellation includes run reference and leaves no local lock",
+			run: func(t *testing.T, r *release, api *fakeDispatchAPI) {
+				ctx, cancel := context.WithCancel(context.Background())
+				stopped := false
+				r.signalContext = func() (context.Context, context.CancelFunc) { return ctx, func() { stopped = true } }
+				r.sleep = func(ctx context.Context, _ time.Duration) error { cancel(); <-ctx.Done(); return ctx.Err() }
+				err := r.run(ci.BumpMinor, false, false)
+				if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), r.runURL(99)) {
+					t.Fatalf("cancellation = %v", err)
+				}
+				if !stopped {
+					t.Fatal("run did not defer signal-context cleanup")
+				}
+				if _, lockErr := r.git.ref(context.Background(), r.remote, lockRef); !errors.Is(lockErr, os.ErrNotExist) || r.lockHeld {
+					t.Fatalf("remote dispatch stranded local lock: lockHeld=%t err=%v", r.lockHeld, lockErr)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeDispatchAPI{}
+			r := newRemoteDispatchRelease(t, workflow, api, tt.name)
+			tt.run(t, r, api)
+		})
+	}
+}
+
+func newRemoteDispatchRelease(t *testing.T, workflow []byte, state *fakeDispatchAPI, scenario string) *release {
+	t.Helper()
+	jobName, supported, err := ci.WorkflowReleaseJobName(workflow)
+	if err != nil || !supported {
+		t.Fatalf("workflow release job name = %q, %t, %v", jobName, supported, err)
+	}
+	gitBin, err := toolPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghBin, err := toolPath("gh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, remote := t.TempDir(), filepath.Join(t.TempDir(), "remote.git")
+	for _, args := range [][]string{{"init", "--bare", remote}, {"init", "-b", "main", root}, {"-C", root, "config", "user.name", "test"}, {"-C", root, "config", "user.email", "test@example.invalid"}} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "fixture"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-C", root, "add", "fixture"}, {"-C", root, "commit", "-m", "fixture"}, {"-C", root, "remote", "add", "origin", remote}, {"-C", root, "push", "origin", "main"}} {
+		if out, err := exec.Command(gitBin, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	r := &release{root: root, remote: remote, repo: "acme/repo", git: &git{root: root, bin: gitBin, env: cleanEnv(gitBin, ghBin)}}
+	r.api = &github{repo: r.repo, token: "test", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, status := "{}", http.StatusOK
+		switch {
+		case strings.Contains(req.URL.Path, "/contents/.github/workflows/ci.yml"):
+			body = string(workflow)
+		case strings.Contains(req.URL.RawQuery, "head_sha="):
+			body = `{"total_count":1,"workflow_runs":[{"id":1,"status":"completed","conclusion":"success","created_at":"2026-07-10T00:00:00Z"}]}`
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/1"):
+			body = `{"id":1,"status":"completed","conclusion":"success"}`
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/dispatches"):
+			state.posts++
+			var post struct {
+				Inputs map[string]string `json:"inputs"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&post); err != nil {
+				t.Fatal(err)
+			}
+			state.token = post.Inputs["dispatch_token"]
+			if state.token == "" {
+				t.Fatal("dispatch omitted idempotency token")
+			}
+			switch scenario {
+			case "delayed visibility correlates token":
+				body = `{}`
+			case "ambiguous acceptance reconciles without redispatch":
+				return nil, errors.New("simulated lost dispatch response after acceptance")
+			default:
+				body = `{"workflow_run_id":99}`
+			}
+		case strings.Contains(req.URL.Path, "/actions/workflows/ci.yml/runs"):
+			state.listCalls++
+			if scenario == "delayed visibility correlates token" && state.listCalls < 4 {
+				body = `{"total_count":0,"workflow_runs":[]}`
+			} else {
+				body = fmt.Sprintf(`{"total_count":1,"workflow_runs":[{"id":99,"status":"queued","display_title":"Release %s"}]}`, state.token)
+			}
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/99/jobs"):
+			conclusion := "success"
+			if scenario == "failed real display-name job includes run URL" {
+				conclusion = "failure"
+			} else if scenario == "skipped real display-name job includes run URL" {
+				conclusion = "skipped"
+			}
+			body = fmt.Sprintf(`{"jobs":[{"name":%q,"status":"completed","conclusion":%q}]}`, jobName, conclusion)
+		case strings.HasSuffix(req.URL.Path, "/actions/runs/99"):
+			state.runCalls++
+			switch scenario {
+			case "timeout includes run reference", "signal cancellation includes run reference and leaves no local lock":
+				body = `{"id":99,"status":"in_progress"}`
+			default:
+				body = `{"id":99,"status":"completed","conclusion":"success"}`
+			}
+		default:
+			t.Fatalf("unexpected API request %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
+		}
+		return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d test", status), Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}}
+	old := releaseStdout
+	releaseStdout = io.Discard
+	t.Cleanup(func() { releaseStdout = old })
+	return r
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
 func TestGitHubRepoRejectsEmptyQueryAndFragmentDelimiters(t *testing.T) {
 	for _, remote := range []string{"https://github.com/acme/repo?", "https://github.com/acme/repo#"} {
@@ -762,7 +1095,7 @@ func TestReleasePublishEndToEndWithBareRemote(t *testing.T) {
 	var output bytes.Buffer
 	releaseStdout = &output
 	t.Cleanup(func() { releaseStdout = oldOutput })
-	if err := r.run(ci.BumpMinor, true, true, false); err != nil {
+	if err := r.run(ci.BumpMinor, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if output.String() != "released v0.1.0\n" {
@@ -796,7 +1129,7 @@ func TestReleasePublishEndToEndWithBareRemote(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r2 := &release{root: root, remote: remote, repo: "acme/repo", git: g, api: r.api, localFallbackOK: func(string) bool { return true }, signalContext: func() (context.Context, context.CancelFunc) { return ctx, func() {} }, afterLock: cancel}
-	if err := r2.run(ci.BumpMinor, true, true, false); err == nil {
+	if err := r2.run(ci.BumpMinor, true, true); err == nil {
 		t.Fatal("cancellation while locked succeeded")
 	}
 	if _, err := g.ref(context.Background(), remote, lockRef); !errors.Is(err, os.ErrNotExist) {
@@ -821,7 +1154,7 @@ func TestReleasePublishEndToEndWithBareRemote(t *testing.T) {
 		}
 		collisionRemoteOID = state.direct
 	}
-	if err := r3.run(ci.BumpMinor, true, true, false); err == nil {
+	if err := r3.run(ci.BumpMinor, true, true); err == nil {
 		t.Fatal("remote collision succeeded")
 	}
 	if collision, err := g.ref(context.Background(), remote, "refs/tags/"+collisionTag); err != nil || collision.direct != collisionRemoteOID {
@@ -850,7 +1183,7 @@ func TestReleasePublishEndToEndWithBareRemote(t *testing.T) {
 		}
 		return errors.New("simulated lost push response")
 	}
-	if err := r4.run(ci.BumpMinor, true, true, false); err != nil {
+	if err := r4.run(ci.BumpMinor, true, true); err != nil {
 		t.Fatalf("ambiguous push reconciliation: %v", err)
 	}
 	if reconciled, err := g.ref(context.Background(), remote, "refs/tags/"+ambiguousTag); err != nil || reconciled.direct != ambiguousOID || reconciled.peeled != r4.head {
@@ -877,7 +1210,7 @@ func TestReleasePublishEndToEndWithBareRemote(t *testing.T) {
 	r5 := &release{root: root, remote: remote, repo: "acme/repo", git: g, api: r.api, localFallbackOK: func(string) bool { return true }}
 	var closedOutputTag, closedOutputOID string
 	r5.beforePush = func(tag string, local localTagRef) { closedOutputTag, closedOutputOID = tag, local.oid }
-	if err := r5.run(ci.BumpMinor, true, true, false); err == nil {
+	if err := r5.run(ci.BumpMinor, true, true); err == nil {
 		t.Fatal("closed output succeeded")
 	}
 	if local, err := g.localRef(context.Background(), "refs/tags/"+closedOutputTag); err != nil || local != "" {

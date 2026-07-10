@@ -8,6 +8,7 @@ import (
 	"math"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,18 +36,95 @@ type Allocation struct {
 }
 
 func WorkflowSupportsReleaseDispatch(workflow []byte) (bool, error) {
+	_, ok, err := WorkflowReleaseJobName(workflow)
+	return ok, err
+}
+
+// WorkflowReleaseJobName returns the GitHub Actions display name of jobs.release.
+// The Actions jobs API reports this name, not the YAML job identifier.
+func WorkflowReleaseJobName(workflow []byte) (string, bool, error) {
 	var document yaml.Node
 	if err := yaml.Unmarshal(workflow, &document); err != nil {
-		return false, fmt.Errorf("parse workflow YAML: %w", err)
+		return "", false, fmt.Errorf("parse workflow YAML: %w", err)
 	}
 	if len(document.Content) == 0 {
-		return false, nil
+		return "", false, nil
 	}
 	on := mappingValue(document.Content[0], "on", map[*yaml.Node]bool{}, 0)
 	dispatch := mappingValue(on, "workflow_dispatch", map[*yaml.Node]bool{}, 0)
 	inputs := mappingValue(dispatch, "inputs", map[*yaml.Node]bool{}, 0)
-	return mappingValue(inputs, "bump", map[*yaml.Node]bool{}, 0) != nil &&
-		mappingValue(inputs, "dispatch_token", map[*yaml.Node]bool{}, 0) != nil, nil
+	for _, input := range []string{"bump", "dispatch_token", "expected_revision"} {
+		if mappingValue(inputs, input, map[*yaml.Node]bool{}, 0) == nil {
+			return "", false, nil
+		}
+	}
+	if !strings.Contains(scalarValue(document.Content[0], "run-name"), "inputs.dispatch_token") {
+		return "", false, nil
+	}
+	// Validate the release job as YAML structure, never as comment/name-string
+	// substrings. cmd/release calls this before it delegates version allocation.
+	jobs := mappingValue(document.Content[0], "jobs", map[*yaml.Node]bool{}, 0)
+	release := mappingValue(jobs, "release", map[*yaml.Node]bool{}, 0)
+	condition := scalarValue(release, "if")
+	if release == nil || scalarValue(release, "needs") != "test" ||
+		!strings.Contains(condition, "github.event_name == 'workflow_dispatch'") ||
+		!strings.Contains(condition, "github.ref == 'refs/heads/main'") || strings.Contains(strings.ToLower(condition), "false") {
+		return "", false, nil
+	}
+	jobName := scalarValue(release, "name")
+	if strings.TrimSpace(jobName) == "" {
+		return "", false, nil
+	}
+	concurrency := mappingValue(release, "concurrency", map[*yaml.Node]bool{}, 0)
+	if scalarValue(concurrency, "group") != "gitops-dashboard-release" || scalarValue(concurrency, "queue") != "" || scalarValue(concurrency, "cancel-in-progress") != "false" {
+		return "", false, nil
+	}
+	permissions := mappingValue(release, "permissions", map[*yaml.Node]bool{}, 0)
+	if scalarValue(permissions, "contents") != "write" || scalarValue(permissions, "packages") != "write" {
+		return "", false, nil
+	}
+	steps := mappingValue(release, "steps", map[*yaml.Node]bool{}, 0)
+	for _, required := range []string{
+		"Select effective release version",
+		"Verify immutable exact image",
+		"Build and publish immutable exact image",
+		"Publish moving image channels",
+		"Create or repair GitHub Release",
+	} {
+		if !namedStep(steps, required) {
+			return "", false, nil
+		}
+	}
+	for _, required := range []string{"Select effective release version", "Verify immutable exact image", "Publish moving image channels", "Create or repair GitHub Release"} {
+		if strings.TrimSpace(scalarValue(namedStepNode(steps, required), "run")) == "" {
+			return "", false, nil
+		}
+	}
+	if !strings.Contains(scalarValue(namedStepNode(steps, "Select effective release version"), "run"), "version-allocator") || !strings.Contains(scalarValue(namedStepNode(steps, "Build and publish immutable exact image"), "if"), "reuse") || scalarValue(namedStepNode(steps, "Build and publish immutable exact image"), "uses") == "" {
+		return "", false, nil
+	}
+	return jobName, true, nil
+}
+
+func scalarValue(node *yaml.Node, key string) string {
+	v := mappingValue(node, key, map[*yaml.Node]bool{}, 0)
+	if v == nil || v.Kind != yaml.ScalarNode {
+		return ""
+	}
+	return v.Value
+}
+func namedStep(steps *yaml.Node, name string) bool { return namedStepNode(steps, name) != nil }
+func namedStepNode(steps *yaml.Node, name string) *yaml.Node {
+	steps = dereference(steps, map[*yaml.Node]bool{}, 0)
+	if steps == nil || steps.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for _, step := range steps.Content {
+		if scalarValue(step, "name") == name {
+			return step
+		}
+	}
+	return nil
 }
 
 func dereference(n *yaml.Node, seen map[*yaml.Node]bool, depth int) *yaml.Node {
@@ -84,26 +162,27 @@ func AllocateVersion(tags []Tag, source string, bump Bump) (string, error) {
 	return a.Version, err
 }
 
-// Allocate returns a new version or the single, provably identical prior
-// allocation for source. A source commit may never be released twice with
-// incompatible bump requests.
+// Allocate returns a new version or a prior allocation for the same source and
+// bump shape. A source may carry one auto-patch tag and later manual minor or
+// major tags: different shapes are ordinary immutable version maxima, not
+// collisions. This makes a rerun idempotent without preventing an operator
+// from escalating a previously auto-patched commit.
 func Allocate(tags []Tag, source string, bump Bump) (Allocation, error) {
 	if bump != BumpPatch && bump != BumpMinor && bump != BumpMajor {
 		return Allocation{}, fmt.Errorf("unsupported version bump")
 	}
-	var sourceTags []Tag
 	max := version{}
+	var reuse *version
 	for _, tag := range tags {
 		parsed, ok := parseVersion(tag.Name)
 		if !ok {
 			logRejectedTag("invalid SemVer", tag.Name)
 			continue
 		}
-		// Source ownership is checked before incrementability. An existing
-		// release remains idempotent even if that component cannot be bumped.
-		if tag.Commit == source {
-			sourceTags = append(sourceTags, tag)
-			continue
+		if tag.Commit == source && sourceTagMatchesBump(tag.Name, bump) &&
+			(reuse == nil || reuse.less(parsed)) {
+			candidate := parsed
+			reuse = &candidate
 		}
 		if !incrementable(parsed, bump) {
 			logRejectedTag("non-incrementable SemVer", tag.Name)
@@ -113,11 +192,8 @@ func Allocate(tags []Tag, source string, bump Bump) (Allocation, error) {
 			max = parsed
 		}
 	}
-	if len(sourceTags) > 0 {
-		if len(sourceTags) != 1 || !sourceTagMatchesBump(sourceTags[0].Name, bump) {
-			return Allocation{}, fmt.Errorf("source commit already has incompatible or ambiguous release tag")
-		}
-		return Allocation{Version: sourceTags[0].Name, Reused: true}, nil
+	if reuse != nil {
+		return Allocation{Version: reuse.String(), Reused: true}, nil
 	}
 	candidate := nextVersion(max, bump)
 	return Allocation{Version: candidate.String()}, nil

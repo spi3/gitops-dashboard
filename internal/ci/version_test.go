@@ -36,11 +36,30 @@ func TestAllocateVersionSourceIdempotency(t *testing.T) {
 	if err != nil || !a.Reused || a.Version != "v1.3.0" {
 		t.Fatalf("identical retry = %#v, %v", a, err)
 	}
-	if _, err := Allocate(tags, "source", BumpMajor); err == nil {
-		t.Fatal("different bump for an already released source was accepted")
+	major, err := Allocate(tags, "source", BumpMajor)
+	if err != nil || major.Reused || major.Version != "v2.0.0" {
+		t.Fatalf("different bump = %#v, %v", major, err)
 	}
-	if _, err := Allocate(append(tags, Tag{"v1.3.1", "source"}), "source", BumpMinor); err == nil {
-		t.Fatal("ambiguous source release was accepted")
+}
+
+func TestAllocateVersionAutoPatchThenManualBumps(t *testing.T) {
+	tags := []Tag{{"v1.2.3", "older"}, {"v1.2.4", "source"}}
+	patch, err := Allocate(tags, "source", BumpPatch)
+	if err != nil || !patch.Reused || patch.Version != "v1.2.4" {
+		t.Fatalf("patch rerun = %#v, %v", patch, err)
+	}
+	minor, err := Allocate(tags, "source", BumpMinor)
+	if err != nil || minor.Reused || minor.Version != "v1.3.0" {
+		t.Fatalf("minor after auto-patch = %#v, %v", minor, err)
+	}
+	tags = append(tags, Tag{minor.Version, "source"})
+	minor, err = Allocate(tags, "source", BumpMinor)
+	if err != nil || !minor.Reused || minor.Version != "v1.3.0" {
+		t.Fatalf("minor rerun = %#v, %v", minor, err)
+	}
+	major, err := Allocate(tags, "source", BumpMajor)
+	if err != nil || major.Reused || major.Version != "v2.0.0" {
+		t.Fatalf("major after auto-patch = %#v, %v", major, err)
 	}
 }
 func TestAllocateVersionSourceRetrySurvivesLaterTag(t *testing.T) {
@@ -69,8 +88,9 @@ func TestAllocateVersionSourceOwnsOverflowAdjacentTag(t *testing.T) {
 }
 
 func TestAllocateVersionRejectsZeroMajorAsMajorReuse(t *testing.T) {
-	if _, err := Allocate([]Tag{{"v0.0.0", "source"}}, "source", BumpMajor); err == nil {
-		t.Fatal("v0.0.0 was accepted as a major release retry")
+	a, err := Allocate([]Tag{{"v0.0.0", "source"}}, "source", BumpMajor)
+	if err != nil || a.Reused || a.Version != "v1.0.0" {
+		t.Fatalf("v0.0.0 major allocation = %#v, %v", a, err)
 	}
 }
 
@@ -107,8 +127,101 @@ func TestUnsupportedBumpDoesNotEchoInput(t *testing.T) {
 	}
 }
 func TestWorkflowSupportsAliases(t *testing.T) {
-	ok, err := WorkflowSupportsReleaseDispatch([]byte("inputs: &release_inputs\n  bump: {type: choice}\n  dispatch_token: {type: string}\non:\n  workflow_dispatch:\n    inputs: *release_inputs\n"))
+	w := `on:
+  workflow_dispatch:
+    inputs: &release_inputs
+      bump: {type: choice}
+      dispatch_token: {type: string}
+      expected_revision: {type: string}
+run-name: "${{ format('Release {0}', inputs.dispatch_token) }}"
+jobs:
+  release:
+    name: Release Container
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: test
+    concurrency: {group: gitops-dashboard-release, cancel-in-progress: false}
+    permissions: {contents: write, packages: write}
+    steps:
+      - {name: Select effective release version, run: go run ./cmd/version-allocator}
+      - {name: Verify immutable exact image, run: verify}
+      - {name: Build and publish immutable exact image, if: steps.existing.outputs.reuse != 'true', uses: docker/build-push-action@v6}
+      - {name: Publish moving image channels, run: publish}
+      - {name: Create or repair GitHub Release, run: create}
+`
+	ok, err := WorkflowSupportsReleaseDispatch([]byte(w))
 	if err != nil || !ok {
 		t.Fatalf("got %v, %v", ok, err)
+	}
+}
+
+func TestWorkflowReleaseJobNameUsesDisplayName(t *testing.T) {
+	w := `on:
+  workflow_dispatch:
+    inputs:
+      bump: {type: choice}
+      dispatch_token: {type: string}
+      expected_revision: {type: string}
+run-name: "${{ format('Release {0}', inputs.dispatch_token) }}"
+jobs:
+  release:
+    name: Release Container
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: test
+    concurrency: {group: gitops-dashboard-release, cancel-in-progress: false}
+    permissions: {contents: write, packages: write}
+    steps:
+      - {name: Select effective release version, run: go run ./cmd/version-allocator}
+      - {name: Verify immutable exact image, run: verify}
+      - {name: Build and publish immutable exact image, if: steps.existing.outputs.reuse != 'true', uses: docker/build-push-action@v6}
+      - {name: Publish moving image channels, run: publish}
+      - {name: Create or repair GitHub Release, run: create}
+`
+	name, ok, err := WorkflowReleaseJobName([]byte(w))
+	if err != nil || !ok || name != "Release Container" {
+		t.Fatalf("WorkflowReleaseJobName = %q, %t, %v", name, ok, err)
+	}
+}
+
+func TestWorkflowSupportsReleaseDispatchRejectsSkippedOrNoopRelease(t *testing.T) {
+	base := `on:
+  workflow_dispatch:
+    inputs:
+      bump: {type: choice}
+      dispatch_token: {type: string}
+      expected_revision: {type: string}
+run-name: "${{ format('Release {0}', inputs.dispatch_token) }}"
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: test
+    concurrency: {group: gitops-dashboard-release, cancel-in-progress: false}
+    permissions: {contents: write, packages: write}
+    steps:
+      - {name: Select effective release version, run: go run ./cmd/version-allocator}
+      - {name: Verify immutable exact image, run: verify}
+      - {name: Build and publish immutable exact image, if: steps.existing.outputs.reuse != 'true', uses: docker/build-push-action@v6}
+      - {name: Publish moving image channels, run: publish}
+      - {name: Create or repair GitHub Release, run: create}
+`
+	for name, mutation := range map[string]string{
+		"skipped":       " && false",
+		"missing input": "", // remove below
+		"no-op":         "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := base
+			switch name {
+			case "skipped":
+				w = strings.Replace(w, "github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/main'"+mutation, 1)
+			case "missing input":
+				w = strings.Replace(w, "      expected_revision: {type: string}\n", "", 1)
+			case "no-op":
+				w = strings.Replace(w, "{name: Create or repair GitHub Release, run: create}", "{name: Create or repair GitHub Release}", 1)
+			}
+			ok, err := WorkflowSupportsReleaseDispatch([]byte(w))
+			if err != nil || ok {
+				t.Fatalf("got %v, %v", ok, err)
+			}
+		})
 	}
 }
