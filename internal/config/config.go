@@ -136,6 +136,7 @@ type MonitoringConfig struct {
 type AlertingConfig struct {
 	Debounce          string              `yaml:"debounce"`
 	Cooldown          string              `yaml:"cooldown"`
+	StabilitySamples  int                 `yaml:"stabilitySamples"`
 	ResetOnMissingKey bool                `yaml:"resetOnMissingKey"`
 	ResetToken        string              `yaml:"resetToken"`
 	Retry             AlertRetryConfig    `yaml:"retry"`
@@ -306,6 +307,9 @@ func (cfg *Config) applyServerDefaults() {
 }
 
 func (cfg *Config) applyAlertingDefaults() {
+	if cfg.Alerting.StabilitySamples == 0 {
+		cfg.Alerting.StabilitySamples = 2
+	}
 	if cfg.Alerting.Debounce == "" {
 		cfg.Alerting.Debounce = "30s"
 	}
@@ -1112,6 +1116,9 @@ func (cfg AlertingConfig) Enabled() bool {
 }
 
 func (cfg AlertingConfig) Validate() error {
+	if cfg.StabilitySamples <= 0 {
+		return fmt.Errorf("alerting.stabilitySamples must be greater than zero")
+	}
 	if _, err := cfg.DebounceDuration(); err != nil {
 		return err
 	}
@@ -1162,6 +1169,22 @@ func (cfg AlertingConfig) EnabledSinkNames() []string {
 		alertSinkName("discord", cfg.Sinks.Discord.Name),
 		alertSinkName("home-assistant", cfg.Sinks.HomeAssistant.Name),
 	}
+}
+
+// ActiveSinkNames returns only configured delivery destinations. Historical
+// disabled identities remain in EnabledSinkNames for storage validation.
+func (cfg AlertingConfig) ActiveSinkNames() []string {
+	active := []string{}
+	if cfg.Sinks.Webhook.Enabled {
+		active = append(active, alertSinkName("webhook", cfg.Sinks.Webhook.Name))
+	}
+	if cfg.Sinks.Discord.Enabled {
+		active = append(active, alertSinkName("discord", cfg.Sinks.Discord.Name))
+	}
+	if cfg.Sinks.HomeAssistant.Enabled {
+		active = append(active, alertSinkName("home-assistant", cfg.Sinks.HomeAssistant.Name))
+	}
+	return active
 }
 
 func (cfg AlertingConfig) validateSinkNames() error {

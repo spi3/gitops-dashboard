@@ -46,6 +46,9 @@ repositories:
 	if got, err := cfg.Alerting.DebounceDuration(); err != nil || got.String() != "30s" {
 		t.Fatalf("alerting debounce = %v, err=%v; want 30s", got, err)
 	}
+	if cfg.Alerting.StabilitySamples != 2 {
+		t.Fatalf("alerting stabilitySamples = %d, want 2", cfg.Alerting.StabilitySamples)
+	}
 }
 
 func TestLoadConfigCanonicalizesAlertSinkNamesAndRejectsDescendingRetryBounds(t *testing.T) {

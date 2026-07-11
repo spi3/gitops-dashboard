@@ -27,7 +27,7 @@ func (store *Store) migrate(ctx context.Context) (err error) {
 		}
 	}()
 	compactNeeded := false
-	alertLocked := store.alertStateLocked
+	alertLocked := store.isAlertStateLocked()
 	for _, step := range store.migrationSteps() {
 		if step.alertOnly && alertLocked {
 			continue
@@ -129,7 +129,237 @@ ON route_target_exclusions(service_id, old_route);`)
 				return false, err
 			},
 		},
+		{
+			id:        "016_health_alert_states",
+			alertOnly: true,
+			apply:     store.repairHealthAlertStatesSchema,
+		},
+		store.ensureColumnStep("017_services_incarnation", "services", "incarnation", "TEXT NOT NULL DEFAULT ''"),
+		{
+			id: "018_backfill_service_incarnations",
+			apply: func(ctx context.Context) (bool, error) {
+				result, err := store.db.ExecContext(ctx, `UPDATE services SET incarnation=lower(hex(randomblob(16))) WHERE incarnation=''`)
+				if err != nil {
+					return false, err
+				}
+				changed, err := result.RowsAffected()
+				return err == nil && changed > 0, err
+			},
+		},
+		{
+			id:        "019_health_alert_states_incarnation",
+			alertOnly: true,
+			apply: func(ctx context.Context) (bool, error) {
+				exists, err := store.tableExists(ctx, "health_alert_states")
+				if err != nil || !exists {
+					return false, err
+				}
+				return store.ensureColumnChanged(ctx, "health_alert_states", "service_incarnation", "TEXT NOT NULL DEFAULT ''")
+			},
+		},
 	}
+}
+
+const healthAlertStatesCreateSQL = `
+CREATE TABLE health_alert_states (
+  service_id TEXT NOT NULL PRIMARY KEY,
+  stable_health TEXT NOT NULL,
+  candidate_health TEXT NOT NULL,
+  candidate_samples INTEGER NOT NULL,
+  candidate_started_at TEXT NOT NULL DEFAULT '',
+  candidate_observation_id TEXT NOT NULL DEFAULT '',
+  failure_started_at TEXT NOT NULL DEFAULT '',
+  service_incarnation TEXT NOT NULL DEFAULT ''
+);`
+
+// repairHealthAlertStatesSchema treats this table as alert-only state: a shape
+// we cannot prove safe is latched rather than guessed at during dashboard boot.
+func (store *Store) repairHealthAlertStatesSchema(ctx context.Context) (bool, error) {
+	exists, err := store.tableExists(ctx, "health_alert_states")
+	if err != nil || !exists {
+		_, err = store.db.ExecContext(ctx, healthAlertStatesCreateSQL)
+		return false, err
+	}
+	rows, err := store.db.QueryContext(ctx, `PRAGMA table_info(health_alert_states)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	columns := map[string]healthAlertStateColumn{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+			return false, err
+		}
+		columns[name] = healthAlertStateColumn{typ: typ, notNull: notNull != 0, defaultValue: sqliteDefaultValue(def), pk: pk}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	legacy := healthAlertStateColumns(false, false)
+	canonical := healthAlertStateColumns(true, true)
+	previousCanonical := healthAlertStateColumns(true, false)
+	if healthAlertStateSchemaMatches(columns, canonical) {
+		if locked, err := healthAlertStateHasUnsupportedConstraints(ctx, store); err != nil || locked {
+			return false, err
+		}
+		return false, nil
+	}
+	// The next idempotent migration adds service_incarnation to this formerly
+	// canonical shape. Its default intentionally makes existing alert state a
+	// mismatch against the backfilled service incarnation on first observation.
+	if healthAlertStateSchemaMatches(columns, previousCanonical) {
+		if locked, err := healthAlertStateHasUnsupportedConstraints(ctx, store); err != nil || locked {
+			return false, err
+		}
+		return false, nil
+	}
+	if !healthAlertStateSchemaMatches(columns, legacy) {
+		store.lockAlertState("alert state locked: health_alert_states has an incompatible schema")
+		return false, nil
+	}
+	if locked, err := healthAlertStateHasUnsupportedConstraints(ctx, store); err != nil || locked {
+		return false, err
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `ALTER TABLE health_alert_states RENAME TO health_alert_states_legacy`); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, healthAlertStatesCreateSQL); err != nil {
+		return false, err
+	}
+	// Legacy candidates lack a coherent start/identity pair. Reset them to the
+	// known stable baseline so a nonzero debounce can start a fresh candidate.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO health_alert_states(service_id, stable_health, candidate_health, candidate_samples, failure_started_at) SELECT service_id, stable_health, stable_health, 0, failure_started_at FROM health_alert_states_legacy`); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `DROP TABLE health_alert_states_legacy`); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+type healthAlertStateColumn struct {
+	typ          string
+	notNull      bool
+	defaultValue string
+	pk           int
+}
+
+func healthAlertStateColumns(canonical, withIncarnation bool) map[string]healthAlertStateColumn {
+	columns := map[string]healthAlertStateColumn{
+		"service_id":         {typ: "TEXT", notNull: true, defaultValue: "", pk: 1},
+		"stable_health":      {typ: "TEXT", notNull: true, defaultValue: "", pk: 0},
+		"candidate_health":   {typ: "TEXT", notNull: true, defaultValue: "", pk: 0},
+		"candidate_samples":  {typ: "INTEGER", notNull: true, defaultValue: "", pk: 0},
+		"failure_started_at": {typ: "TEXT", notNull: true, defaultValue: "''", pk: 0},
+	}
+	if canonical {
+		columns["candidate_started_at"] = healthAlertStateColumn{typ: "TEXT", notNull: true, defaultValue: "''", pk: 0}
+		columns["candidate_observation_id"] = healthAlertStateColumn{typ: "TEXT", notNull: true, defaultValue: "''", pk: 0}
+	}
+	if withIncarnation {
+		columns["service_incarnation"] = healthAlertStateColumn{typ: "TEXT", notNull: true, defaultValue: "''", pk: 0}
+	}
+	return columns
+}
+
+func healthAlertStateSchemaMatches(actual, expected map[string]healthAlertStateColumn) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name, want := range expected {
+		got, ok := actual[name]
+		if !ok || sqliteAffinity(got.typ) != sqliteAffinity(want.typ) || got.notNull != want.notNull || got.defaultValue != want.defaultValue || got.pk != want.pk {
+			return false
+		}
+	}
+	return true
+}
+
+func sqliteAffinity(typ string) string {
+	typ = strings.ToUpper(strings.TrimSpace(typ))
+	switch {
+	case strings.Contains(typ, "INT"):
+		return "INTEGER"
+	case strings.Contains(typ, "CHAR"), strings.Contains(typ, "CLOB"), strings.Contains(typ, "TEXT"):
+		return "TEXT"
+	case strings.Contains(typ, "BLOB") || typ == "":
+		return "BLOB"
+	case strings.Contains(typ, "REAL"), strings.Contains(typ, "FLOA"), strings.Contains(typ, "DOUB"):
+		return "REAL"
+	default:
+		return "NUMERIC"
+	}
+}
+
+func sqliteDefaultValue(value any) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func healthAlertStateHasUnsupportedConstraints(ctx context.Context, store *Store) (bool, error) {
+	triggers, err := store.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='health_alert_states'`)
+	if err != nil {
+		return false, err
+	}
+	defer triggers.Close()
+	if triggers.Next() {
+		store.lockAlertState("alert state locked: health_alert_states has unsupported triggers")
+		return true, nil
+	}
+	if err := triggers.Err(); err != nil {
+		return false, err
+	}
+	fks, err := store.db.QueryContext(ctx, `PRAGMA foreign_key_list(health_alert_states)`)
+	if err != nil {
+		return false, err
+	}
+	defer fks.Close()
+	if fks.Next() {
+		store.lockAlertState("alert state locked: health_alert_states has unsupported foreign-key constraints")
+		return true, nil
+	}
+	if err := fks.Err(); err != nil {
+		return false, err
+	}
+	rows, err := store.db.QueryContext(ctx, `PRAGMA index_list(health_alert_states)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, err
+		}
+		if origin != "pk" {
+			store.lockAlertState("alert state locked: health_alert_states has unsupported constraints")
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	var tableSQL string
+	if err := store.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='health_alert_states'`).Scan(&tableSQL); err != nil {
+		return false, err
+	}
+	if strings.Contains(strings.ToUpper(tableSQL), "CHECK") {
+		store.lockAlertState("alert state locked: health_alert_states has unsupported constraints")
+		return true, nil
+	}
+	return false, nil
 }
 
 func (store *Store) ensureColumnStep(id, table, column, definition string) migrationStep {
@@ -477,7 +707,7 @@ func (store *Store) alertDispatchesNeedConstraintRebuild(ctx context.Context) (b
 }
 
 func (store *Store) ensureAlertIndexes(ctx context.Context) (bool, error) {
-	if store.alertStateLocked {
+	if store.isAlertStateLocked() {
 		return false, nil
 	}
 	changed, err := store.reconcileDuplicatePendingAlertDedupeHashes(ctx)
@@ -913,7 +1143,7 @@ func alertDispatchMergePriority(status string) int {
 }
 
 func (store *Store) backfillAlertEventDedupeHashes(ctx context.Context) (bool, error) {
-	if store.alertStateLocked {
+	if store.isAlertStateLocked() {
 		return false, nil
 	}
 	rows, err := store.db.QueryContext(ctx, `SELECT id, dedupe_key FROM alert_events WHERE dedupe_hash=''`)
@@ -945,7 +1175,7 @@ func (store *Store) backfillAlertEventDedupeHashes(ctx context.Context) (bool, e
 }
 
 func (store *Store) backfillAlertDedupeHashesBeforeRedaction(ctx context.Context) error {
-	if store.alertStateLocked || len(store.alertDedupeKey) == 0 {
+	if store.isAlertStateLocked() || len(store.alertDedupeKey) == 0 {
 		return nil
 	}
 	tx, err := store.db.BeginTx(ctx, nil)
@@ -1624,7 +1854,7 @@ func (store *Store) backfillAlertEventsTableInTx(ctx context.Context, tx *sql.Tx
 			createdAtNS = time.Now().UTC().UnixNano()
 		}
 		dedupeHash := ""
-		if !store.alertStateLocked {
+		if !store.isAlertStateLocked() {
 			dedupeHash = store.alertDedupeHash(update.dedupeKey)
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET dedupe_hash=CASE WHEN dedupe_hash='' THEN ? ELSE dedupe_hash END, created_at_ns=CASE WHEN created_at_ns=0 THEN ? ELSE created_at_ns END WHERE id=?`, table), dedupeHash, createdAtNS, update.id); err != nil {
@@ -1950,6 +2180,7 @@ CREATE TABLE IF NOT EXISTS services (
 	  exposure_json TEXT NOT NULL,
 	  config_json TEXT NOT NULL DEFAULT '[]',
 	  compose_project TEXT NOT NULL DEFAULT '',
+	  incarnation TEXT NOT NULL DEFAULT '',
 	  warnings_json TEXT NOT NULL
 	);
 

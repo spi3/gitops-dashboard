@@ -56,9 +56,12 @@ type AlertEvent struct {
 	NewState   string
 	Reason     string
 	DedupeKey  string
-	DedupeHash string
-	CreatedAt  time.Time
-	Status     string
+	// CooldownKey groups separate idempotent occurrences for rate limiting.
+	// It is intentionally not persisted: DedupeKey identifies this occurrence.
+	CooldownKey string
+	DedupeHash  string
+	CreatedAt   time.Time
+	Status      string
 }
 
 type AlertDispatch struct {
@@ -119,6 +122,24 @@ type enqueueAlertResult struct {
 }
 
 func (store *Store) enqueueAlertEventOnce(ctx context.Context, event AlertEvent, sinks []string, cooldown time.Duration) (AlertEvent, bool, error) {
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AlertEvent{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stored, inserted, err := store.enqueueAlertEventInTx(ctx, tx, event, sinks, cooldown)
+	if err != nil {
+		return AlertEvent{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AlertEvent{}, false, err
+	}
+	return stored, inserted, nil
+}
+
+// enqueueAlertEventInTx is shared by producers that must record an observed
+// edge atomically with its source-state update.
+func (store *Store) enqueueAlertEventInTx(ctx context.Context, tx *sql.Tx, event AlertEvent, sinks []string, cooldown time.Duration) (AlertEvent, bool, error) {
 	rawDedupeKey := strings.TrimSpace(event.DedupeKey)
 	event = store.prepareAlertEvent(event)
 	if event.Kind == "" {
@@ -151,11 +172,6 @@ func (store *Store) enqueueAlertEventOnce(ctx context.Context, event AlertEvent,
 		return AlertEvent{}, false, err
 	}
 
-	tx, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return AlertEvent{}, false, err
-	}
-	defer func() { _ = tx.Rollback() }()
 	if err := store.ensureAlertDedupeKeyCurrent(ctx, tx); err != nil {
 		return AlertEvent{}, false, err
 	}
@@ -166,12 +182,13 @@ func (store *Store) enqueueAlertEventOnce(ctx context.Context, event AlertEvent,
 		if err := store.ensurePendingAlertDispatches(ctx, tx, existing.ID, sinks, event.CreatedAt); err != nil {
 			return AlertEvent{}, false, err
 		}
-		if err := tx.Commit(); err != nil {
-			return AlertEvent{}, false, err
-		}
 		return existing, false, nil
 	}
-	if existing, suppressed, err := store.cooldownSuppressedAlertEvent(ctx, tx, event.DedupeHash, event.CreatedAt, cooldown); err != nil {
+	cooldownHash := event.DedupeHash
+	if strings.TrimSpace(event.CooldownKey) != "" {
+		cooldownHash = store.alertDedupeHash(event.CooldownKey)
+	}
+	if existing, suppressed, err := store.cooldownSuppressedAlertEventForEvent(ctx, tx, cooldownHash, event, event.CreatedAt, cooldown); err != nil {
 		return AlertEvent{}, false, err
 	} else if suppressed {
 		return existing, false, nil
@@ -204,9 +221,6 @@ ON CONFLICT DO NOTHING
 		if err := store.ensurePendingAlertDispatches(ctx, tx, existing.ID, sinks, event.CreatedAt); err != nil {
 			return AlertEvent{}, false, err
 		}
-		if err := tx.Commit(); err != nil {
-			return AlertEvent{}, false, err
-		}
 		return existing, false, nil
 	}
 	eventID, err := result.LastInsertId()
@@ -218,10 +232,35 @@ ON CONFLICT DO NOTHING
 	if err := store.ensurePendingAlertDispatches(ctx, tx, event.ID, sinks, event.CreatedAt); err != nil {
 		return AlertEvent{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	return event, true, nil
+}
+
+func (store *Store) cooldownSuppressedAlertEventForEvent(ctx context.Context, tx *sql.Tx, dedupeHash string, event AlertEvent, occurrenceAt time.Time, cooldown time.Duration) (AlertEvent, bool, error) {
+	if strings.TrimSpace(event.CooldownKey) == "" {
+		return store.cooldownSuppressedAlertEvent(ctx, tx, dedupeHash, occurrenceAt, cooldown)
+	}
+	if cooldown <= 0 {
+		return AlertEvent{}, false, nil
+	}
+	var closedAtNS int64
+	latest, err := store.scanAlertEventWithExtraInt64(tx.QueryRowContext(ctx, `
+SELECT e.id, e.kind, e.service_id, e.target, e.repository, e.agent, e.old_state, e.new_state, e.reason, e.dedupe_key, e.dedupe_hash, e.created_at, e.status,
+  MAX(COALESCE(d.delivered_at_ns, d.updated_at_ns, 0)) AS closed_at_ns
+FROM alert_events e JOIN alert_dispatches d ON d.event_id=e.id
+WHERE e.kind=? AND e.service_id=? AND e.old_state=? AND e.new_state=? AND e.status IN (?, ?)
+GROUP BY e.id HAVING SUM(CASE WHEN d.status IN (?, ?) THEN 1 ELSE 0 END)=0 AND MAX(COALESCE(d.delivered_at_ns, d.updated_at_ns, 0)) > 0
+ORDER BY closed_at_ns DESC, e.id DESC LIMIT 1`, event.Kind, event.ServiceID, event.OldState, event.NewState, AlertEventStatusDelivered, AlertEventStatusPartial, AlertDispatchStatusPending, AlertDispatchStatusInFlight), &closedAtNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AlertEvent{}, false, nil
+	}
+	if err != nil {
 		return AlertEvent{}, false, err
 	}
-	return event, true, nil
+	closedAt := time.Unix(0, closedAtNS).UTC()
+	if occurrenceAt.Before(closedAt.Add(cooldown)) {
+		return latest, true, nil
+	}
+	return AlertEvent{}, false, nil
 }
 
 func (store *Store) ensurePendingAlertDispatches(ctx context.Context, tx *sql.Tx, eventID int64, sinks []string, updatedAt time.Time) error {
@@ -775,15 +814,11 @@ func (store *Store) ensureAlertStateUnlocked() error {
 	if store == nil {
 		return nil
 	}
-	store.alertStateMu.RLock()
-	defer store.alertStateMu.RUnlock()
-	if !store.alertStateLocked {
+	message := store.alertStateLockMessage()
+	if message == "" {
 		return nil
 	}
-	if store.alertStateLockMsg != "" {
-		return fmt.Errorf("%w; %s", ErrAlertStateLocked, store.alertStateLockMsg)
-	}
-	return ErrAlertStateLocked
+	return fmt.Errorf("%w; %s", ErrAlertStateLocked, message)
 }
 
 func (store *Store) ensureAlertDedupeKeyCurrent(ctx context.Context, queryer interface {

@@ -84,6 +84,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		ResetAlertStateToken:        cfg.Alerting.ResetToken,
 		AlertSinkNames:              cfg.Alerting.EnabledSinkNames(),
 		AlertSinkAllowlist:          true,
+		HealthAlerts: storage.HealthAlertProducerConfig{
+			Enabled: cfg.Alerting.Enabled(), Sinks: cfg.Alerting.ActiveSinkNames(),
+			Debounce: mustAlertDebounce(cfg.Alerting), Cooldown: mustAlertCooldown(cfg.Alerting), StabilitySamples: cfg.Alerting.StabilitySamples,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -125,6 +129,22 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		logger.Warn("alerting configured: delivery worker not yet available (foundations only)")
 	}
 	return app, nil
+}
+
+func mustAlertCooldown(alerting config.AlertingConfig) time.Duration {
+	cooldown, err := alerting.CooldownDuration()
+	if err != nil {
+		return 0
+	}
+	return cooldown
+}
+
+func mustAlertDebounce(alerting config.AlertingConfig) time.Duration {
+	debounce, err := alerting.DebounceDuration()
+	if err != nil {
+		return 0
+	}
+	return debounce
 }
 
 func repositoryRedactionValues(repos []config.RepositoryConfig) []string {

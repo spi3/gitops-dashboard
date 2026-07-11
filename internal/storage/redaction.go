@@ -96,7 +96,7 @@ func (store *Store) redactPersistedColumns(ctx context.Context, targets []struct
 	for _, target := range targets {
 		var columnChanged bool
 		var err error
-		if store.alertStateLocked && alertEventRedactionTable(target.table) && target.column == "dedupe_key" {
+		if store.isAlertStateLocked() && alertEventRedactionTable(target.table) && target.column == "dedupe_key" {
 			columnChanged, err = store.redactAlertDedupeKeyColumn(ctx, tx, target.table)
 		} else {
 			columnChanged, err = store.redactColumn(ctx, tx, target.table, target.column)
@@ -113,7 +113,7 @@ func (store *Store) redactPersistedColumns(ctx context.Context, targets []struct
 }
 
 func (store *Store) lockedAlertRowsNeedRawDedupeKey(ctx context.Context) (bool, error) {
-	if !store.alertStateLocked {
+	if !store.isAlertStateLocked() {
 		return false, nil
 	}
 	for _, table := range []string{"alert_events", "alert_events_legacy"} {

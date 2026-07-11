@@ -39,11 +39,22 @@ type Store struct {
 	alertSinkNames     map[string]struct{}
 	alertSinkAllowlist bool
 	alertStateMu       sync.RWMutex
-	alertStateLocked   bool
-	alertStateLockMsg  string
-	resetAlertState    bool
-	alertResetToken    string
-	alertResetTokenFP  string
+	// Health-alert cleanup attempts may finish out of order. Only the newest
+	// completed attempt may update the retryable cleanup-lock component.
+	healthAlertCleanupAttempt          uint64
+	healthAlertCleanupCompletedAttempt uint64
+	// afterSuccessfulHealthAlertCleanup is a narrow test seam for interleaving
+	// cleanup attempts at the SQL/state-update boundary.
+	afterSuccessfulHealthAlertCleanup func()
+	// Durable and cleanup locks have different recovery contracts. Durable
+	// locks require their specific repair path (usually operator action and a
+	// restart); cleanup is retried after every inventory commit.
+	alertStateDurableLockMsg string
+	alertStateCleanupLockMsg string
+	healthAlerts             HealthAlertProducerConfig
+	resetAlertState          bool
+	alertResetToken          string
+	alertResetTokenFP        string
 	// restoreAlertForeignKeys is a narrow test seam for pooled-connection
 	// restoration failures during alert-table rebuilds.
 	restoreAlertForeignKeys func(context.Context, *sql.Conn) error
@@ -67,6 +78,18 @@ type OpenOptions struct {
 	ResetAlertStateToken        string
 	AlertSinkNames              []string
 	AlertSinkAllowlist          bool
+	HealthAlerts                HealthAlertProducerConfig
+}
+
+// HealthAlertProducerConfig controls service-rollup health alerts. Targets are
+// inputs to the rollup only; this avoids one incident producing an alert per
+// monitor target. A zero-value config disables production for compatibility.
+type HealthAlertProducerConfig struct {
+	Enabled          bool
+	Sinks            []string
+	Debounce         time.Duration
+	Cooldown         time.Duration
+	StabilitySamples int
 }
 
 type alertDedupeKeyLoadResult struct {
@@ -146,21 +169,21 @@ func OpenWithOptions(path string, options OpenOptions) (*Store, error) {
 		keyResult.lockMessage = fmt.Sprintf("alert state locked: initialize alert metadata/reset bookkeeping failed: %v", resetBookkeepingErr)
 	}
 	store := &Store{
-		db:                 db,
-		dataDir:            filepath.Dir(path),
-		logger:             logger,
-		alertDedupeKey:     keyResult.key,
-		alertDedupeKeyPath: alertDedupeKeyPath,
-		alertSinkNames:     alertSinkNameSet(options.AlertSinkNames),
-		alertSinkAllowlist: options.AlertSinkAllowlist,
-		alertStateLocked:   keyResult.locked,
-		alertStateLockMsg:  keyResult.lockMessage,
-		resetAlertState:    keyResult.resetAlertState,
-		alertResetToken:    resetToken,
-		alertResetTokenFP:  keyResult.resetTokenFingerprint,
+		db:                       db,
+		dataDir:                  filepath.Dir(path),
+		logger:                   logger,
+		alertDedupeKey:           keyResult.key,
+		alertDedupeKeyPath:       alertDedupeKeyPath,
+		alertSinkNames:           alertSinkNameSet(options.AlertSinkNames),
+		alertSinkAllowlist:       options.AlertSinkAllowlist,
+		healthAlerts:             normalizeHealthAlertProducerConfig(options.HealthAlerts),
+		alertStateDurableLockMsg: keyResult.lockMessage,
+		resetAlertState:          keyResult.resetAlertState,
+		alertResetToken:          resetToken,
+		alertResetTokenFP:        keyResult.resetTokenFingerprint,
 	}
-	if store.alertStateLocked && store.alertStateLockMsg != "" {
-		store.startupWarnings = append(store.startupWarnings, store.alertStateLockMsg)
+	if keyResult.locked && keyResult.lockMessage != "" {
+		store.startupWarnings = append(store.startupWarnings, keyResult.lockMessage)
 	}
 	store.AddRedactionValues(options.RedactionValues...)
 	if err := store.migrate(context.Background()); err != nil {
@@ -179,6 +202,16 @@ func OpenWithOptions(path string, options OpenOptions) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func normalizeHealthAlertProducerConfig(config HealthAlertProducerConfig) HealthAlertProducerConfig {
+	if !config.Enabled {
+		return HealthAlertProducerConfig{}
+	}
+	if config.StabilitySamples <= 0 {
+		config.StabilitySamples = 2
+	}
+	return config
 }
 
 func alertSinkNameSet(names []string) map[string]struct{} {
@@ -961,8 +994,41 @@ func (store *Store) lockAlertState(message string) {
 	}
 	store.alertStateMu.Lock()
 	defer store.alertStateMu.Unlock()
-	store.alertStateLocked = true
-	store.alertStateLockMsg = message
+	if store.alertStateDurableLockMsg == "" {
+		store.alertStateDurableLockMsg = message
+	}
+	for _, warning := range store.startupWarnings {
+		if warning == message {
+			return
+		}
+	}
+	store.startupWarnings = append(store.startupWarnings, message)
+	if store.logger != nil {
+		store.logger.Error(message)
+	}
+}
+
+func (store *Store) beginHealthAlertCleanup() uint64 {
+	store.alertStateMu.Lock()
+	defer store.alertStateMu.Unlock()
+	store.healthAlertCleanupAttempt++
+	return store.healthAlertCleanupAttempt
+}
+
+// completeHealthAlertCleanup applies a cleanup result only if it is newer
+// than every result already applied. This prevents an older success that
+// resumes late from clearing a newer failure's retryable lock.
+func (store *Store) completeHealthAlertCleanup(attempt uint64, message string) {
+	store.alertStateMu.Lock()
+	defer store.alertStateMu.Unlock()
+	if attempt <= store.healthAlertCleanupCompletedAttempt {
+		return
+	}
+	store.healthAlertCleanupCompletedAttempt = attempt
+	store.alertStateCleanupLockMsg = message
+	if message == "" {
+		return
+	}
 	for _, warning := range store.startupWarnings {
 		if warning == message {
 			return
@@ -977,5 +1043,14 @@ func (store *Store) lockAlertState(message string) {
 func (store *Store) isAlertStateLocked() bool {
 	store.alertStateMu.RLock()
 	defer store.alertStateMu.RUnlock()
-	return store.alertStateLocked
+	return store.alertStateDurableLockMsg != "" || store.alertStateCleanupLockMsg != ""
+}
+
+func (store *Store) alertStateLockMessage() string {
+	store.alertStateMu.RLock()
+	defer store.alertStateMu.RUnlock()
+	if store.alertStateDurableLockMsg != "" {
+		return store.alertStateDurableLockMsg
+	}
+	return store.alertStateCleanupLockMsg
 }

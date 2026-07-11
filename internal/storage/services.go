@@ -58,18 +58,18 @@ ON CONFLICT(name) DO UPDATE SET
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id FROM services WHERE repository=?`, repositoryName)
+	currentRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=?`, repositoryName)
 	if err != nil {
 		return err
 	}
-	currentIDs := map[string]struct{}{}
+	currentIDs := map[string]string{}
 	for currentRows.Next() {
-		var id string
-		if err := currentRows.Scan(&id); err != nil {
+		var id, incarnation string
+		if err := currentRows.Scan(&id, &incarnation); err != nil {
 			_ = currentRows.Close()
 			return err
 		}
-		currentIDs[id] = struct{}{}
+		currentIDs[id] = incarnation
 	}
 	if err := currentRows.Close(); err != nil {
 		return err
@@ -93,11 +93,15 @@ ON CONFLICT(name) DO UPDATE SET
 		return err
 	}
 	for _, service := range services {
-		if err := insertService(ctx, tx, service); err != nil {
+		if err := insertService(ctx, tx, service, currentIDs[service.ID]); err != nil {
 			return err
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.reconcileHealthAlertStates(ctx)
+	return nil
 }
 
 func (store *Store) ReplaceRuntimeServices(ctx context.Context, repositoryName, source, runtime string, services []core.Service) error {
@@ -120,18 +124,18 @@ ON CONFLICT(name) DO NOTHING
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
+	currentRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
 	if err != nil {
 		return err
 	}
-	currentIDs := map[string]struct{}{}
+	currentIDs := map[string]string{}
 	for currentRows.Next() {
-		var id string
-		if err := currentRows.Scan(&id); err != nil {
+		var id, incarnation string
+		if err := currentRows.Scan(&id, &incarnation); err != nil {
 			_ = currentRows.Close()
 			return err
 		}
-		currentIDs[id] = struct{}{}
+		currentIDs[id] = incarnation
 	}
 	if err := currentRows.Close(); err != nil {
 		return err
@@ -155,11 +159,15 @@ ON CONFLICT(name) DO NOTHING
 		return err
 	}
 	for _, service := range services {
-		if err := insertService(ctx, tx, service); err != nil {
+		if err := insertService(ctx, tx, service, currentIDs[service.ID]); err != nil {
 			return err
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.reconcileHealthAlertStates(ctx)
+	return nil
 }
 
 func (store *Store) PruneRuntimeServices(ctx context.Context, runtime string, keep []RuntimeServiceSource) error {
@@ -216,7 +224,11 @@ WHERE name=? AND default_ref='configured' AND NOT EXISTS (
 			return err
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.reconcileHealthAlertStates(ctx)
+	return nil
 }
 
 func (store *Store) RuntimeServiceSourceCommit(ctx context.Context, repositoryName, source, runtime string) (string, bool, error) {
@@ -285,6 +297,7 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 	if err != nil {
 		return err
 	}
+	var retainedReplacementIDs []string
 	if scanErr == nil {
 		// A successful scan is authoritative for ambiguity state. Retain only
 		// identities that remain ambiguous in this result, so resolved or vanished
@@ -298,30 +311,74 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 		if err := store.migrateRouteTargetReplacements(ctx, tx, replacements, httpRouteTargetNames(httpTargets)); err != nil {
 			return err
 		}
+		newIDs := make(map[string]struct{}, len(services))
+		for _, service := range services {
+			newIDs[service.ID] = struct{}{}
+		}
+		existingRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=?`, repoName)
+		if err != nil {
+			return err
+		}
+		existingIncarnations := make(map[string]string)
+		for existingRows.Next() {
+			var id, incarnation string
+			if err := existingRows.Scan(&id, &incarnation); err != nil {
+				_ = existingRows.Close()
+				return err
+			}
+			existingIncarnations[id] = incarnation
+		}
+		if err := existingRows.Close(); err != nil {
+			return err
+		}
+		retainedReplacementIDs = routeReplacementServiceIDs(replacements, newIDs)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repoName); err != nil {
 			return err
 		}
 		for _, service := range services {
-			if err := insertService(ctx, tx, service); err != nil {
+			if err := insertService(ctx, tx, service, existingIncarnations[service.ID]); err != nil {
 				return err
 			}
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.reconcileHealthAlertStates(ctx)
+	store.observeHealthAlerts(ctx, retainedReplacementIDs, time.Now().UTC())
+	return nil
 }
 
-func insertService(ctx context.Context, tx *sql.Tx, service core.Service) error {
+// reconcileHealthAlertStates runs only after core inventory commits. It is
+// best-effort orphan hygiene: alert-state correctness is established by the
+// producer's service-incarnation comparison, not by this deletion succeeding.
+func (store *Store) reconcileHealthAlertStates(ctx context.Context) {
+	attempt := store.beginHealthAlertCleanup()
+	if _, err := store.db.ExecContext(ctx, `
+DELETE FROM health_alert_states
+WHERE NOT EXISTS (SELECT 1 FROM services WHERE services.id=health_alert_states.service_id)
+`); err != nil {
+		store.completeHealthAlertCleanup(attempt, fmt.Sprintf("alert state locked: health_alert_states cleanup unavailable: %v", err))
+		return
+	}
+	if store.afterSuccessfulHealthAlertCleanup != nil {
+		store.afterSuccessfulHealthAlertCleanup()
+	}
+	store.completeHealthAlertCleanup(attempt, "")
+}
+
+func insertService(ctx context.Context, tx *sql.Tx, service core.Service, incarnation string) error {
 	service = normalizeService(service)
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO services(
+	INSERT INTO services(
 	  id, name, repository, source_commit, source_path, runtime, kind, namespace,
 	  compose_project, resource_name, environment, health, images_json, ports_json, dependencies_json,
-	  storage_json, exposure_json, config_json, warnings_json
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	  storage_json, exposure_json, config_json, warnings_json, incarnation
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), lower(hex(randomblob(16)))))
 	`, service.ID, service.Name, service.Repository, service.SourceCommit, service.SourcePath,
 		service.Runtime, service.Kind, service.Namespace, service.ComposeProject, service.ResourceName, service.Environment,
 		string(service.Health), toJSON(service.Images), toJSON(service.Ports), toJSON(service.Dependencies),
-		toJSON(service.Storage), toJSON(service.Exposure), toJSON(service.ConfigRefs), toJSON(service.Warnings))
+		toJSON(service.Storage), toJSON(service.Exposure), toJSON(service.ConfigRefs), toJSON(service.Warnings), incarnation)
 	if err != nil {
 		return fmt.Errorf("insert service %s: %w", service.ID, err)
 	}

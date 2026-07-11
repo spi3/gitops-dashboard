@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
@@ -172,7 +173,32 @@ func (store *Store) MigrateRouteTargetReplacements(ctx context.Context, replacem
 	if err := store.migrateRouteTargetReplacements(ctx, tx, replacements, httpRouteTargetNames(targets)); err != nil {
 		return err
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.observeHealthAlerts(ctx, routeReplacementServiceIDs(replacements, nil), time.Now().UTC())
+	return nil
+}
+
+func routeReplacementServiceIDs(replacements []RouteTargetReplacement, retained map[string]struct{}) []string {
+	ids := make([]string, 0, len(replacements))
+	seen := make(map[string]struct{}, len(replacements))
+	for _, replacement := range replacements {
+		if replacement.ServiceID == "" || replacement.OldRoute == "" || replacement.NewRoute == "" || replacement.OldRoute == replacement.NewRoute {
+			continue
+		}
+		if retained != nil {
+			if _, ok := retained[replacement.ServiceID]; !ok {
+				continue
+			}
+		}
+		if _, ok := seen[replacement.ServiceID]; ok {
+			continue
+		}
+		seen[replacement.ServiceID] = struct{}{}
+		ids = append(ids, replacement.ServiceID)
+	}
+	return ids
 }
 
 func (store *Store) migrateRouteTargetReplacements(ctx context.Context, tx *sql.Tx, replacements []RouteTargetReplacement, targetNames []string) error {

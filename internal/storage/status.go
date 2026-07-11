@@ -156,7 +156,11 @@ WHERE service_id=? AND target=? AND health=?
 			return fmt.Errorf("reset status override %s/%s: %w", serviceID, target, err)
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.observeHealthAlert(ctx, serviceID, time.Now().UTC())
+	return nil
 }
 
 type resolvedMonitorOverrideTarget struct {
@@ -273,7 +277,11 @@ func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarg
 			return err
 		}
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.observeHealthAlert(ctx, serviceID, time.Now().UTC())
+	return nil
 }
 
 type RouteMonitorLookup struct {
@@ -446,7 +454,11 @@ func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, 
 	if err := deleteByServiceAndTargets(ctx, tx, "status_history", serviceID, removeTargets); err != nil {
 		return err
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.observeHealthAlert(ctx, serviceID, time.Now().UTC())
+	return nil
 }
 
 func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
@@ -576,7 +588,11 @@ DELETE FROM status_history WHERE service_id=? AND target=?
 `, status.ServiceID, status.Target); err != nil {
 			return fmt.Errorf("clear not applicable status history %s/%s: %w", status.ServiceID, status.Target, err)
 		}
-		return store.commitAndInvalidateSummary(tx)
+		if err := store.commitAndInvalidateSummary(tx); err != nil {
+			return err
+		}
+		store.observeHealthAlert(ctx, status.ServiceID, status.CheckedAt.UTC())
+		return nil
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO status_history(service_id, target, health, message, checked_at)
@@ -585,7 +601,172 @@ VALUES(?, ?, ?, ?, ?)
 	if err != nil {
 		return fmt.Errorf("insert status history %s/%s: %w", status.ServiceID, status.Target, err)
 	}
-	return store.commitAndInvalidateSummary(tx)
+	if err := store.commitAndInvalidateSummary(tx); err != nil {
+		return err
+	}
+	store.observeHealthAlert(ctx, status.ServiceID, status.CheckedAt.UTC())
+	return nil
+}
+
+// observeHealthAlert is deliberately outside the monitoring transaction. A
+// canceled or unavailable alert store must never roll back a monitor result;
+// the alert state and outbox event themselves remain one transaction.
+func (store *Store) observeHealthAlert(ctx context.Context, serviceID string, observedAt time.Time) {
+	if err := store.produceHealthAlert(ctx, serviceID, observedAt); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrAlertStateLocked) {
+		store.logger.Warn("health alert production deferred", "service", store.redact(serviceID), "error", store.redact(err.Error()))
+	}
+}
+
+func (store *Store) observeHealthAlerts(ctx context.Context, serviceIDs []string, observedAt time.Time) {
+	for _, serviceID := range serviceIDs {
+		store.observeHealthAlert(ctx, serviceID, observedAt)
+	}
+}
+
+func (store *Store) produceHealthAlert(ctx context.Context, serviceID string, observedAt time.Time) error {
+	config := store.healthAlerts
+	if !config.Enabled || store.isAlertStateLocked() {
+		return nil
+	}
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var serviceIncarnation string
+	if err := tx.QueryRowContext(ctx, `SELECT incarnation FROM services WHERE id=?`, serviceID).Scan(&serviceIncarnation); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Status-only callers predate inventory rows. Keep their producer
+			// behavior stable, while inventory-backed services always use their
+			// durable incarnation below.
+			serviceIncarnation = "legacy:" + serviceID
+		} else {
+			return err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT target, health, checked_at FROM status_results WHERE service_id=?`, serviceID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var statuses []core.StatusResult
+	for rows.Next() {
+		var status core.StatusResult
+		var health, checkedAt string
+		if err := rows.Scan(&status.Target, &health, &checkedAt); err != nil {
+			return err
+		}
+		status.ServiceID = serviceID
+		status.Health = core.HealthState(health)
+		status.CheckedAt, _ = time.Parse(time.RFC3339, checkedAt)
+		statuses = append(statuses, status)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rollup := aggregateTargetHealth(statuses)
+	observationID := rollupObservationID(statuses)
+
+	var stable, candidate, candidateStarted, candidateObservation, failureStarted string
+	var samples int
+	var stateIncarnation string
+	err = tx.QueryRowContext(ctx, `SELECT stable_health, candidate_health, candidate_samples, candidate_started_at, candidate_observation_id, failure_started_at, service_incarnation FROM health_alert_states WHERE service_id=?`, serviceID).Scan(&stable, &candidate, &samples, &candidateStarted, &candidateObservation, &failureStarted, &stateIncarnation)
+	if errors.Is(err, sql.ErrNoRows) || stateIncarnation != serviceIncarnation {
+		failureStarted := ""
+		if rollup != core.HealthHealthy && rollup != core.HealthNotApplicable {
+			failureStarted = observedAt.Format(time.RFC3339Nano)
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO health_alert_states(service_id, stable_health, candidate_health, candidate_samples, failure_started_at, service_incarnation) VALUES(?, ?, ?, 0, ?, ?)
+ON CONFLICT(service_id) DO UPDATE SET stable_health=excluded.stable_health, candidate_health=excluded.candidate_health, candidate_samples=0, candidate_started_at='', candidate_observation_id='', failure_started_at=excluded.failure_started_at, service_incarnation=excluded.service_incarnation`, serviceID, string(rollup), string(rollup), failureStarted, serviceIncarnation)
+		if err != nil {
+			return err
+		}
+		return tx.Commit() // first observation is silent, even if failing
+	}
+	if err != nil {
+		return err
+	}
+	if rollup == core.HealthNotApplicable {
+		return tx.Commit()
+	}
+	if stable == string(rollup) {
+		// A candidate that returns to the stable state was abandoned. If that
+		// stable state is healthy, its failure start belongs to the abandoned
+		// failure rather than a future incident.
+		if stable == string(core.HealthHealthy) {
+			failureStarted = ""
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE health_alert_states SET candidate_health=?, candidate_samples=0, candidate_started_at='', candidate_observation_id='', failure_started_at=? WHERE service_id=?`, stable, failureStarted, serviceID)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if candidate == string(rollup) {
+		if candidateObservation != observationID {
+			samples++
+			candidateObservation = observationID
+		}
+	} else {
+		candidate, samples, candidateObservation = string(rollup), 1, observationID
+		candidateStarted = observedAt.Format(time.RFC3339Nano)
+	}
+	if failureStarted == "" && rollup != core.HealthHealthy {
+		failureStarted = observedAt.Format(time.RFC3339Nano)
+	}
+	started, _ := time.Parse(time.RFC3339Nano, candidateStarted)
+	continuous := config.Debounce <= 0 || (!started.IsZero() && !observedAt.Before(started) && observedAt.Sub(started) >= config.Debounce)
+	if samples < config.StabilitySamples || !continuous {
+		_, err = tx.ExecContext(ctx, `UPDATE health_alert_states SET candidate_health=?, candidate_samples=?, candidate_started_at=?, candidate_observation_id=?, failure_started_at=? WHERE service_id=?`, candidate, samples, candidateStarted, candidateObservation, failureStarted, serviceID)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
+	newFailureStarted := failureStarted
+	if rollup == core.HealthHealthy {
+		newFailureStarted = ""
+	} else if failureStarted == "" {
+		newFailureStarted = observedAt.Format(time.RFC3339Nano)
+	}
+	reason := "service health transitioned"
+	kind := "health.transition"
+	if rollup == core.HealthHealthy {
+		kind = "health.recovery"
+		if started, parseErr := time.Parse(time.RFC3339Nano, failureStarted); parseErr == nil {
+			reason = fmt.Sprintf("service recovered after %s", observedAt.Sub(started).Round(time.Second))
+		}
+	}
+	occurrenceID := candidateStarted
+	if rollup == core.HealthHealthy {
+		occurrenceID = failureStarted
+	}
+	if occurrenceID == "" {
+		occurrenceID = observedAt.Format(time.RFC3339Nano)
+	}
+	dedupeKey := "health:service:" + serviceID + ":" + stable + ":" + string(rollup) + ":" + occurrenceID
+	stored, inserted, err := store.enqueueAlertEventInTx(ctx, tx, AlertEvent{Kind: kind, ServiceID: serviceID, OldState: stable, NewState: string(rollup), Reason: reason, DedupeKey: dedupeKey, CooldownKey: "health:service:" + serviceID + ":" + stable + ":" + string(rollup)}, config.Sinks, config.Cooldown)
+	if err != nil {
+		return err
+	}
+	if !inserted && stored.DedupeHash == store.alertDedupeHash(dedupeKey) {
+		return fmt.Errorf("health edge was not persisted")
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE health_alert_states SET stable_health=?, candidate_health=?, candidate_samples=0, candidate_started_at='', candidate_observation_id='', failure_started_at=? WHERE service_id=?`, string(rollup), string(rollup), newFailureStarted, serviceID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rollupObservationID(statuses []core.StatusResult) string {
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Target < statuses[j].Target })
+	parts := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		parts = append(parts, status.Target+"\x00"+string(status.Health)+"\x00"+status.CheckedAt.UTC().Format(time.RFC3339Nano))
+	}
+	return strings.Join(parts, "\x01")
 }
 
 func (store *Store) PruneStatusHistory(ctx context.Context) error {

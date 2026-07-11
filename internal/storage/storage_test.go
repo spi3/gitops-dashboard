@@ -103,6 +103,736 @@ func TestStorePersistsSummary(t *testing.T) {
 	}
 }
 
+func TestHealthAlertProducerTransitionSequences(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, Cooldown: time.Hour, StabilitySamples: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	write := func(health core.HealthState) {
+		t.Helper()
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: health, CheckedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	events := func() []AlertEvent {
+		t.Helper()
+		got, err := store.ListUndeliveredAlertEvents(ctx, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	write(core.HealthHealthy) // silent baseline
+	write(core.HealthUnhealthy)
+	if got := events(); len(got) != 0 {
+		t.Fatalf("events after unstable edge = %#v", got)
+	}
+	write(core.HealthUnhealthy)
+	if got := events(); len(got) != 1 || got[0].Kind != "health.transition" || got[0].OldState != "healthy" || got[0].NewState != "unhealthy" {
+		t.Fatalf("failure event = %#v", got)
+	}
+	write(core.HealthUnhealthy)
+	if got := events(); len(got) != 1 {
+		t.Fatalf("steady state events = %#v", got)
+	}
+	write(core.HealthHealthy)
+	write(core.HealthHealthy)
+	if got := events(); len(got) != 2 || got[1].Kind != "health.recovery" || !strings.Contains(got[1].Reason, "recovered after 4m0s") {
+		t.Fatalf("recovery event = %#v", got)
+	}
+}
+
+func TestHealthAlertStateLegacyRebuildResetsInflightCandidate(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE health_alert_states (
+  service_id TEXT NOT NULL PRIMARY KEY,
+  stable_health TEXT NOT NULL,
+  candidate_health TEXT NOT NULL,
+  candidate_samples INTEGER NOT NULL,
+  failure_started_at TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO health_alert_states(service_id, stable_health, candidate_health, candidate_samples, failure_started_at)
+VALUES('svc', 'healthy', 'unhealthy', 1, '2026-07-10T12:00:00Z');`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenWithOptions(path, OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, Debounce: 2 * time.Minute, StabilitySamples: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var candidate string
+	var samples int
+	if err := store.db.QueryRowContext(ctx, `SELECT candidate_health, candidate_samples FROM health_alert_states WHERE service_id='svc'`).Scan(&candidate, &samples); err != nil {
+		t.Fatal(err)
+	}
+	if candidate != string(core.HealthHealthy) || samples != 0 {
+		t.Fatalf("rebuilt candidate = %q/%d, want healthy/0", candidate, samples)
+	}
+	base := time.Date(2026, 7, 10, 12, 1, 0, 0, time.UTC)
+	for _, at := range []time.Time{base, base.Add(2 * time.Minute)} {
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthUnhealthy, CheckedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if events, err := store.ListUndeliveredAlertEvents(ctx, 0); err != nil || len(events) != 0 {
+		t.Fatalf("legacy state without an incarnation must establish a silent fresh baseline: %#v, %v", events, err)
+	}
+}
+
+func TestHealthAlertStateMalformedCanonicalSchemaLatches(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+CREATE TABLE health_alert_states (
+  service_id TEXT NOT NULL PRIMARY KEY,
+  stable_health TEXT NOT NULL,
+  candidate_health TEXT NOT NULL,
+  candidate_samples TEXT NOT NULL,
+  candidate_started_at TEXT NOT NULL DEFAULT '',
+  candidate_observation_id TEXT NOT NULL DEFAULT '',
+  failure_started_at TEXT NOT NULL DEFAULT ''
+);`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !store.isAlertStateLocked() || !strings.Contains(strings.Join(store.StartupWarnings(), "\n"), "health_alert_states has an incompatible schema") {
+		t.Fatalf("malformed health state schema did not latch: %#v", store.StartupWarnings())
+	}
+}
+
+func TestHealthAlertStateCanonicalSchemaWithTriggerLatches(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, healthAlertStatesCreateSQL+`
+CREATE TRIGGER health_alert_states_abort_delete
+BEFORE DELETE ON health_alert_states
+BEGIN
+  SELECT RAISE(ABORT, 'alert cleanup blocked');
+END;`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !store.isAlertStateLocked() || !strings.Contains(strings.Join(store.StartupWarnings(), "\n"), "health_alert_states has unsupported triggers") {
+		t.Fatalf("triggered health state schema did not latch: %#v", store.StartupWarnings())
+	}
+}
+
+func TestCleanupHealthAlertStateTriggerKeepsCoreInventory(t *testing.T) {
+	ctx := context.Background()
+	service := core.Service{ID: "svc", Name: "service", Repository: "repo", SourcePath: "services.yml", Runtime: "configured", Kind: "Service", Health: core.HealthUnknown}
+
+	for _, trigger := range []string{"ABORT", "ROLLBACK"} {
+		trigger := trigger
+		for _, tc := range []struct {
+			name  string
+			run   func(t *testing.T, store *Store)
+			check func(t *testing.T, store *Store)
+		}{
+			{
+				name: "replace configured services",
+				run: func(t *testing.T, store *Store) {
+					if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", []core.Service{service}); err != nil {
+						t.Fatal(err)
+					}
+					seedInventoryStatus(t, store)
+					installHealthAlertDeleteTrigger(t, store, trigger)
+					if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", nil); err != nil {
+						t.Fatal(err)
+					}
+				},
+				check: assertInventoryStatusRemoved,
+			},
+			{
+				name: "replace runtime services",
+				run: func(t *testing.T, store *Store) {
+					if err := store.ReplaceRuntimeServices(ctx, "repo", "services.yml", "configured", []core.Service{service}); err != nil {
+						t.Fatal(err)
+					}
+					seedInventoryStatus(t, store)
+					installHealthAlertDeleteTrigger(t, store, trigger)
+					if err := store.ReplaceRuntimeServices(ctx, "repo", "services.yml", "configured", nil); err != nil {
+						t.Fatal(err)
+					}
+				},
+				check: assertInventoryStatusRemoved,
+			},
+			{
+				name: "prune runtime services",
+				run: func(t *testing.T, store *Store) {
+					if err := store.ReplaceRuntimeServices(ctx, "repo", "services.yml", "configured", []core.Service{service}); err != nil {
+						t.Fatal(err)
+					}
+					seedInventoryStatus(t, store)
+					installHealthAlertDeleteTrigger(t, store, trigger)
+					if err := store.PruneRuntimeServices(ctx, "configured", nil); err != nil {
+						t.Fatal(err)
+					}
+				},
+				check: assertInventoryStatusRemoved,
+			},
+			{
+				name: "finish scan inventory replacement",
+				run: func(t *testing.T, store *Store) {
+					if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+						t.Fatal(err)
+					}
+					scanID, err := store.StartScan(ctx, "repo")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := store.FinishScan(ctx, scanID, "repo", "first", []core.Service{service}, nil); err != nil {
+						t.Fatal(err)
+					}
+					seedInventoryStatus(t, store)
+					installHealthAlertDeleteTrigger(t, store, trigger)
+					scanID, err = store.StartScan(ctx, "repo")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := store.FinishScan(ctx, scanID, "repo", "second", nil, nil); err != nil {
+						t.Fatal(err)
+					}
+				},
+				check: func(t *testing.T, store *Store) {
+					t.Helper()
+					if got := countRows(t, store, `SELECT COUNT(*) FROM scans WHERE commit_sha='second' AND status='ok'`); got != 1 {
+						t.Fatalf("committed scan rows = %d, want 1", got)
+					}
+					if got := countRows(t, store, `SELECT COUNT(*) FROM repositories WHERE name='repo' AND last_commit='second' AND status='ok'`); got != 1 {
+						t.Fatalf("committed repository rows = %d, want 1", got)
+					}
+				},
+			},
+		} {
+			t.Run(trigger+"/"+tc.name, func(t *testing.T) {
+				store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				tc.run(t, store)
+				if !store.isAlertStateLocked() {
+					t.Fatalf("alert state must latch after cleanup trigger %s", trigger)
+				}
+				if got := countRows(t, store, `SELECT COUNT(*) FROM services WHERE id='svc'`); got != 0 {
+					t.Fatalf("core service rows = %d, want 0", got)
+				}
+				tc.check(t, store)
+			})
+		}
+	}
+}
+
+func TestReusedServiceIDResetsAlertStateAfterFailedCleanup(t *testing.T) {
+	for _, restartBeforeObservation := range []bool{false, true} {
+		restartBeforeObservation := restartBeforeObservation
+		name := "same process"
+		if restartBeforeObservation {
+			name = "restart"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "dashboard.db")
+			service := core.Service{ID: "svc", Name: "service", Repository: "repo", SourcePath: "services.yml", Runtime: "configured", Kind: "Service", Health: core.HealthUnknown}
+			options := OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}}
+			store, err := OpenWithOptions(path, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", []core.Service{service}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthUnhealthy, CheckedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.Exec(`CREATE TRIGGER health_alert_states_abort_delete
+BEFORE DELETE ON health_alert_states
+BEGIN
+  SELECT RAISE(ABORT, 'alert cleanup blocked');
+END;`); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", nil); err != nil {
+				t.Fatal(err)
+			}
+			if !store.isAlertStateLocked() {
+				t.Fatal("alert state must latch after forced cleanup failure")
+			}
+			// Replay the same nonempty inventory without repairing the failed
+			// cleanup. The orphan is no longer selectable for deletion, so hygiene
+			// succeeds but must not be required to reset producer state.
+			if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", []core.Service{service}); err != nil {
+				t.Fatal(err)
+			}
+			if store.isAlertStateLocked() {
+				t.Fatal("successful hygiene pass must resume alert observation")
+			}
+			if got := countRows(t, store, `SELECT COUNT(*) FROM health_alert_states WHERE service_id='svc'`); got != 1 {
+				t.Fatalf("reused service ID retained stale alert state rows = %d, want 1 before producer replacement", got)
+			}
+			if restartBeforeObservation {
+				// The trigger deliberately simulates failed hygiene above. Remove it
+				// only before reopening, because startup correctly rejects unknown
+				// alert-table triggers.
+				if _, err := store.db.Exec(`DROP TRIGGER health_alert_states_abort_delete`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if restartBeforeObservation {
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store, err = OpenWithOptions(path, options)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthHealthy, CheckedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.ListUndeliveredAlertEvents(ctx, 0); err != nil {
+				t.Fatal(err)
+			} else if len(got) != 0 {
+				t.Fatalf("reused service ID emitted an event instead of a silent fresh baseline: %#v", got)
+			}
+			if got := countRows(t, store, `SELECT COUNT(*) FROM health_alert_states WHERE service_id='svc' AND stable_health='healthy' AND service_incarnation=(SELECT incarnation FROM services WHERE id='svc')`); got != 1 {
+				t.Fatalf("reused service ID fresh baseline rows = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestDurableAlertLockSurvivesRecoveredHealthAlertCleanup(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{
+		HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	service := core.Service{ID: "svc", Name: "service", Repository: "repo", SourcePath: "services.yml", Runtime: "configured", Kind: "Service", Health: core.HealthUnknown}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: "target", Health: core.HealthUnhealthy, CheckedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{Kind: "test", ServiceID: service.ID, NewState: "unhealthy", DedupeKey: "durable-cleanup-lock"}, []string{"test"}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+
+	store.lockAlertState("alert state locked: test durable migration failure; operator reset required")
+	if _, err := store.db.Exec(`CREATE TRIGGER health_alert_states_abort_delete
+BEFORE DELETE ON health_alert_states
+BEGIN
+  SELECT RAISE(ABORT, 'alert cleanup blocked');
+END;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !store.isAlertStateLocked() {
+		t.Fatal("durable and cleanup components must lock alerting after cleanup failure")
+	}
+	// The replacement makes the failed-cleanup row non-orphaned, so this later
+	// pass succeeds with zero rows deleted while the cleanup trigger remains.
+	if err := store.ReplaceConfiguredServices(ctx, "repo", "services.yml", []core.Service{service}); err != nil {
+		t.Fatal(err)
+	}
+	if !store.isAlertStateLocked() {
+		t.Fatal("successful zero-row cleanup must not clear a durable alert lock")
+	}
+
+	if _, err := store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 1); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("claim after cleanup recovery err = %v, want ErrAlertStateLocked", err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); !errors.Is(err, ErrAlertStateLocked) {
+		t.Fatalf("record after cleanup recovery err = %v, want ErrAlertStateLocked", err)
+	}
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: "target", Health: core.HealthHealthy, CheckedAt: time.Now().UTC().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events`); got != 1 {
+		t.Fatalf("production after cleanup recovery created %d alert events, want only the pre-lock event", got)
+	}
+}
+
+func TestConcurrentHealthAlertCleanupFailureRemainsLocked(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	olderPaused := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	var pauseOlder sync.Once
+	store.afterSuccessfulHealthAlertCleanup = func() {
+		pauseOlder.Do(func() {
+			close(olderPaused)
+			<-releaseOlder
+		})
+	}
+
+	olderDone := make(chan struct{})
+	go func() {
+		store.reconcileHealthAlertStates(ctx)
+		close(olderDone)
+	}()
+	<-olderPaused
+
+	if _, err := store.db.Exec(`INSERT INTO health_alert_states(service_id, stable_health, candidate_health, candidate_samples) VALUES('orphan', 'healthy', 'healthy', 0);
+CREATE TRIGGER health_alert_states_abort_delete
+BEFORE DELETE ON health_alert_states
+BEGIN
+  SELECT RAISE(ABORT, 'newer cleanup blocked');
+END;`); err != nil {
+		t.Fatal(err)
+	}
+	store.reconcileHealthAlertStates(ctx)
+	if !store.isAlertStateLocked() {
+		t.Fatal("newer cleanup failure must lock alerting before the older success is released")
+	}
+	close(releaseOlder)
+	<-olderDone
+	if !store.isAlertStateLocked() {
+		t.Fatal("newer cleanup failure must remain locked after the older success completes")
+	}
+}
+
+func assertInventoryStatusRemoved(t *testing.T, store *Store) {
+	t.Helper()
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_results WHERE service_id='svc'`); got != 0 {
+		t.Fatalf("core status result rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc'`); got != 0 {
+		t.Fatalf("core status history rows = %d, want 0", got)
+	}
+}
+
+func seedInventoryStatus(t *testing.T, store *Store) {
+	t.Helper()
+	if err := store.UpsertStatus(context.Background(), core.StatusResult{
+		ServiceID: "svc",
+		Target:    "target",
+		Health:    core.HealthHealthy,
+		CheckedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func installHealthAlertDeleteTrigger(t *testing.T, store *Store, trigger string) {
+	t.Helper()
+	if trigger != "ABORT" && trigger != "ROLLBACK" {
+		t.Fatalf("unsupported trigger action %q", trigger)
+	}
+	if _, err := store.db.Exec(fmt.Sprintf(`INSERT INTO health_alert_states(service_id, stable_health, candidate_health, candidate_samples) VALUES('svc', 'healthy', 'healthy', 0);
+CREATE TRIGGER health_alert_states_abort_delete
+BEFORE DELETE ON health_alert_states
+BEGIN
+  SELECT RAISE(%s, 'alert cleanup blocked');
+END;`, trigger)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplaceConfiguredServicesRemovesCoreInventoryWhenAlertStateUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		unprepare func(t *testing.T, path string)
+	}{
+		{
+			name: "startup locked without health alert states table",
+			unprepare: func(t *testing.T, path string) {
+				t.Helper()
+				db, err := sql.Open("sqlite3", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(`DROP TABLE health_alert_states`); err != nil {
+					_ = db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(filepath.Dir(path), "alert-dedupe.key")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "incompatible health alert states table without service id",
+			unprepare: func(t *testing.T, path string) {
+				t.Helper()
+				db, err := sql.Open("sqlite3", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(`DROP TABLE health_alert_states; CREATE TABLE health_alert_states (state TEXT NOT NULL)`); err != nil {
+					_ = db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "dashboard.db")
+			store, err := OpenWithOptions(path, OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := core.Service{ID: "svc", Name: "service", Repository: "configured", SourcePath: "services.yml", Runtime: "configured", Kind: "Service", Health: core.HealthUnknown}
+			if err := store.ReplaceConfiguredServices(ctx, "configured", "services.yml", []core.Service{service}); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			// Persist a keyed alert row so removing the key latches startup before
+			// alert-only migrations can recreate the table.
+			if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: "target", Health: core.HealthHealthy, CheckedAt: time.Now().UTC()}); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: "target", Health: core.HealthUnhealthy, CheckedAt: time.Now().UTC().Add(time.Second)}); err != nil {
+				_ = store.Close()
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			tc.unprepare(t, path)
+
+			store, err = OpenWithOptions(path, OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if !store.isAlertStateLocked() {
+				t.Fatal("alert state must remain latched")
+			}
+			if err := store.ReplaceConfiguredServices(ctx, "configured", "services.yml", nil); err != nil {
+				t.Fatalf("remove configured service with unavailable alert state: %v", err)
+			}
+			if got := countRows(t, store, `SELECT COUNT(*) FROM services WHERE id='svc'`); got != 0 {
+				t.Fatalf("core service rows = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRouteReplacementObservesMergedHealthAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: oldTarget, Health: core.HealthUnhealthy, CheckedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	// Insert the collision directly: it is the replacement transaction, not a
+	// monitor write, that must observe the resulting recovered rollup.
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO status_results(service_id, target, health, message, checked_at) VALUES(?, ?, ?, '', ?)`, "svc", newTarget, string(core.HealthHealthy), base.Add(time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListUndeliveredAlertEvents(ctx, 0)
+	if err != nil || len(events) != 1 || events[0].Kind != "health.recovery" {
+		t.Fatalf("replacement recovery event = %#v, %v", events, err)
+	}
+}
+
+func TestFinishScanRouteReplacementObservesMergedHealthAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "old", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "routes: " + oldRoute, Health: core.HealthUnhealthy, CheckedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO status_results(service_id, target, health, message, checked_at) VALUES(?, ?, ?, '', ?)`, "svc", "routes: "+newRoute, string(core.HealthHealthy), base.Add(time.Minute).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	service.Exposure = []string{newRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetReplacements(ctx, scanID, "repo", "new", []core.Service{service}, nil, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListUndeliveredAlertEvents(ctx, 0)
+	if err != nil || len(events) != 1 || events[0].Kind != "health.recovery" {
+		t.Fatalf("scan replacement recovery event = %#v, %v", events, err)
+	}
+}
+
+func TestHealthAlertProducerCooldownDisabledAndNotApplicable(t *testing.T) {
+	ctx := context.Background()
+	newStore := func(config HealthAlertProducerConfig) *Store {
+		t.Helper()
+		store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{HealthAlerts: config})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		return store
+	}
+	write := func(store *Store, health core.HealthState, at time.Time) {
+		t.Helper()
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: health, CheckedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disabled := newStore(HealthAlertProducerConfig{})
+	write(disabled, core.HealthHealthy, time.Now().UTC())
+	write(disabled, core.HealthUnhealthy, time.Now().UTC().Add(time.Minute))
+	if got, err := disabled.ListUndeliveredAlertEvents(ctx, 0); err != nil || len(got) != 0 {
+		t.Fatalf("disabled events = %#v, %v", got, err)
+	}
+	store := newStore(HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, Cooldown: time.Hour, StabilitySamples: 1})
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	write(store, core.HealthHealthy, base)
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "ignored", Health: core.HealthNotApplicable, CheckedAt: base.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.ListUndeliveredAlertEvents(ctx, 0); err != nil || len(got) != 0 {
+		t.Fatalf("not-applicable events = %#v, %v", got, err)
+	}
+	write(store, core.HealthUnhealthy, base.Add(2*time.Minute))
+	deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker", time.Minute, 10)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("deliveries = %#v, %v", deliveries, err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, deliveries[0].Dispatch.ID, "worker", deliveries[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	write(store, core.HealthHealthy, base.Add(3*time.Minute))
+	write(store, core.HealthUnhealthy, base.Add(4*time.Minute))
+	if got, err := store.ListUndeliveredAlertEvents(ctx, 0); err != nil || len(got) != 1 {
+		t.Fatalf("cooldown events = %#v, %v", got, err)
+	}
+}
+
+func TestHealthAlertProducerDebounceRejectsReplayedObservationAndKeepsSilentFailureStart(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenWithOptions(filepath.Join(t.TempDir(), "dashboard.db"), OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, Debounce: 2 * time.Minute, StabilitySamples: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	write := func(health core.HealthState, at time.Time) {
+		t.Helper()
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: health, CheckedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(core.HealthHealthy, base)
+	write(core.HealthUnhealthy, base.Add(time.Minute))
+	write(core.HealthUnhealthy, base.Add(time.Minute)) // same aggregate identity: no second confirmation
+	write(core.HealthUnhealthy, base.Add(2*time.Minute))
+	if events, err := store.ListUndeliveredAlertEvents(ctx, 0); err != nil || len(events) != 0 {
+		t.Fatalf("premature events = %#v, %v", events, err)
+	}
+	write(core.HealthUnhealthy, base.Add(3*time.Minute))
+	events, err := store.ListUndeliveredAlertEvents(ctx, 0)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("confirmed events = %#v, %v", events, err)
+	}
+
+	failing, err := OpenWithOptions(filepath.Join(t.TempDir(), "failing.db"), OpenOptions{HealthAlerts: HealthAlertProducerConfig{Enabled: true, Sinks: []string{"test"}, StabilitySamples: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failing.Close()
+	if err := failing.UpsertStatus(ctx, core.StatusResult{ServiceID: "failed-first", Target: "target", Health: core.HealthUnhealthy, CheckedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := failing.UpsertStatus(ctx, core.StatusResult{ServiceID: "failed-first", Target: "target", Health: core.HealthHealthy, CheckedAt: base.Add(5 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	events, err = failing.ListUndeliveredAlertEvents(ctx, 0)
+	if err != nil || len(events) != 1 || !strings.Contains(events[0].Reason, "recovered after 5m0s") {
+		t.Fatalf("silent failing baseline recovery = %#v, %v", events, err)
+	}
+}
+
 func TestFinishScanMigratesRouteTargetIdentityAcrossState(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
