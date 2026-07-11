@@ -99,6 +99,52 @@ func TestHTTPRouteCheckPersistsRouteStatuses(t *testing.T) {
 	}
 }
 
+func TestHTTPRouteCheckSkipsMigratedRouteOverride(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldRoute, newRoute := "http://10.10.10.127", "http://10.10.10.127:8080"
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "routes: " + oldRoute, Health: core.HealthHealthy, CheckedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, "svc", "routes: "+oldRoute, true); err != nil {
+		t.Fatal(err)
+	}
+	// The storage migration is the successful-rescan handoff; monitor then sees
+	// the replacement identity and must not put it back on the probe queue.
+	if err := store.MigrateRouteTargetReplacements(ctx, []storage.RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int64
+	client := &http.Client{Transport: routeTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return routeResponse(req, http.StatusOK), nil
+	})}
+	monitor := New(config.Config{}, store, slog.Default())
+	if err := monitor.checkHTTPRoutesWithClient(ctx, config.HTTPRouteTarget{Name: "routes"}, []core.Service{{ID: "svc", Exposure: []string{newRoute}}}, client); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("HTTP requests = %d, want 0", requests.Load())
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range statuses {
+		if status.Target == "routes: "+oldRoute {
+			t.Fatalf("old target remained: %#v", status)
+		}
+		if status.Target == "routes: "+newRoute && status.Health != core.HealthNotApplicable {
+			t.Fatalf("migrated status = %#v, want not applicable", status)
+		}
+	}
+}
+
 func TestHTTPRouteCheckRecordsTimeoutForEveryQueuedRoute(t *testing.T) {
 	t.Parallel()
 	store, err := storage.Open(t.TempDir() + "/dashboard.db")

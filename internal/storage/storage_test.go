@@ -103,6 +103,685 @@ func TestStorePersistsSummary(t *testing.T) {
 	}
 }
 
+func TestFinishScanMigratesRouteTargetIdentityAcrossState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, newRoute := "http://10.10.10.127", "http://10.10.10.127:8080"
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "old", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	oldTarget, newTarget := "custom: "+oldRoute, "custom: "+newRoute
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO monitor_overrides(service_id,target,not_applicable,updated_at) VALUES(?,?,1,?)`, []any{"svc", oldTarget, "2026-07-10T10:00:00Z"}},
+		{`INSERT INTO status_results(service_id,target,health,message,checked_at) VALUES(?,?, 'healthy','old',?)`, []any{"svc", oldTarget, "2026-07-10T09:00:00Z"}},
+		{`INSERT INTO status_results(service_id,target,health,message,checked_at) VALUES(?,?, 'unhealthy','newer',?)`, []any{"svc", newTarget, "2026-07-10T11:00:00Z"}},
+		{`INSERT INTO status_history(service_id,target,health,message,checked_at) VALUES(?,?, 'healthy','old history',?)`, []any{"svc", oldTarget, "2026-07-10T09:00:00Z"}},
+	} {
+		if _, err := store.db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.Exposure = []string{newRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.FinishScanWithRouteTargetReplacements(ctx, scanID, "repo", "new", []core.Service{service}, nil,
+		[]RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, []config.HTTPRouteTarget{{Name: "custom"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM monitor_overrides WHERE service_id='svc' AND target='custom: http://10.10.10.127'`); got != 0 {
+		t.Fatalf("old override rows = %d, want 0", got)
+	}
+	var override, health, historyHealth, historyMessage string
+	if err := store.db.QueryRowContext(ctx, `SELECT not_applicable, (SELECT health FROM status_results WHERE service_id='svc' AND target=?) FROM monitor_overrides WHERE service_id='svc' AND target=?`, newTarget, newTarget).Scan(&override, &health); err != nil {
+		t.Fatal(err)
+	}
+	if override != "1" || health != string(core.HealthUnhealthy) {
+		t.Fatalf("migrated override/status = %q/%q, want active/unhealthy payload preserved", override, health)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT health, message FROM status_history WHERE service_id='svc' AND target=?`, newTarget).Scan(&historyHealth, &historyMessage); err != nil {
+		t.Fatal(err)
+	}
+	if historyHealth != string(core.HealthHealthy) || historyMessage != "old history" {
+		t.Fatalf("migrated history = %q/%q, want byte-equivalent payload", historyHealth, historyMessage)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc' AND target='custom: http://10.10.10.127:8080'`); got != 1 {
+		t.Fatalf("retargeted history = %d, want 1", got)
+	}
+}
+
+func TestRouteTargetMigrationRetargetsOnlyMutableAlertsAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldTarget, newTarget := "routes: https://app.example.test", "routes: https://app.example.test:8443"
+	for _, status := range []string{AlertEventStatusPending, AlertEventStatusFailed, AlertEventStatusDelivered} {
+		key := "health:svc:" + oldTarget + ":" + status
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, oldTarget, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replacement := []RouteTargetReplacement{{ServiceID: "svc", OldRoute: "https://app.example.test", NewRoute: "https://app.example.test:8443"}}
+	if err := store.MigrateRouteTargetReplacements(ctx, replacement, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, replacement, nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.db.QueryContext(ctx, `SELECT target, dedupe_key, status FROM alert_events ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for _, want := range []struct{ target, status string }{{newTarget, AlertEventStatusPending}, {newTarget, AlertEventStatusFailed}, {oldTarget, AlertEventStatusDelivered}} {
+		if !rows.Next() {
+			t.Fatal("missing alert row")
+		}
+		var target, key, status string
+		if err := rows.Scan(&target, &key, &status); err != nil {
+			t.Fatal(err)
+		}
+		if target != want.target || status != want.status {
+			t.Fatalf("alert = %q/%q, want %q/%q", target, status, want.target, want.status)
+		}
+		if status != AlertEventStatusDelivered && !strings.Contains(key, newTarget) {
+			t.Fatalf("mutable dedupe key = %q, want new identity", key)
+		}
+	}
+}
+
+func TestRouteTargetMigrationScopesAlertsToService(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldTarget, newTarget := "routes: https://app.example.test", "routes: https://app.example.test:8443"
+	for _, serviceID := range []string{"migrated", "other"} {
+		key := "health:" + serviceID + ":" + oldTarget
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health',?,?,?,?,?,?,?,?)`, serviceID, oldTarget, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "migrated", OldRoute: "https://app.example.test", NewRoute: "https://app.example.test:8443"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for serviceID, wantTarget := range map[string]string{"migrated": newTarget, "other": oldTarget} {
+		var target string
+		if err := store.db.QueryRowContext(ctx, `SELECT target FROM alert_events WHERE service_id=?`, serviceID).Scan(&target); err != nil {
+			t.Fatal(err)
+		}
+		if target != wantTarget {
+			t.Fatalf("alert target for %s = %q, want %q", serviceID, target, wantTarget)
+		}
+	}
+}
+
+func TestRouteTargetMigrationDefersAlertsUntilAlertSafetyValidationRecovers(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		breakKey func(*Store)
+	}{
+		{name: "missing key", breakKey: func(store *Store) { store.alertDedupeKey = nil }},
+		{name: "mismatched key", breakKey: func(store *Store) { store.alertDedupeKey = []byte("not-the-sidecar-key") }},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "dashboard.db")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldTarget, newTarget := "routes: https://app.example.test", "routes: https://app.example.test:8443"
+			key := "health:svc:" + oldTarget
+			if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, oldTarget, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending); err != nil {
+				t.Fatal(err)
+			}
+			var before string
+			if err := store.db.QueryRowContext(ctx, `SELECT target || '|' || dedupe_key || '|' || dedupe_hash || '|' || status FROM alert_events WHERE service_id='svc'`).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			scenario.breakKey(store)
+			if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: "https://app.example.test", NewRoute: "https://app.example.test:8443"}}, nil); err != nil {
+				t.Fatalf("route migration should not be held hostage by alert safety validation: %v", err)
+			}
+			var after string
+			if err := store.db.QueryRowContext(ctx, `SELECT target || '|' || dedupe_key || '|' || dedupe_hash || '|' || status FROM alert_events WHERE service_id='svc'`).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if after != before {
+				t.Fatalf("alert row changed while alert state was unsafe: got %q, want byte-identical %q", after, before)
+			}
+			if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations WHERE service_id='svc' AND old_target='routes: https://app.example.test' AND new_target='routes: https://app.example.test:8443'`); got != 1 {
+				t.Fatalf("deferred reconciliations = %d, want 1", got)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err := store.MigrateRouteTargetReplacements(ctx, nil, nil); err != nil {
+				t.Fatalf("apply deferred alert reconciliation: %v", err)
+			}
+			var target string
+			if err := store.db.QueryRowContext(ctx, `SELECT target FROM alert_events WHERE service_id='svc'`).Scan(&target); err != nil {
+				t.Fatal(err)
+			}
+			if target != newTarget {
+				t.Fatalf("deferred alert target = %q, want %q", target, newTarget)
+			}
+		})
+	}
+}
+
+func TestFinishScanRouteTargetMigrationReconcilesPendingAlertCollision(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, newRoute := "https://app.example.test", "https://app.example.test:8443"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "old", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []struct{ target, key, sink string }{
+		{oldTarget, "health:svc:" + oldTarget, "old-sink"},
+		{newTarget, "health:svc:" + newTarget, "new-sink"},
+	} {
+		result, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, event.target, "unhealthy", event.key, store.alertDedupeHash(event.key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		eventID, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,updated_at,updated_at_ns) VALUES(?,?,?, ?, ?)`, eventID, event.sink, AlertDispatchStatusPending, "2026-07-10T10:00:00Z", int64(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.Exposure = []string{newRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetReplacements(ctx, scanID, "repo", "new", []core.Service{service}, nil, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatalf("FinishScan collision reconciliation: %v", err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE target='routes: https://app.example.test:8443' AND status='pending'`); got != 1 {
+		t.Fatalf("pending destination events = %d, want 1", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_dispatches d JOIN alert_events e ON e.id=d.event_id WHERE e.target='routes: https://app.example.test:8443' AND e.status='pending' AND d.status='pending'`); got != 2 {
+		t.Fatalf("keeper pending dispatches = %d, want merged 2", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM alert_events WHERE target='routes: https://app.example.test:8443' AND status='reset'`); got != 1 {
+		t.Fatalf("terminalized duplicate events = %d, want 1", got)
+	}
+}
+
+func TestRouteTargetMigrationReplaysDeferredAlertChainsToFixedPoint(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// The second edge sorts before the first: a one-pass lexical replay would
+	// discard a->c before a later z->a migration can reach it.
+	oldRoute, middleRoute, newRoute := "https://z.example.test", "https://a.example.test", "https://c.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	key := "health:svc:" + oldTarget
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, oldTarget, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending); err != nil {
+		t.Fatal(err)
+	}
+	store.alertDedupeKey = nil
+	replacements := []RouteTargetReplacement{
+		{ServiceID: "svc", OldRoute: oldRoute, NewRoute: middleRoute},
+		{ServiceID: "svc", OldRoute: middleRoute, NewRoute: newRoute},
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, replacements, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.MigrateRouteTargetReplacements(ctx, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var target string
+	if err := store.db.QueryRowContext(ctx, `SELECT target FROM alert_events WHERE service_id='svc'`).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if target != newTarget {
+		t.Fatalf("deferred chain target = %q, want %q", target, newTarget)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations`); got != 0 {
+		t.Fatalf("deferred chain rows = %d, want 0", got)
+	}
+}
+
+func TestRouteTargetMigrationCollisionPreservesClaimedDestinationDispatch(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	var oldEvent, destinationEvent int64
+	for _, event := range []struct {
+		target string
+		status string
+	}{{oldTarget, AlertEventStatusPending}, {newTarget, AlertEventStatusPending}} {
+		key := "health:svc:" + event.target
+		result, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, event.target, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), event.status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.target == oldTarget {
+			oldEvent = id
+		} else {
+			destinationEvent = id
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,updated_at,updated_at_ns) VALUES(?, 'discord', ?, ?, ?)`, oldEvent, AlertDispatchStatusPending, "2026-07-10T10:00:00Z", int64(1)); err != nil {
+		t.Fatal(err)
+	}
+	lease := time.Now().UTC().Add(time.Hour)
+	result, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,worker_id,claim_id,lease_expires_at,lease_expires_at_ns,updated_at,updated_at_ns) VALUES(?, 'discord', ?, 'worker-a', 'claim-a', ?, ?, ?, ?)`, destinationEvent, AlertDispatchStatusInFlight, lease.Format(time.RFC3339Nano), lease.UnixNano(), "2026-07-10T10:00:00Z", int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var eventID int64
+	var status, workerID, claimID string
+	if err := store.db.QueryRowContext(ctx, `SELECT event_id, status, worker_id, claim_id FROM alert_dispatches WHERE id=?`, claimedID).Scan(&eventID, &status, &workerID, &claimID); err != nil {
+		t.Fatal(err)
+	}
+	if eventID != destinationEvent || status != AlertDispatchStatusInFlight || workerID != "worker-a" || claimID != "claim-a" {
+		t.Fatalf("claimed dispatch = event=%d status=%q worker=%q claim=%q, want preserved destination claim", eventID, status, workerID, claimID)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations`); got != 1 {
+		t.Fatalf("deferred collision edges = %d, want 1", got)
+	}
+}
+
+func TestRouteTargetMigrationDefersClaimedCollisionWithoutRewritingTerminalKeeper(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	var keeperID, destinationID int64
+	for _, target := range []string{oldTarget, newTarget} {
+		key := "health:svc:" + target
+		result, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, target, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target == oldTarget {
+			keeperID = id
+		} else {
+			destinationID = id
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,attempts,last_error,delivered_at,delivered_at_ns,updated_at,updated_at_ns) VALUES(?, 'discord', 'delivered', 3, 'delivery audit', '2026-07-10T10:00:01Z', 2, '2026-07-10T10:00:01Z', 2), (?, 'webhook', 'pending', 0, '', NULL, NULL, '2026-07-10T10:00:02Z', 3)`, keeperID, keeperID); err != nil {
+		t.Fatal(err)
+	}
+	lease := time.Now().UTC().Add(time.Hour)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,worker_id,claim_id,lease_expires_at,lease_expires_at_ns,attempts,last_error,updated_at,updated_at_ns) VALUES(?, 'discord', 'in_flight', 'worker-a', 'claim-a', ?, ?, 2, 'claimed delivery', '2026-07-10T10:00:03Z', 4)`, destinationID, lease.Format(time.RFC3339Nano), lease.UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	var before string
+	if err := store.db.QueryRowContext(ctx, `SELECT printf('%d|%d|%s|%s|%s|%d|%s|%s|%d|%s|%d', id,event_id,status,worker_id,claim_id,attempts,last_error,COALESCE(delivered_at,''),COALESCE(delivered_at_ns,0),updated_at,updated_at_ns) FROM alert_dispatches WHERE event_id=? AND sink='discord'`, keeperID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatalf("committed migration with claimed collision: %v", err)
+	}
+	var after string
+	if err := store.db.QueryRowContext(ctx, `SELECT printf('%d|%d|%s|%s|%s|%d|%s|%s|%d|%s|%d', id,event_id,status,worker_id,claim_id,attempts,last_error,COALESCE(delivered_at,''),COALESCE(delivered_at_ns,0),updated_at,updated_at_ns) FROM alert_dispatches WHERE event_id=? AND sink='discord'`, keeperID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("terminal keeper dispatch changed: got %q, want byte-identical %q", after, before)
+	}
+	var deferred int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations WHERE service_id='svc' AND old_target=? AND new_target=?`, oldTarget, newTarget).Scan(&deferred); err != nil {
+		t.Fatal(err)
+	}
+	if deferred != 1 {
+		t.Fatalf("deferred collision edges = %d, want 1", deferred)
+	}
+}
+
+func TestFinishScanDefersDeadLetteredKeeperSameSinkPendingDestination(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "old", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]int64{}
+	for _, target := range []string{oldTarget, newTarget} {
+		key := "health:svc:" + target
+		result, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, target, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[target], err = result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,attempts,last_error,updated_at,updated_at_ns) VALUES(?, 'discord', 'dead_lettered', 2, 'terminal diagnostic', '2026-07-10T10:00:01Z', 2), (?, 'webhook', 'pending', 0, '', '2026-07-10T10:00:02Z', 3), (?, 'discord', 'pending', 0, '', '2026-07-10T10:00:03Z', 4)`, ids[oldTarget], ids[oldTarget], ids[newTarget]); err != nil {
+		t.Fatal(err)
+	}
+	terminalRow := func(eventID int64, sink string) string {
+		var row string
+		if err := store.db.QueryRowContext(ctx, `SELECT printf('%d|%d|%s|%s|%d|%s|%s|%d|%s|%d', id,event_id,status,worker_id,attempts,last_error,COALESCE(delivered_at,''),COALESCE(delivered_at_ns,0),updated_at,updated_at_ns) FROM alert_dispatches WHERE event_id=? AND sink=?`, eventID, sink).Scan(&row); err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+	deadLetteredBefore := terminalRow(ids[oldTarget], "discord")
+	service.Exposure = []string{newRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetReplacements(ctx, scanID, "repo", "new", []core.Service{service}, nil, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatalf("scan with dead-lettered keeper collision: %v", err)
+	}
+	if got := terminalRow(ids[oldTarget], "discord"); got != deadLetteredBefore {
+		t.Fatalf("dead-lettered keeper changed: got %q, want byte-identical %q", got, deadLetteredBefore)
+	}
+	var pendingDestination int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_dispatches WHERE event_id=? AND sink='discord' AND status='pending'`, ids[newTarget]).Scan(&pendingDestination); err != nil {
+		t.Fatal(err)
+	}
+	if pendingDestination != 1 {
+		t.Fatalf("pending destination dispatches = %d, want claimable 1", pendingDestination)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations`); got != 1 {
+		t.Fatalf("deferred collision edges = %d, want 1", got)
+	}
+	deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 {
+		t.Fatalf("claimable deliveries = %d, want keeper webhook plus destination discord", len(deliveries))
+	}
+	for _, delivery := range deliveries {
+		if _, err := store.RecordAlertDispatchResult(ctx, delivery.Dispatch.ID, "worker-a", delivery.Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destinationDeliveredBefore := terminalRow(ids[newTarget], "discord")
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "settled", []core.Service{service}, nil); err != nil {
+		t.Fatalf("settled reconciliation scan: %v", err)
+	}
+	if got := terminalRow(ids[oldTarget], "discord"); got != deadLetteredBefore {
+		t.Fatalf("dead-lettered keeper changed after reconciliation: got %q, want %q", got, deadLetteredBefore)
+	}
+	if got := terminalRow(ids[newTarget], "discord"); got != destinationDeliveredBefore {
+		t.Fatalf("delivered destination changed after reconciliation: got %q, want %q", got, destinationDeliveredBefore)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations`); got != 0 {
+		t.Fatalf("deferred collision edges = %d, want 0 after terminal reconciliation", got)
+	}
+}
+
+func TestFinishScanDefersDualClaimedSameSinkCollisionUntilTerminal(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, newRoute := "https://old.example.test", "https://new.example.test"
+	oldTarget, newTarget := "routes: "+oldRoute, "routes: "+newRoute
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "old", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]int64{}
+	for _, target := range []string{oldTarget, newTarget} {
+		key := "health:svc:" + target
+		result, err := store.db.ExecContext(ctx, `INSERT INTO alert_events(kind,service_id,target,new_state,dedupe_key,dedupe_hash,created_at,created_at_ns,status) VALUES('health','svc',?,?,?,?,?,?,?)`, target, "unhealthy", key, store.alertDedupeHash(key), "2026-07-10T10:00:00Z", int64(1), AlertEventStatusPending)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[target], err = result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	lease := time.Now().UTC().Add(time.Hour)
+	for target, claimID := range map[string]string{oldTarget: "claim-old", newTarget: "claim-new"} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO alert_dispatches(event_id,sink,status,worker_id,claim_id,lease_expires_at,lease_expires_at_ns,updated_at,updated_at_ns) VALUES(?, 'discord', 'in_flight', 'worker-a', ?, ?, ?, '2026-07-10T10:00:00Z', 1)`, ids[target], claimID, lease.Format(time.RFC3339Nano), lease.UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.Exposure = []string{newRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetReplacements(ctx, scanID, "repo", "new", []core.Service{service}, nil, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: newRoute}}, nil); err != nil {
+		t.Fatalf("scan with dual claimed collision: %v", err)
+	}
+	for _, target := range []string{oldTarget, newTarget} {
+		var targetAfter, hash, status, claimID string
+		if err := store.db.QueryRowContext(ctx, `SELECT e.target,e.dedupe_hash,d.status,d.claim_id FROM alert_events e JOIN alert_dispatches d ON d.event_id=e.id WHERE e.id=?`, ids[target]).Scan(&targetAfter, &hash, &status, &claimID); err != nil {
+			t.Fatal(err)
+		}
+		if targetAfter != target || hash != store.alertDedupeHash("health:svc:"+target) || status != AlertDispatchStatusInFlight || claimID == "" {
+			t.Fatalf("claimed event after deferred scan = target:%q hash:%q status:%q claim:%q, want untouched", targetAfter, hash, status, claimID)
+		}
+	}
+	if deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-b", time.Minute, 10); err != nil || len(deliveries) != 0 {
+		t.Fatalf("claim after deferred scan = %#v, err=%v; want no newly claimable dispatch", deliveries, err)
+	}
+	var destinationDispatchID int64
+	if err := store.db.QueryRowContext(ctx, `SELECT id FROM alert_dispatches WHERE event_id=?`, ids[newTarget]).Scan(&destinationDispatchID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, destinationDispatchID, "worker-a", "claim-new", AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatalf("terminalize destination claim: %v", err)
+	}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "reconciled", []core.Service{service}, nil); err != nil {
+		t.Fatalf("fixed-point reconciliation scan: %v", err)
+	}
+	var reconciled int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_events WHERE id=? AND target=? AND status='pending'`, ids[oldTarget], newTarget).Scan(&reconciled); err != nil {
+		t.Fatal(err)
+	}
+	if reconciled != 1 {
+		t.Fatalf("reconciled keeper events = %d, want 1", reconciled)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM deferred_alert_route_reconciliations`); got != 0 {
+		t.Fatalf("deferred collision edges = %d, want 0 after terminal reconciliation", got)
+	}
+}
+
+func TestRouteTargetExclusionRetainsOnlyAmbiguousStaleTarget(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	oldTarget, otherTarget := "routes: https://old.example.test", "routes: https://gone.example.test"
+	for _, target := range []string{oldTarget, otherTarget} {
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: target, Health: core.HealthHealthy, Message: target, CheckedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetRouteTargetExclusions(ctx, []RouteTargetExclusion{{ServiceID: "svc", OldRoute: "https://old.example.test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PruneStatusTargetsFromKnown(ctx, "svc", "routes", "routes: ", nil, map[string]struct{}{oldTarget: {}, otherTarget: {}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc' AND target='routes: https://old.example.test'`); got != 1 {
+		t.Fatalf("ambiguous history rows = %d, want 1", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc' AND target='routes: https://gone.example.test'`); got != 0 {
+		t.Fatalf("ordinary stale history rows = %d, want 0", got)
+	}
+}
+
+func TestFinishScanReconcilesResolvedRouteTargetExclusion(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureRepositories(ctx, []config.RepositoryConfig{{Name: "repo", URL: "https://example.test/repo", DefaultRef: "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	oldRoute, keptRoute, droppedRoute := "https://app.example.test", "https://app.example.test:8443", "https://app.example.test:9443"
+	oldTarget, keptTarget, staleTarget := "routes: "+oldRoute, "routes: "+keptRoute, "routes: https://gone.example.test"
+	service := core.Service{ID: "svc", Name: "svc", Repository: "repo", Runtime: "compose", Exposure: []string{oldRoute}}
+	scanID, err := store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "repo", "one", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{oldTarget, staleTarget} {
+		if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: target, Health: core.HealthHealthy, Message: "observed " + target, CheckedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.Exposure = []string{keptRoute, droppedRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetChanges(ctx, scanID, "repo", "two", []core.Service{service}, nil, nil, []RouteTargetExclusion{{ServiceID: "svc", OldRoute: oldRoute}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	service.Exposure = []string{keptRoute}
+	scanID, err = store.StartScan(ctx, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScanWithRouteTargetChanges(ctx, scanID, "repo", "three", []core.Service{service}, nil, []RouteTargetReplacement{{ServiceID: "svc", OldRoute: oldRoute, NewRoute: keptRoute}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM route_target_exclusions WHERE service_id='svc' AND old_route='https://app.example.test'`); got != 0 {
+		t.Fatalf("resolved exclusions = %d, want 0", got)
+	}
+	if err := store.PruneStatusTargetsFromKnown(ctx, "svc", "routes", "routes: ", []string{keptTarget}, map[string]struct{}{keptTarget: {}, staleTarget: {}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc' AND target='routes: https://gone.example.test'`); got != 0 {
+		t.Fatalf("stale history rows = %d, want 0", got)
+	}
+	if got := countRows(t, store, `SELECT COUNT(*) FROM status_history WHERE service_id='svc' AND target='routes: https://app.example.test:8443'`); got != 1 {
+		t.Fatalf("migrated history rows = %d, want 1", got)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Services) != 1 || summary.Services[0].Health != core.HealthHealthy {
+		t.Fatalf("aggregate service health = %#v, want healthy", summary.Services)
+	}
+}
+
 func TestSummaryReturnsDecodeErrorWithRowContext(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1511,8 +2190,8 @@ WHERE service_id='svc-app' AND target='routes: https://app.example.test'
 	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test'"); got != 3 {
 		t.Fatalf("canonical history rows = %d, want 3", got)
 	}
-	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test' AND health='not_applicable'"); got != 3 {
-		t.Fatalf("canonical not_applicable history rows = %d, want 3", got)
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test' AND health='not_applicable'"); got != 0 {
+		t.Fatalf("canonical history rows rewritten by override = %d, want 0", got)
 	}
 	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE target='routes: https://app.example.test/admin/'"); got != 1 {
 		t.Fatalf("non-root trailing-slash history rows = %d, want 1", got)
@@ -1626,8 +2305,14 @@ WHERE service_id='svc-app' AND target=?
 	if got := countRows(t, store, "SELECT COUNT(*) FROM status_results WHERE service_id='svc-app' AND target='svc-http: https://app.example.test' AND health='not_applicable' AND message='not applicable'"); got != 1 {
 		t.Fatalf("canonical custom not_applicable status rows = %d, want 1", got)
 	}
-	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-app' AND target='svc-http: https://app.example.test' AND health='not_applicable' AND message='not applicable'"); got != 1 {
-		t.Fatalf("canonical custom not_applicable history rows = %d, want 1", got)
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-app' AND target='svc-http: https://app.example.test' AND health='healthy' AND message='https://app.example.test ok'"); got != 1 {
+		t.Fatalf("canonical custom observed history rows = %d, want 1", got)
+	}
+	if err := store.MigrateRouteTargetReplacements(ctx, []RouteTargetReplacement{{ServiceID: "svc-app", OldRoute: "https://app.example.test", NewRoute: "https://app.example.test:8443"}}, []config.HTTPRouteTarget{{Name: "svc-http"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countRows(t, store, "SELECT COUNT(*) FROM status_history WHERE service_id='svc-app' AND target='svc-http: https://app.example.test:8443' AND health='healthy' AND message='https://app.example.test ok'"); got != 1 {
+		t.Fatalf("migrated custom observed history rows = %d, want 1", got)
 	}
 	if got := countRows(t, store, "SELECT COUNT(*) FROM monitor_overrides WHERE target LIKE '%@%'"); got != 0 {
 		t.Fatalf("custom override rows with URL userinfo = %d, want 0", got)

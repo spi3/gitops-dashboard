@@ -115,6 +115,20 @@ func (store *Store) migrationSteps() []migrationStep {
 			id:    "014_canonicalize_route_status_targets",
 			apply: store.canonicalizeStoredRouteTargets,
 		},
+		{
+			id: "015_route_target_exclusions",
+			apply: func(ctx context.Context) (bool, error) {
+				_, err := store.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS route_target_exclusions (
+  service_id TEXT NOT NULL,
+  old_route TEXT NOT NULL,
+  PRIMARY KEY(service_id, old_route)
+);
+CREATE INDEX IF NOT EXISTS idx_route_target_exclusions_service_route
+ON route_target_exclusions(service_id, old_route);`)
+				return false, err
+			},
+		},
 	}
 }
 
@@ -1976,6 +1990,25 @@ CREATE TABLE IF NOT EXISTS monitor_overrides (
   not_applicable INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   PRIMARY KEY(service_id, target)
+);
+
+CREATE TABLE IF NOT EXISTS route_target_exclusions (
+  service_id TEXT NOT NULL,
+  old_route TEXT NOT NULL,
+  PRIMARY KEY(service_id, old_route)
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_target_exclusions_service_route
+ON route_target_exclusions(service_id, old_route);
+
+-- Route scans must not be held hostage by an alert-state safety lock.  These
+-- rows retain the exact alert retarget work until a later successful scan can
+-- validate the alert dedupe key and apply it atomically.
+CREATE TABLE IF NOT EXISTS deferred_alert_route_reconciliations (
+  service_id TEXT NOT NULL,
+  old_target TEXT NOT NULL,
+  new_target TEXT NOT NULL,
+  PRIMARY KEY(service_id, old_target, new_target)
 );
 
 CREATE TABLE IF NOT EXISTS alert_events (

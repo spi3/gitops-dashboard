@@ -85,6 +85,72 @@ func TestScanAllClonesAndParsesFixtureRepository(t *testing.T) {
 	}
 }
 
+func TestRouteTargetReplacementsRefusesAmbiguousPorts(t *testing.T) {
+	previous := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"http://10.10.10.127"}}}
+	current := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"http://10.10.10.127:8080", "http://10.10.10.127:9090"}}}
+	replacements, ambiguous := routeTargetReplacements(previous, current, "repo", nil)
+	if len(replacements) != 0 {
+		t.Fatalf("replacements = %#v, want none", replacements)
+	}
+	if len(ambiguous) != 1 || ambiguous[0].ServiceID != "svc" || ambiguous[0].OldRoute != "http://10.10.10.127" {
+		t.Fatalf("ambiguous = %#v", ambiguous)
+	}
+}
+
+func TestRouteTargetReplacementsRequiresSetDifferenceAndBijection(t *testing.T) {
+	previous := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test", "https://app.example.test:8443"}}}
+	current := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test", "https://app.example.test:9443"}}}
+	replacements, exclusions := routeTargetReplacements(previous, current, "repo", nil)
+	if len(replacements) != 1 || replacements[0].OldRoute != "https://app.example.test:8443" || replacements[0].NewRoute != "https://app.example.test:9443" {
+		t.Fatalf("replacements = %#v", replacements)
+	}
+	if len(exclusions) != 0 {
+		t.Fatalf("exclusions = %#v", exclusions)
+	}
+
+	// A still-present portless identity is not an old set difference and cannot
+	// be guessed as the replacement for a newly discovered portful route.
+	previous = []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test"}}}
+	current = []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test", "https://app.example.test:8443"}}}
+	replacements, exclusions = routeTargetReplacements(previous, current, "repo", nil)
+	if len(replacements) != 0 || len(exclusions) != 0 {
+		t.Fatalf("present identity replacements/exclusions = %#v/%#v", replacements, exclusions)
+	}
+
+	// Two old identities competing for one new identity are not a bijection;
+	// retain both rather than allowing either to consume the replacement.
+	previous = []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test:8080", "https://app.example.test:9090"}}}
+	current = []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://app.example.test:9443"}}}
+	replacements, exclusions = routeTargetReplacements(previous, current, "repo", nil)
+	if len(replacements) != 0 || len(exclusions) != 2 {
+		t.Fatalf("non-bijective replacements/exclusions = %#v/%#v", replacements, exclusions)
+	}
+}
+
+func TestRouteTargetReplacementsMigratesSinglePortEvidence(t *testing.T) {
+	previous := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"http://10.10.10.127"}}}
+	current := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"http://10.10.10.127:8080"}}}
+	replacements, ambiguous := routeTargetReplacements(previous, current, "repo", nil)
+	if len(ambiguous) != 0 || len(replacements) != 1 || replacements[0].OldRoute != "http://10.10.10.127" || replacements[0].NewRoute != "http://10.10.10.127:8080" {
+		t.Fatalf("replacements/ambiguous = %#v/%#v", replacements, ambiguous)
+	}
+}
+
+func TestRouteTargetReplacementsReconsidersPriorAmbiguity(t *testing.T) {
+	oldRoute, firstCandidate, retainedCandidate := "https://app.example.test", "https://app.example.test:8443", "https://app.example.test:9443"
+	first := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{oldRoute}}}
+	second := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{firstCandidate, retainedCandidate}}}
+	replacements, exclusions := routeTargetReplacements(first, second, "repo", nil)
+	if len(replacements) != 0 || len(exclusions) != 1 {
+		t.Fatalf("ambiguous transition = replacements:%#v exclusions:%#v", replacements, exclusions)
+	}
+	third := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{firstCandidate}}}
+	replacements, exclusions = routeTargetReplacements(second, third, "repo", exclusions)
+	if len(replacements) != 1 || replacements[0] != (storage.RouteTargetReplacement{ServiceID: "svc", OldRoute: oldRoute, NewRoute: firstCandidate}) || len(exclusions) != 0 {
+		t.Fatalf("resolved transition = replacements:%#v exclusions:%#v", replacements, exclusions)
+	}
+}
+
 func TestScanAllDiscoversPingHostsFromConfiguredRepository(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

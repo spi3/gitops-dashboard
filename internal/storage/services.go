@@ -249,6 +249,19 @@ func (store *Store) StartScan(ctx context.Context, repoName string) (int64, erro
 }
 
 func (store *Store) FinishScan(ctx context.Context, scanID int64, repoName, commit string, services []core.Service, scanErr error) error {
+	return store.FinishScanWithRouteTargetReplacements(ctx, scanID, repoName, commit, services, scanErr, nil, nil)
+}
+
+// FinishScanWithRouteTargetReplacements commits a successful discovery result and
+// any evidence-backed route identity replacements atomically. Replacements are
+// deliberately supplied by discovery rather than inferred from stored targets.
+func (store *Store) FinishScanWithRouteTargetReplacements(ctx context.Context, scanID int64, repoName, commit string, services []core.Service, scanErr error, replacements []RouteTargetReplacement, httpTargets []config.HTTPRouteTarget) error {
+	return store.FinishScanWithRouteTargetChanges(ctx, scanID, repoName, commit, services, scanErr, replacements, nil, httpTargets)
+}
+
+// FinishScanWithRouteTargetChanges atomically commits discovery, proven
+// replacements, and ambiguity exclusions.
+func (store *Store) FinishScanWithRouteTargetChanges(ctx context.Context, scanID int64, repoName, commit string, services []core.Service, scanErr error, replacements []RouteTargetReplacement, exclusions []RouteTargetExclusion, httpTargets []config.HTTPRouteTarget) error {
 	status := "ok"
 	errText := ""
 	if scanErr != nil {
@@ -273,6 +286,18 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 		return err
 	}
 	if scanErr == nil {
+		// A successful scan is authoritative for ambiguity state. Retain only
+		// identities that remain ambiguous in this result, so resolved or vanished
+		// routes return to ordinary stale-pruning behavior.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM route_target_exclusions WHERE service_id IN (SELECT id FROM services WHERE repository=?)`, repoName); err != nil {
+			return fmt.Errorf("reconcile route target exclusions: %w", err)
+		}
+		if err := setRouteTargetExclusions(ctx, tx, exclusions); err != nil {
+			return err
+		}
+		if err := store.migrateRouteTargetReplacements(ctx, tx, replacements, httpRouteTargetNames(httpTargets)); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repoName); err != nil {
 			return err
 		}

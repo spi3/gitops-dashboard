@@ -19,6 +19,10 @@ func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, err
 	if err != nil {
 		return nil, err
 	}
+	activeOverrides, err := store.activeMonitorOverrides(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := store.db.QueryContext(ctx, `
 SELECT rowid, service_id, target, health, message, checked_at, observed_images_json
 FROM status_results ORDER BY checked_at DESC
@@ -49,9 +53,31 @@ FROM status_results ORDER BY checked_at DESC
 		if parentRouteOverrides[status.ServiceID] && strings.HasPrefix(status.Target, routeTargetPrefix) {
 			continue
 		}
+		if activeOverrides[status.ServiceID+"\x00"+status.Target] {
+			status.Health = core.HealthNotApplicable
+			status.Message = "not applicable"
+			status.ObservedImages = []core.ObservedImage{}
+		}
 		statuses = append(statuses, status)
 	}
 	return statuses, rows.Err()
+}
+
+func (store *Store) activeMonitorOverrides(ctx context.Context) (map[string]bool, error) {
+	rows, err := store.db.QueryContext(ctx, `SELECT service_id, target FROM monitor_overrides WHERE not_applicable=1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	overrides := map[string]bool{}
+	for rows.Next() {
+		var serviceID, target string
+		if err := rows.Scan(&serviceID, &target); err != nil {
+			return nil, err
+		}
+		overrides[serviceID+"\x00"+target] = true
+	}
+	return overrides, rows.Err()
 }
 
 func (store *Store) SetMonitorNotApplicable(ctx context.Context, serviceID, target string, notApplicable bool) error {
@@ -349,6 +375,42 @@ func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, 
 		keepTargets[target] = struct{}{}
 	}
 
+	// Ambiguity exclusions are consulted only for candidates this call would
+	// otherwise remove. The leading service_id index keeps this bounded even for
+	// large history tables.
+	excludedRoutes := map[string]struct{}{}
+	if prefix != "" {
+		candidateRoutes := make([]string, 0, len(statusTargets))
+		for target := range statusTargets {
+			if strings.HasPrefix(target, prefix) {
+				candidateRoutes = append(candidateRoutes, strings.TrimPrefix(target, prefix))
+			}
+		}
+		if len(candidateRoutes) > 0 {
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(candidateRoutes)), ",")
+			args := make([]any, 0, len(candidateRoutes)+1)
+			args = append(args, serviceID)
+			for _, route := range candidateRoutes {
+				args = append(args, route)
+			}
+			rows, err := store.db.QueryContext(ctx, `SELECT old_route FROM route_target_exclusions WHERE service_id=? AND old_route IN (`+placeholders+`)`, args...)
+			if err != nil {
+				return fmt.Errorf("query route target exclusions: %w", err)
+			}
+			for rows.Next() {
+				var route string
+				if err := rows.Scan(&route); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				excludedRoutes[route] = struct{}{}
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+		}
+	}
+
 	removeTargets := make([]string, 0, len(statusTargets))
 	for target := range statusTargets {
 		if target == exactTarget && exactTarget != "" {
@@ -362,6 +424,9 @@ func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, 
 			continue
 		}
 		if _, keep := keepTargets[target]; keep {
+			continue
+		}
+		if _, excluded := excludedRoutes[strings.TrimPrefix(target, prefix)]; excluded {
 			continue
 		}
 		removeTargets = append(removeTargets, target)

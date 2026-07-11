@@ -37,11 +37,12 @@ not override externally managed assignment, priority, or status.
 | TASK-0027 | In Review | P1 | Release | Inline auto-patch release on main | `docs/tasks/TASK-0027-inline-main-release.md` | TASK-0026 | 2026-07-10 | Serialized inline release allocation, immutable image reuse, and display-name-aware dispatch integration. |
 | TASK-0028 | In Review | P1 | Release | Continuous versioning convergence and rollout | `docs/tasks/TASK-0028-continuous-versioning-convergence.md` | TASK-0027 | 2026-07-10 | Queued-run channel convergence, stale latest guard, operator runbook, and continuous-model documentation. |
 | TASK-0030 | In Review | P1 | Route Discovery | Explicit Compose port evidence | `docs/tasks/TASK-0030-route-discovery-correctness.md` | TASK-0028 | 2026-07-10 | Static-address port-evidence rules, IPv6-safe routes, and discovery reference. |
+| TASK-0031 | In Progress | P1 | Route Discovery | Route identity replacement migration | `docs/tasks/TASK-0031-route-identity-replacement-migration.md` | TASK-0030, TASK-0021 | 2026-07-10 | Atomic portless-to-portful route state migration before stale pruning; round 5 defers same-sink claimed collisions and preserves terminal delivery audit rows. |
 | TASK-0047 | In Review | P1 | CI Reliability | CI publish wedge hotfix | `docs/tasks/TASK-0047-ci-publish-wedge-hotfix.md` | TASK-0015 | 2026-07-10 | Native UI build platform, bounded CI jobs, and exact Docker variable-reference guards. |
 
 ## Next Task ID
 
-`TASK-0031`
+`TASK-0032`
 
 Reserved-task traceability:
 

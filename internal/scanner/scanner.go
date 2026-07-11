@@ -21,6 +21,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/environment"
 	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/parser"
+	"github.com/example/gitops-dashboard/internal/routetarget"
 	"github.com/example/gitops-dashboard/internal/sanitizer"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
@@ -129,12 +130,144 @@ func (scanner Scanner) scanOneUnshared(ctx context.Context, repo config.Reposito
 		services, err = scanner.parseRepo(path, repo, strings.TrimSpace(commit))
 		return err
 	}()
+	var replacements []storage.RouteTargetReplacement
+	var exclusions []storage.RouteTargetExclusion
+	if scanErr == nil {
+		replacementCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		previous, err := scanner.store.Services(replacementCtx)
+		if err != nil {
+			scanErr = err
+		} else {
+			unresolved, err := scanner.store.RouteTargetExclusions(replacementCtx, repo.Name)
+			if err != nil {
+				scanErr = err
+			} else {
+				replacements, exclusions = routeTargetReplacements(previous, services, repo.Name, unresolved)
+			}
+			if len(exclusions) > 0 {
+				scanner.logger.Warn("route identity replacement ambiguous; retaining old target state", "repository", repo.Name, "count", len(exclusions))
+			}
+		}
+		cancel()
+	}
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if err := scanner.store.FinishScan(finishCtx, scanID, repo.Name, strings.TrimSpace(commit), services, scanErr); err != nil {
+	if err := scanner.store.FinishScanWithRouteTargetChanges(finishCtx, scanID, repo.Name, strings.TrimSpace(commit), services, scanErr, replacements, exclusions, scanner.cfg.Runtime.HTTP); err != nil {
 		return err
 	}
 	return scanErr
+}
+
+// routeTargetReplacements derives only provenance-backed, bijective replacements
+// from route set differences. The shared canonicalizer makes normalization-only
+// changes disappear; all remaining candidates must agree on every URL component
+// except the identity-changing port.
+func routeTargetReplacements(previous, current []core.Service, repository string, unresolved []storage.RouteTargetExclusion) ([]storage.RouteTargetReplacement, []storage.RouteTargetExclusion) {
+	oldByID := make(map[string]core.Service)
+	for _, service := range previous {
+		if service.Repository == repository {
+			oldByID[service.ID] = service
+		}
+	}
+	replacements := []storage.RouteTargetReplacement{}
+	exclusions := []storage.RouteTargetExclusion{}
+	for _, service := range current {
+		oldService, ok := oldByID[service.ID]
+		if !ok {
+			continue
+		}
+		oldRoutes := routetarget.Routes(oldService.Exposure)
+		newRoutes := routetarget.Routes(service.Exposure)
+		oldOnly, newOnly := routeDifference(oldRoutes, newRoutes), routeDifference(newRoutes, oldRoutes)
+		newOwners := map[string]int{}
+		candidates := make(map[string][]string, len(oldOnly))
+		for _, oldRoute := range oldOnly {
+			for _, newRoute := range newOnly {
+				if replacementInvariantMatch(oldRoute, newRoute) {
+					candidates[oldRoute] = append(candidates[oldRoute], newRoute)
+					newOwners[newRoute]++
+				}
+			}
+		}
+		for _, oldRoute := range oldOnly {
+			matches := candidates[oldRoute]
+			if len(matches) == 1 && newOwners[matches[0]] == 1 {
+				replacements = append(replacements, storage.RouteTargetReplacement{ServiceID: service.ID, OldRoute: oldRoute, NewRoute: matches[0]})
+				continue
+			}
+			if len(matches) > 0 {
+				exclusions = append(exclusions, storage.RouteTargetExclusion{ServiceID: service.ID, OldRoute: oldRoute})
+			}
+		}
+	}
+
+	// An exclusion is not a permanent tombstone. Later scans must reconsider
+	// the old identity against the complete current route set, rather than only
+	// that scan's set difference: A->{B,C} followed by {B} proves A->B.
+	currentByID := make(map[string]core.Service)
+	for _, service := range current {
+		if service.Repository == repository {
+			currentByID[service.ID] = service
+		}
+	}
+	priorCandidates := make(map[storage.RouteTargetExclusion][]string, len(unresolved))
+	priorOwners := map[string]int{}
+	for _, exclusion := range unresolved {
+		service, ok := currentByID[exclusion.ServiceID]
+		if !ok || routeContains(routetarget.Routes(service.Exposure), exclusion.OldRoute) {
+			continue
+		}
+		for _, route := range routetarget.Routes(service.Exposure) {
+			if replacementInvariantMatch(exclusion.OldRoute, route) {
+				priorCandidates[exclusion] = append(priorCandidates[exclusion], route)
+				priorOwners[exclusion.ServiceID+"\x00"+route]++
+			}
+		}
+	}
+	for _, exclusion := range unresolved {
+		matches := priorCandidates[exclusion]
+		if len(matches) == 1 && priorOwners[exclusion.ServiceID+"\x00"+matches[0]] == 1 {
+			replacements = append(replacements, storage.RouteTargetReplacement{ServiceID: exclusion.ServiceID, OldRoute: exclusion.OldRoute, NewRoute: matches[0]})
+			continue
+		}
+		if len(matches) > 1 || (len(matches) == 1 && priorOwners[exclusion.ServiceID+"\x00"+matches[0]] > 1) {
+			exclusions = append(exclusions, exclusion)
+		}
+	}
+	return replacements, exclusions
+}
+
+func routeContains(routes []string, route string) bool {
+	for _, candidate := range routes {
+		if candidate == route {
+			return true
+		}
+	}
+	return false
+}
+
+func routeDifference(left, right []string) []string {
+	rightSet := make(map[string]struct{}, len(right))
+	for _, route := range right {
+		rightSet[route] = struct{}{}
+	}
+	difference := make([]string, 0, len(left))
+	for _, route := range left {
+		if _, ok := rightSet[route]; !ok {
+			difference = append(difference, route)
+		}
+	}
+	return difference
+}
+
+func replacementInvariantMatch(oldRoute, newRoute string) bool {
+	oldURL, oldErr := url.Parse(oldRoute)
+	newURL, newErr := url.Parse(newRoute)
+	if oldErr != nil || newErr != nil {
+		return false
+	}
+	return oldURL.Scheme == newURL.Scheme && oldURL.Hostname() == newURL.Hostname() &&
+		oldURL.EscapedPath() == newURL.EscapedPath() && oldURL.RawQuery == newURL.RawQuery && oldURL.Fragment == newURL.Fragment && oldURL.Port() != newURL.Port()
 }
 
 func (scanner Scanner) SyncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
