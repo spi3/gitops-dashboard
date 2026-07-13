@@ -34,6 +34,8 @@ type Store struct {
 	summaryMu          sync.RWMutex
 	summaryVersion     uint64
 	summaryCache       summaryCache
+	freshnessMu        sync.RWMutex
+	statusTTLs         map[string]time.Duration
 	alertDedupeKey     []byte
 	alertDedupeKeyPath string
 	alertSinkNames     map[string]struct{}

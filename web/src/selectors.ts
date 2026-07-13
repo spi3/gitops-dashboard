@@ -25,11 +25,16 @@ export function agentConnection(agent: AgentInfo): AgentConnection {
   if (Number.isNaN(seenAt)) {
     return "never";
   }
+  const staleAfterAt = new Date(agent.staleAfter ?? "").getTime();
+  const staleAfterMs = Number.isNaN(staleAfterAt)
+    ? agentStaleThresholdMs
+    : Math.max(0, staleAfterAt - seenAt);
+  const connectedThresholdMs = staleAfterMs > 0 ? staleAfterMs / 2 : agentConnectedThresholdMs;
   const elapsedMs = Date.now() - seenAt;
-  if (elapsedMs < agentConnectedThresholdMs) {
+  if (elapsedMs < connectedThresholdMs) {
     return "connected";
   }
-  if (elapsedMs < agentStaleThresholdMs) {
+  if (elapsedMs < staleAfterMs) {
     return "stale";
   }
   return "offline";

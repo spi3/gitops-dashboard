@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -74,6 +75,8 @@ func (store *Store) migrationSteps() []migrationStep {
 		store.ensureColumnStep("002_services_config_json", "services", "config_json", "TEXT NOT NULL DEFAULT '[]'"),
 		store.ensureColumnStep("003_services_compose_project", "services", "compose_project", "TEXT NOT NULL DEFAULT ''"),
 		store.ensureColumnStep("004_status_results_observed_images_json", "status_results", "observed_images_json", "TEXT NOT NULL DEFAULT '[]'"),
+		store.ensureFreshnessColumnStep("016_status_results_expires_at", "status_results", "expires_at"),
+		store.ensureFreshnessColumnStep("017_agents_stale_after", "agents", "stale_after"),
 		{
 			id:        "007_repair_alert_events_schema",
 			alertOnly: true,
@@ -426,6 +429,244 @@ func (store *Store) ensureColumnChanged(ctx context.Context, table, column, defi
 	}
 	_, err = store.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
 	return err == nil, err
+}
+
+func (store *Store) ensureFreshnessColumnStep(id, table, column string) migrationStep {
+	return migrationStep{id: id, apply: func(ctx context.Context) (bool, error) {
+		rows, err := store.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, typ string
+			var def any
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+				return false, err
+			}
+			if name != column {
+				continue
+			}
+			return false, store.repairFreshnessTable(ctx, table)
+		}
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		_, err = store.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''", table, column))
+		if err != nil {
+			return false, err
+		}
+		return true, store.repairFreshnessTable(ctx, table)
+	}}
+}
+
+// repairFreshnessTable accepts only the complete status/agent table contract.
+// Older layouts are rebuilt atomically rather than turning a recoverable
+// monitor-schema drift into a dashboard-startup outage.
+func (store *Store) repairFreshnessTable(ctx context.Context, table string) error {
+	if err := store.validateFreshnessTable(ctx, table); err == nil {
+		return nil
+	}
+	return store.rebuildFreshnessTable(ctx, table)
+}
+
+func (store *Store) validateFreshnessTable(ctx context.Context, table string) error {
+	type contract struct {
+		typ         string
+		notNull, pk int
+		def         string
+	}
+	expected := map[string]contract{}
+	switch table {
+	case "status_results":
+		expected = map[string]contract{"service_id": {"TEXT", 1, 1, ""}, "target": {"TEXT", 1, 2, ""}, "health": {"TEXT", 1, 0, ""}, "message": {"TEXT", 1, 0, ""}, "checked_at": {"TEXT", 1, 0, ""}, "expires_at": {"TEXT", 1, 0, "''"}, "observed_images_json": {"TEXT", 1, 0, "'[]'"}}
+	case "agents":
+		expected = map[string]contract{"target": {"TEXT", 0, 1, ""}, "last_seen_at": {"TEXT", 1, 0, ""}, "stale_after": {"TEXT", 1, 0, "''"}, "status_json": {"TEXT", 1, 0, ""}}
+	default:
+		return fmt.Errorf("unknown freshness table %s", table)
+	}
+	expectedDDL := map[string]string{
+		"status_results": `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id, target))`,
+		"agents":         `CREATE TABLE agents (target TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL, stale_after TEXT NOT NULL DEFAULT '', status_json TEXT NOT NULL)`,
+	}[table]
+	var actualDDL string
+	if err := store.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&actualDDL); err != nil {
+		return err
+	}
+	if actualDDL != expectedDDL {
+		return fmt.Errorf("%s does not match the accepted DDL contract", table)
+	}
+	rows, err := store.db.QueryContext(ctx, "PRAGMA table_xinfo("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk, hidden int
+		var name, typ string
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk, &hidden); err != nil {
+			return err
+		}
+		if hidden != 0 {
+			return fmt.Errorf("%s has hidden column %s", table, name)
+		}
+		want, ok := expected[name]
+		if !ok {
+			return fmt.Errorf("%s has unexpected column %s", table, name)
+		}
+		gotDef, _ := def.(string)
+		if !strings.EqualFold(typ, want.typ) || notNull != want.notNull || pk != want.pk || gotDef != want.def {
+			return fmt.Errorf("%s.%s has incompatible schema", table, name)
+		}
+		seen[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for name := range expected {
+		if !seen[name] {
+			return fmt.Errorf("%s.%s is missing", table, name)
+		}
+	}
+	indexes, err := store.db.QueryContext(ctx, "PRAGMA index_list("+table+")")
+	if err != nil {
+		return err
+	}
+	defer indexes.Close()
+	for indexes.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := indexes.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return err
+		}
+		if origin != "pk" {
+			return fmt.Errorf("%s has incompatible index %s", table, name)
+		}
+	}
+	if err := indexes.Err(); err != nil {
+		return err
+	}
+	foreignKeys, err := store.db.QueryContext(ctx, "PRAGMA foreign_key_list("+table+")")
+	if err != nil {
+		return err
+	}
+	defer foreignKeys.Close()
+	if foreignKeys.Next() {
+		return fmt.Errorf("%s has incompatible foreign-key constraint", table)
+	}
+	if err := foreignKeys.Err(); err != nil {
+		return err
+	}
+	var triggerCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name=?`, table).Scan(&triggerCount); err != nil {
+		return err
+	}
+	if triggerCount != 0 {
+		return fmt.Errorf("%s has incompatible trigger constraint", table)
+	}
+	return nil
+}
+
+func (store *Store) rebuildFreshnessTable(ctx context.Context, table string) error {
+	createSQL := map[string]string{
+		"status_results": `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id, target))`,
+		"agents":         `CREATE TABLE agents (target TEXT PRIMARY KEY, last_seen_at TEXT NOT NULL, stale_after TEXT NOT NULL DEFAULT '', status_json TEXT NOT NULL)`,
+	}[table]
+	if createSQL == "" {
+		return fmt.Errorf("unknown freshness table %s", table)
+	}
+	columns, err := store.tableColumnNames(ctx, table)
+	if err != nil {
+		return err
+	}
+	legacy := table + "_t032_legacy"
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS `+legacy); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE `+table+` RENAME TO `+legacy); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, createSQL); err != nil {
+		return err
+	}
+	if err := preserveFreshnessRows(ctx, tx, legacy, table, columns); err != nil {
+		return err
+	}
+	if table == "status_results" {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO status_results(service_id,target,health,message,checked_at,expires_at,observed_images_json) SELECT `+freshnessSource(columns, "service_id", "''")+`,`+freshnessSource(columns, "target", "''")+`,`+freshnessSource(columns, "health", "'unknown'")+`,`+freshnessSource(columns, "message", "''")+`,`+freshnessSource(columns, "checked_at", "''")+`,`+freshnessSource(columns, "expires_at", "''")+`,`+freshnessSource(columns, "observed_images_json", "'[]'")+` FROM `+legacy+` ORDER BY `+freshnessSource(columns, "checked_at", "''")+` ASC, rowid ASC`); err != nil {
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO agents(target,last_seen_at,stale_after,status_json) SELECT `+freshnessSource(columns, "target", "''")+`,`+freshnessSource(columns, "last_seen_at", "''")+`,`+freshnessSource(columns, "stale_after", "''")+`,`+freshnessSource(columns, "status_json", "'[]'")+` FROM `+legacy+` ORDER BY `+freshnessSource(columns, "last_seen_at", "''")+` ASC, rowid ASC`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE `+legacy); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (store *Store) tableColumnNames(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := store.db.QueryContext(ctx, "PRAGMA table_xinfo("+table+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk, hidden int
+		var name, typ string
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk, &hidden); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
+}
+
+// preserveFreshnessRows keeps every raw row before canonical key repair chooses
+// the latest observation. The recovery ledger is durable so malformed keys or
+// unknown drift columns never silently destroy historical evidence.
+func preserveFreshnessRows(ctx context.Context, tx *sql.Tx, legacy, table string, columns map[string]bool) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS freshness_recovery (source_table TEXT NOT NULL, source_rowid INTEGER NOT NULL, canonical_key TEXT NOT NULL, raw_json TEXT NOT NULL, recovered_at TEXT NOT NULL, PRIMARY KEY(source_table, source_rowid))`); err != nil {
+		return err
+	}
+	key := freshnessSource(columns, "target", "''")
+	timestamp := freshnessSource(columns, "last_seen_at", "''")
+	if table == "status_results" {
+		key = freshnessSource(columns, "service_id", "''") + ` || char(0) || ` + freshnessSource(columns, "target", "''")
+		timestamp = freshnessSource(columns, "checked_at", "''")
+	}
+	names := make([]string, 0, len(columns))
+	for name := range columns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	jsonArgs := make([]string, 0, len(names)*2)
+	for _, name := range names {
+		jsonArgs = append(jsonArgs, fmt.Sprintf("'%s'", name), `"`+name+`"`)
+	}
+	if len(jsonArgs) == 0 {
+		return fmt.Errorf("%s has no recoverable columns", legacy)
+	}
+	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO freshness_recovery(source_table,source_rowid,canonical_key,raw_json,recovered_at) SELECT ?, rowid, `+key+`, json_object(`+strings.Join(jsonArgs, ",")+`), ? FROM `+legacy+` ORDER BY `+timestamp+` ASC, rowid ASC`, table, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func freshnessSource(columns map[string]bool, column, fallback string) string {
+	if !columns[column] {
+		return fallback
+	}
+	return `COALESCE("` + column + `", ` + fallback + `)`
 }
 
 func (store *Store) repairAlertEventsSchema(ctx context.Context) (bool, error) {
@@ -1363,6 +1604,7 @@ func (store *Store) alertDispatchesHasUniqueEventSink(ctx context.Context) (bool
 		return false, err
 	}
 	defer rows.Close()
+	var candidates []string
 	for rows.Next() {
 		var seq int
 		var name string
@@ -1375,6 +1617,15 @@ func (store *Store) alertDispatchesHasUniqueEventSink(ctx context.Context) (bool
 		if unique == 0 || partial != 0 {
 			continue
 		}
+		candidates = append(candidates, name)
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	for _, name := range candidates {
 		matches, err := store.indexColumnsMatch(ctx, name, []string{"event_id", "sink"})
 		if err != nil {
 			return false, err
@@ -1383,7 +1634,7 @@ func (store *Store) alertDispatchesHasUniqueEventSink(ctx context.Context) (bool
 			return true, nil
 		}
 	}
-	return false, rows.Err()
+	return false, nil
 }
 
 func (store *Store) alertDispatchesHasAlertEventsFK(ctx context.Context) (bool, error) {
@@ -2190,6 +2441,7 @@ CREATE TABLE IF NOT EXISTS status_results (
   health TEXT NOT NULL,
   message TEXT NOT NULL,
   checked_at TEXT NOT NULL,
+	  expires_at TEXT NOT NULL DEFAULT '',
   observed_images_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY(service_id, target)
 );
@@ -2197,6 +2449,7 @@ CREATE TABLE IF NOT EXISTS status_results (
 CREATE TABLE IF NOT EXISTS agents (
   target TEXT PRIMARY KEY,
   last_seen_at TEXT NOT NULL,
+	  stale_after TEXT NOT NULL DEFAULT '',
   status_json TEXT NOT NULL
 );
 

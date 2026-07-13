@@ -46,6 +46,45 @@ func TestDockerHealthMapsContainerState(t *testing.T) {
 	}
 }
 
+func TestDockerHealthAggregatesReplicaWorstState(t *testing.T) {
+	t.Parallel()
+	service := core.Service{Name: "web"}
+	health, message := dockerHealth(service, []dockerContainer{
+		{Names: []string{"/stack-web-1"}, Labels: map[string]string{dockerComposeServiceLabel: "web"}, State: "running", Status: "Up 1 minute"},
+		{Names: []string{"/stack-web-2"}, Labels: map[string]string{dockerComposeServiceLabel: "web"}, State: "running", Status: "Up 1 minute (unhealthy)"},
+	})
+	if health != core.HealthUnhealthy || !strings.Contains(message, "2 replicas") {
+		t.Fatalf("replica health = %s %q, want unhealthy replica summary", health, message)
+	}
+}
+
+func TestDockerHealthLifecycleOverridesReportedHealthyState(t *testing.T) {
+	t.Parallel()
+	service := core.Service{Name: "web"}
+	for _, container := range []dockerContainer{
+		{Names: []string{"/web-1"}, Labels: map[string]string{dockerComposeServiceLabel: "web"}, State: "exited", Health: "healthy", Status: "Exited"},
+		{Names: []string{"/web-1"}, Labels: map[string]string{dockerComposeServiceLabel: "web"}, State: "restarting", Health: "healthy", Status: "Restarting"},
+	} {
+		health, _ := dockerHealth(service, []dockerContainer{container})
+		if health == core.HealthHealthy {
+			t.Fatalf("%s healthy healthcheck reported healthy", container.State)
+		}
+	}
+}
+
+func TestClampAgentCheckedAtRejectsSkew(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	if got := clampAgentCheckedAt(now.Add(time.Minute), now); !got.Equal(now) {
+		t.Fatalf("future timestamp = %s, want receipt %s", got, now)
+	}
+	if got := clampAgentCheckedAt(now.Add(-time.Minute), now); !got.Equal(now) {
+		t.Fatalf("old timestamp = %s, want receipt %s", got, now)
+	}
+	if got := clampAgentCheckedAt(now.Add(10*time.Second), now); !got.Equal(now.Add(10 * time.Second)) {
+		t.Fatalf("near timestamp = %s", got)
+	}
+}
+
 func TestDockerHealthUsesHealthcheckState(t *testing.T) {
 	t.Parallel()
 	service := core.Service{Name: "web", Images: []string{"example/web:v1"}}
@@ -166,6 +205,42 @@ func TestApplyAgentReportPersistsMatchingComposeStatuses(t *testing.T) {
 	}
 	if _, ok := byService["albert-web"]; ok {
 		t.Fatalf("albert-web should not be updated by serenity agent: %#v", byService["albert-web"])
+	}
+}
+
+func TestApplyAgentReportRetainsMonitorOverrideSemantics(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := core.Service{ID: "serenity-web", Name: "web", Repository: "kube", SourceCommit: "abc123", SourcePath: "docker_files/serenity/web/docker-compose.yml", Runtime: "compose", Health: core.HealthUnknown}
+	scanID, err := store.StartScan(ctx, "kube")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishScan(ctx, scanID, "kube", "abc123", []core.Service{service}, nil); err != nil {
+		t.Fatal(err)
+	}
+	monitor := New(config.Config{}, store, slog.Default())
+	report := core.AgentMessage{Target: "serenity", Containers: []core.ContainerStatus{{Name: "/stack-web-1", State: "running", Status: "Up 1 minute"}}}
+	if err := monitor.ApplyAgentReport(ctx, report, []string{"serenity"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMonitorNotApplicable(ctx, service.ID, "serenity", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.ApplyAgentReport(ctx, report, []string{"serenity"}); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Health != core.HealthNotApplicable || statuses[0].Message != "not applicable" {
+		t.Fatalf("agent projection overwrote monitor override: %#v", statuses)
 	}
 }
 

@@ -116,6 +116,7 @@ export type ContainerStatus = {
 export type AgentInfo = {
   target: string;
   lastSeenAt: string;
+  staleAfter?: string;
   configured: boolean;
   containers: ContainerStatus[];
 };

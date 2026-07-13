@@ -3593,6 +3593,302 @@ func TestUpsertAgentThenAgentsRoundtrip(t *testing.T) {
 	}
 }
 
+func TestStatusResultsDegradeExpiredTargetStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthHealthy, CheckedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Health != core.HealthUnknown || !strings.Contains(statuses[0].Message, "stale") {
+		t.Fatalf("expired status = %#v, want stale unknown", statuses)
+	}
+}
+
+func TestStatusResultsExpireAtTTLBoundary(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	boundary := time.Now().UTC()
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthHealthy, CheckedAt: boundary.Add(-time.Minute), ExpiresAt: boundary}); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statuses[0].Health != core.HealthUnknown {
+		t.Fatalf("health at expiry boundary = %s, want unknown", statuses[0].Health)
+	}
+}
+
+func TestStatusResultsUseParentTTLForRouteChildrenAndLegacyRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetStatusTTL("routes", time.Minute)
+	checkedAt := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO status_results(service_id,target,health,message,checked_at,expires_at) VALUES(?,?,?,?,?, '')`, "svc", "routes: https://example.test", "healthy", "old", checkedAt.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Health != core.HealthUnknown {
+		t.Fatalf("legacy route status = %#v, want expired unknown", statuses)
+	}
+}
+
+func TestAgentsUseLegacyTargetTTL(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetStatusTTL("agent-a", time.Minute)
+	seen := time.Now().UTC().Add(-2 * time.Minute)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO agents(target,last_seen_at,stale_after,status_json) VALUES(?,?, '', '[]')`, "agent-a", seen.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	agents, err := store.Agents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].StaleAfter == "" {
+		t.Fatalf("legacy agent = %#v, want derived staleAfter", agents)
+	}
+}
+
+func TestLegacyAgentStatusUsesReceiptInsteadOfFutureCheckedAt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetStatusTTL("agent-a", time.Minute)
+	seen := time.Now().UTC().Add(-2 * time.Minute)
+	future := time.Now().UTC().Add(24 * time.Hour)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO agents(target,last_seen_at,stale_after,status_json) VALUES(?,?, '', '[]')`, "agent-a", seen.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO status_results(service_id,target,health,message,checked_at,expires_at,observed_images_json) VALUES(?,?, 'healthy','legacy',?,'','[]')`, "svc", "agent-a", future.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statuses[0].Health != core.HealthUnknown {
+		t.Fatalf("future legacy agent status = %#v", statuses[0])
+	}
+}
+
+func TestFreshnessMigrationRebuildsIncompatibleExistingColumn(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at INTEGER, PRIMARY KEY(service_id,target))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.validateFreshnessTable(context.Background(), "status_results"); err != nil {
+		t.Fatalf("rebuilt status_results schema: %v", err)
+	}
+}
+
+func TestFreshnessMigrationRebuildsCorrectColumnWithWrongPrimaryKey(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE agents (target TEXT NOT NULL, last_seen_at TEXT NOT NULL, stale_after TEXT NOT NULL DEFAULT '', status_json TEXT NOT NULL, PRIMARY KEY(last_seen_at))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.validateFreshnessTable(context.Background(), "agents"); err != nil {
+		t.Fatalf("rebuilt agents schema: %v", err)
+	}
+}
+
+func TestFreshnessMigrationRebuildsEverySchemaDriftDimension(t *testing.T) {
+	fixtures := map[string]string{
+		"type":          `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at INTEGER NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target))`,
+		"nullability":   `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target))`,
+		"default":       `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT 'later', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target))`,
+		"primary key":   `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(target,service_id))`,
+		"index":         `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target)); CREATE INDEX drift_index ON status_results(health)`,
+		"constraint":    `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL CHECK(health <> 'unhealthy'), message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target))`,
+		"foreign key":   `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target), FOREIGN KEY(service_id) REFERENCES services(id))`,
+		"trigger":       `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(service_id,target)); CREATE TRIGGER drift_trigger AFTER INSERT ON status_results BEGIN SELECT 1; END`,
+		"hidden column": `CREATE TABLE status_results (service_id TEXT NOT NULL, target TEXT NOT NULL, health TEXT NOT NULL, message TEXT NOT NULL, checked_at TEXT NOT NULL, expires_at TEXT NOT NULL DEFAULT '', observed_images_json TEXT NOT NULL DEFAULT '[]', generated TEXT GENERATED ALWAYS AS (service_id || target) VIRTUAL, PRIMARY KEY(service_id,target))`,
+	}
+	for name, schema := range fixtures {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "dashboard.db")
+			db, err := sql.Open("sqlite3", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(schema); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err := store.validateFreshnessTable(context.Background(), "status_results"); err != nil {
+				t.Fatalf("schema drift %s survived migration: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestFreshnessMigrationKeepsLatestConflictAndRecoveryRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE agents (target TEXT NOT NULL, last_seen_at TEXT NOT NULL, stale_after TEXT NOT NULL DEFAULT '', status_json TEXT NOT NULL, PRIMARY KEY(last_seen_at)); INSERT INTO agents VALUES ('agent-a','2026-07-12T12:00:00Z','','[]'),('agent-a','2026-07-12T12:01:00Z','','[]')`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agents, err := store.Agents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].LastSeenAt != "2026-07-12T12:01:00Z" {
+		t.Fatalf("canonical agents = %#v, want latest receipt", agents)
+	}
+	var recovered int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM freshness_recovery WHERE source_table='agents' AND canonical_key='agent-a'`).Scan(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 2 {
+		t.Fatalf("recovered agent rows=%d, want 2", recovered)
+	}
+}
+
+func TestLegacyOrphanAgentProjectionExpiresWithoutConfiguredTTL(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	received := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	checked := time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO agents(target,last_seen_at,stale_after,status_json) VALUES(?,?, '', '[]')`, "removed-agent", received); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO status_results(service_id,target,health,message,checked_at,expires_at,observed_images_json) VALUES('svc','removed-agent','healthy','legacy',?,'','[]')`, checked); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].Health != core.HealthUnknown {
+		t.Fatalf("orphan agent status=%#v, want expired unknown", statuses)
+	}
+}
+
+func TestNotApplicableExpiredStatusRemainsCacheable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthNotApplicable, CheckedAt: time.Now().UTC().Add(-time.Minute), ExpiresAt: time.Now().UTC().Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Summary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.cachedSummary(); !ok {
+		t.Fatal("expired not-applicable status bypassed summary cache")
+	}
+}
+
+func TestSummaryCachesMaterializedStaleStatus(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.UpsertStatus(ctx, core.StatusResult{ServiceID: "svc", Target: "target", Health: core.HealthHealthy, CheckedAt: time.Now().UTC().Add(-time.Minute), ExpiresAt: time.Now().UTC().Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Summary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.cachedSummary(); !ok {
+		t.Fatal("stale summary was not cacheable after materialization")
+	}
+}
+
 func TestUptimeEmptyIsSlice(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

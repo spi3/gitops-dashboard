@@ -57,6 +57,38 @@ func TestRunTargetLoopWithoutCheckTimeoutDoesNotAddDefaultDeadline(t *testing.T)
 	}
 }
 
+func TestRecordTargetFailureWritesCoveredServiceErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir() + "/dashboard.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor := New(config.Config{}, store, slog.Default())
+	monitor.recordTargetFailure(ctx, "docker-a", []core.Service{{ID: "one"}, {ID: "two"}})
+	statuses, err := store.StatusResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %#v, want errors for both covered services", statuses)
+	}
+	for _, status := range statuses {
+		if status.Health != core.HealthError || status.Message != "monitor target check failed" {
+			t.Fatalf("status = %#v", status)
+		}
+	}
+}
+
+func TestAgentStatusTTLTracksConfiguredReportingInterval(t *testing.T) {
+	t.Parallel()
+	monitor := New(config.Config{Monitoring: config.MonitoringConfig{DefaultInterval: "1m"}, Runtime: config.RuntimeConfig{Docker: []config.DockerTarget{{Name: "agent-a", Kind: "agent", Interval: "90s"}}}}, nil, slog.Default())
+	if got, want := monitor.agentStatusTTL("agent-a"), 3*time.Minute; got != want {
+		t.Fatalf("agent TTL = %s, want %s", got, want)
+	}
+}
+
 func TestKubernetesStatusMappingWithFakeClient(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -15,6 +15,7 @@ import (
 
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
+	"github.com/example/gitops-dashboard/internal/hostinventory"
 	"github.com/example/gitops-dashboard/internal/scanner"
 	"github.com/example/gitops-dashboard/internal/storage"
 )
@@ -211,6 +212,19 @@ all:
 		t.Fatal(err)
 	}
 	assertHostServiceCount(t, store, 2)
+}
+
+func TestPingServicesForTargetExcludesUnrelatedRuntimeServices(t *testing.T) {
+	t.Parallel()
+	target := config.PingTarget{Repository: "kube", AnsibleInventory: "ansible/hosts.yml"}
+	covered := pingServicesForTarget([]core.Service{
+		{ID: "host", Repository: hostinventory.RepositoryName(target), SourcePath: hostinventory.Source(target), Runtime: "host"},
+		{ID: "docker", Repository: "kube", SourcePath: "docker-compose.yml", Runtime: "compose"},
+		{ID: "other-host", Repository: "kube", SourcePath: "other.yml", Runtime: "host"},
+	}, target)
+	if len(covered) != 1 || covered[0].ID != "host" {
+		t.Fatalf("covered services = %#v", covered)
+	}
 }
 
 func TestPingTargetReusesEmptyInventoryUntilRefreshInterval(t *testing.T) {

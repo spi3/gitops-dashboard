@@ -415,6 +415,17 @@ func pingCheckCount(target config.PingTarget, services []core.Service) int {
 	return checks
 }
 
+func pingServicesForTarget(services []core.Service, target config.PingTarget) []core.Service {
+	repository, source := hostinventory.RepositoryName(target), hostinventory.Source(target)
+	covered := make([]core.Service, 0)
+	for _, service := range services {
+		if service.Repository == repository && service.Runtime == "host" && service.SourcePath == source {
+			covered = append(covered, service)
+		}
+	}
+	return covered
+}
+
 func checkPingHost(ctx context.Context, ping pingFunc, address string, timeout time.Duration) (core.HealthState, string) {
 	pingCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

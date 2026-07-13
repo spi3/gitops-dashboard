@@ -25,6 +25,11 @@ func (store *Store) cachedSummary() (core.DashboardSummary, bool) {
 	if time.Since(store.summaryCache.cachedAt) >= summaryCacheTTL {
 		return core.DashboardSummary{}, false
 	}
+	for _, status := range store.summaryCache.summary.Statuses {
+		if status.Health != core.HealthNotApplicable && !status.ExpiresAt.IsZero() && !time.Now().UTC().Before(status.ExpiresAt) {
+			return core.DashboardSummary{}, false
+		}
+	}
 	summary := cloneDashboardSummary(store.summaryCache.summary)
 	summary.GeneratedAt = time.Now().UTC()
 	return summary, true

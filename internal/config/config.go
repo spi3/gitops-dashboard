@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -1081,8 +1082,55 @@ func (cfg Config) Validate() error {
 			return err
 		}
 	}
+	if err := cfg.validateUniqueMonitorTargetNames(); err != nil {
+		return err
+	}
 	if err := cfg.Alerting.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (cfg Config) validateUniqueMonitorTargetNames() error {
+	seen := map[string]string{}
+	register := func(kind, name string) error {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return fmt.Errorf("runtime monitor target identity is empty")
+		}
+		if strings.Contains(name, ": ") {
+			return fmt.Errorf("runtime monitor target identity uses reserved delimiter")
+		}
+		if previous, ok := seen[name]; ok {
+			sum := sha256.Sum256([]byte(name))
+			return fmt.Errorf("runtime monitor target identity duplicates %s target (digest=%s length=%d)", previous, hex.EncodeToString(sum[:4]), len(name))
+		}
+		seen[name] = kind
+		return nil
+	}
+	for _, target := range cfg.Runtime.Docker {
+		if err := register("docker", target.Name); err != nil {
+			return err
+		}
+	}
+	for _, target := range cfg.Runtime.Kubernetes {
+		if err := register("kubernetes", target.Name); err != nil {
+			return err
+		}
+	}
+	for _, target := range cfg.Runtime.HTTP {
+		name := target.Name
+		if name == "" {
+			name = "routes"
+		}
+		if err := register("http", name); err != nil {
+			return err
+		}
+	}
+	for _, target := range cfg.Runtime.Ping {
+		if err := register("ping", target.EffectiveName()); err != nil {
+			return err
+		}
 	}
 	return nil
 }

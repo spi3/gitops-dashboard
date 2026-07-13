@@ -979,6 +979,15 @@ agent:
 	}
 }
 
+func TestValidateRejectsDuplicateMonitorTargetNamesAcrossKinds(t *testing.T) {
+	t.Parallel()
+	cfg := Config{Runtime: RuntimeConfig{Docker: []DockerTarget{{Name: "local"}}, Kubernetes: []KubernetesTarget{{Name: "local"}}}}
+	err := cfg.validateUniqueMonitorTargetNames()
+	if err == nil || !strings.Contains(err.Error(), "duplicates docker target") {
+		t.Fatalf("duplicate target error = %v", err)
+	}
+}
+
 func TestLoadAgentConfigRejectsInvalidAgentDuration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agent.yaml")
 	if err := os.WriteFile(path, []byte(`

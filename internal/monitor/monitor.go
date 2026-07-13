@@ -44,7 +44,34 @@ type Monitor struct {
 }
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Monitor {
+	if store != nil {
+		if interval, err := cfg.DefaultInterval(); err == nil {
+			for _, target := range cfg.Runtime.Docker {
+				store.SetStatusTTL(target.Name, statusTTL(target.CheckInterval(interval)))
+			}
+			for _, target := range cfg.Runtime.Kubernetes {
+				store.SetStatusTTL(target.Name, statusTTL(target.CheckInterval(interval)))
+			}
+			for _, target := range cfg.Runtime.HTTP {
+				name := target.Name
+				if name == "" {
+					name = "routes"
+				}
+				store.SetStatusTTL(name, statusTTL(target.CheckInterval(interval)))
+			}
+			for _, target := range cfg.Runtime.Ping {
+				store.SetStatusTTL(target.EffectiveName(), statusTTL(target.CheckInterval(interval)))
+			}
+		}
+	}
 	return Monitor{cfg: cfg, store: store, logger: logger, pingCache: newPingInventoryCache(), ping: systemPing}
+}
+
+func statusTTL(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return 2 * interval
 }
 
 func (monitor Monitor) Run(ctx context.Context) {
@@ -108,12 +135,18 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 			continue
 		}
 		if err := monitor.checkDocker(ctx, target, services); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				monitor.recordTargetFailure(ctx, target.Name, dockerServicesForTarget(services, target, directDockerTargets(monitor.cfg.Runtime.Docker)))
+			}
 			monitor.logger.Error("docker monitoring failed", "target", target.Name, "error", err)
 			combined = err
 		}
 	}
 	for _, target := range monitor.cfg.Runtime.Kubernetes {
 		if err := monitor.checkKubernetes(ctx, target, services); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				monitor.recordTargetFailure(ctx, target.Name, runtimeServices(services, "kubernetes"))
+			}
 			monitor.logger.Error("kubernetes monitoring failed", "target", target.Name, "error", err)
 			combined = err
 		}
@@ -123,12 +156,22 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 			return monitor.checkHTTPRoutes(checkCtx, target, services)
 		})
 		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				targetName := target.Name
+				if targetName == "" {
+					targetName = "routes"
+				}
+				monitor.recordTargetFailure(ctx, targetName, routeServices(services))
+			}
 			monitor.logger.Error("http route monitoring failed", "target", target.Name, "error", err)
 			combined = err
 		}
 	}
 	for _, target := range monitor.cfg.Runtime.Ping {
 		if err := monitor.checkPing(ctx, target); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				monitor.recordTargetFailure(ctx, target.EffectiveName(), pingServicesForTarget(services, target))
+			}
 			monitor.logger.Error("ping monitoring failed", "target", target.EffectiveName(), "error", err)
 			combined = err
 		}
@@ -148,35 +191,56 @@ func (monitor Monitor) ApplyAgentReport(ctx context.Context, message core.AgentM
 	}
 	message.Target = target
 	message = core.FilterAgentMessageDockerLabels(message)
-	if err := monitor.store.UpsertAgent(ctx, message); err != nil {
-		return err
+	receivedAt := time.Now().UTC()
+	message.CheckedAt = clampAgentCheckedAt(message.CheckedAt, receivedAt)
+	if ttl := monitor.agentStatusTTL(target); ttl > 0 {
+		message.StaleAfter = receivedAt.Add(ttl)
 	}
 	services, err := monitor.store.Services(ctx)
 	if err != nil {
 		return err
 	}
 	checkedAt := message.CheckedAt.UTC()
-	if checkedAt.IsZero() {
-		checkedAt = time.Now().UTC()
-	}
 	containers := agentDockerContainers(message.Containers)
+	statuses := make([]core.StatusResult, 0)
 	for _, service := range services {
 		if service.Runtime != "compose" || composeServiceTarget(service) != target {
 			continue
 		}
 		health, statusMessage, observedImages := dockerStatus(ctx, service, target, containers, nil)
-		if err := monitor.store.UpsertStatus(ctx, core.StatusResult{
+		statuses = append(statuses, core.StatusResult{
 			ServiceID:      service.ID,
 			Target:         target,
 			Health:         health,
 			Message:        statusMessage,
 			CheckedAt:      checkedAt,
+			ExpiresAt:      message.StaleAfter,
 			ObservedImages: observedImages,
-		}); err != nil {
-			return err
+		})
+	}
+	return monitor.store.UpsertAgentReport(ctx, message, statuses, receivedAt)
+}
+
+const maxAgentClockSkew = 30 * time.Second
+
+func clampAgentCheckedAt(reported, received time.Time) time.Time {
+	if reported.IsZero() || reported.Before(received.Add(-maxAgentClockSkew)) || reported.After(received.Add(maxAgentClockSkew)) {
+		return received
+	}
+	return reported.UTC()
+}
+
+func (monitor Monitor) agentStatusTTL(target string) time.Duration {
+	defaultInterval, err := monitor.cfg.DefaultInterval()
+	if err != nil {
+		return 0
+	}
+	for _, candidate := range monitor.cfg.Runtime.Docker {
+		if candidate.Kind == "agent" && strings.TrimSpace(candidate.Name) == target {
+			return statusTTL(candidate.CheckInterval(defaultInterval))
 		}
 	}
-	return nil
+	return 0
 }
 
 func agentTargetAllowed(target string, authorizedTargets []string) bool {
@@ -194,30 +258,36 @@ func agentTargetAllowed(target string, authorizedTargets []string) bool {
 func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkDocker(checkCtx, target, services)
+	}, func(services []core.Service) []core.Service {
+		return dockerServicesForTarget(services, target, directDockerTargets(monitor.cfg.Runtime.Docker))
 	})
 }
 
 func (monitor Monitor) runKubernetesLoop(ctx context.Context, target config.KubernetesTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkKubernetes(checkCtx, target, services)
-	})
+	}, func(services []core.Service) []core.Service { return runtimeServices(services, "kubernetes") })
 }
 
 func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPRouteTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.Name, interval, func(services []core.Service) time.Duration {
+	targetName := target.Name
+	if targetName == "" {
+		targetName = "routes"
+	}
+	monitor.runTargetLoop(ctx, targetName, interval, func(services []core.Service) time.Duration {
 		return monitor.httpRouteRunTimeout(target, services)
 	}, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkHTTPRoutes(checkCtx, target, services)
-	})
+	}, func(services []core.Service) []core.Service { return routeServices(services) })
 }
 
 func (monitor Monitor) runPingLoop(ctx context.Context, target config.PingTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.EffectiveName(), interval, nil, func(checkCtx context.Context, _ []core.Service) error {
 		return monitor.checkPing(checkCtx, target)
-	})
+	}, func(services []core.Service) []core.Service { return pingServicesForTarget(services, target) })
 }
 
-func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, checkTimeout func([]core.Service) time.Duration, check func(context.Context, []core.Service) error) {
+func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, checkTimeout func([]core.Service) time.Duration, check func(context.Context, []core.Service) error, covered ...func([]core.Service) []core.Service) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	failures := 0
@@ -238,13 +308,16 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 				}
 			}
 			if pruneErr := monitor.store.PruneStatusHistory(ctx); pruneErr != nil {
-				if err != nil {
-					err = fmt.Errorf("%w; status history prune failed: %w", err, pruneErr)
-				} else {
-					err = pruneErr
-				}
+				monitor.logger.Error("status history prune failed", "target", targetName, "error", pruneErr)
 			}
 			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					servicesForFailure := services
+					if len(covered) > 0 && covered[0] != nil {
+						servicesForFailure = covered[0](services)
+					}
+					monitor.recordTargetFailure(ctx, targetName, servicesForFailure)
+				}
 				failures++
 				monitor.logger.Error("runtime monitoring failed", "target", targetName, "error", err, "failures", failures)
 			} else {
@@ -253,6 +326,48 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 			timer.Reset(nextInterval(interval, failures))
 		}
 	}
+}
+
+func (monitor Monitor) recordTargetFailure(ctx context.Context, target string, services []core.Service) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	now := time.Now().UTC()
+	for _, service := range services {
+		if err := monitor.upsertMonitorStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: target, Health: core.HealthError, Message: "monitor target check failed", CheckedAt: now}); err != nil {
+			monitor.logger.Error("persist monitor target failure", "target", target, "service", service.ID, "error", err)
+		}
+	}
+}
+
+func runtimeServices(services []core.Service, runtime string) []core.Service {
+	result := make([]core.Service, 0, len(services))
+	for _, service := range services {
+		if service.Runtime == runtime {
+			result = append(result, service)
+		}
+	}
+	return result
+}
+
+func dockerServicesForTarget(services []core.Service, target config.DockerTarget, direct []config.DockerTarget) []core.Service {
+	result := make([]core.Service, 0, len(services))
+	for _, service := range services {
+		if service.Runtime == "compose" && dockerServiceAppliesToTarget(service, target, direct) {
+			result = append(result, service)
+		}
+	}
+	return result
+}
+
+func routeServices(services []core.Service) []core.Service {
+	result := make([]core.Service, 0, len(services))
+	for _, service := range services {
+		if len(httpRoutes(service.Exposure)) > 0 {
+			result = append(result, service)
+		}
+	}
+	return result
 }
 
 func nextInterval(interval time.Duration, failures int) time.Duration {
@@ -385,26 +500,66 @@ func dockerHealth(service core.Service, containers []dockerContainer) (core.Heal
 func dockerStatus(ctx context.Context, service core.Service, target string, containers []dockerContainer, imageInspector *dockerImageInspector) (core.HealthState, string, []core.ObservedImage) {
 	matches := matchingDockerContainers(service, containers)
 	observedImages := observedDockerImages(ctx, target, matches, imageInspector)
+	if len(matches) == 0 {
+		return core.HealthUnknown, "container not found", nil
+	}
+	worst := core.HealthHealthy
+	messages := make([]string, 0, len(matches))
 	for _, container := range matches {
+		lifecycle := strings.ToLower(strings.TrimSpace(container.State))
+		if lifecycle != "running" {
+			if lifecycle == "restarting" || lifecycle == "paused" {
+				worst = worseDockerHealth(worst, core.HealthDegraded)
+			} else {
+				worst = worseDockerHealth(worst, core.HealthUnhealthy)
+			}
+			messages = append(messages, strings.TrimSpace(container.Status))
+			continue
+		}
 		health := strings.ToLower(strings.TrimSpace(container.Health))
 		if health == "" {
 			health = containerHealthFromStatus(strings.ToLower(strings.TrimSpace(container.State)), strings.ToLower(strings.TrimSpace(container.Status)))
 		}
 		switch health {
 		case "healthy", "none":
-			return core.HealthHealthy, container.Status, observedImages
+			// already the best state
 		case "starting":
-			return core.HealthDegraded, container.Status, observedImages
+			worst = worseDockerHealth(worst, core.HealthDegraded)
 		case "unhealthy":
-			return core.HealthUnhealthy, container.Status, observedImages
+			worst = worseDockerHealth(worst, core.HealthUnhealthy)
 		default:
 			if strings.EqualFold(container.State, "restarting") {
-				return core.HealthDegraded, container.Status, observedImages
+				worst = worseDockerHealth(worst, core.HealthDegraded)
+			} else {
+				worst = worseDockerHealth(worst, core.HealthUnhealthy)
 			}
-			return core.HealthUnhealthy, container.Status, observedImages
 		}
+		messages = append(messages, strings.TrimSpace(container.Status))
 	}
-	return core.HealthUnknown, "container not found", nil
+	if len(matches) == 1 {
+		return worst, messages[0], observedImages
+	}
+	return worst, fmt.Sprintf("%d replicas: %s", len(matches), strings.Join(messages, "; ")), observedImages
+}
+
+func worseDockerHealth(left, right core.HealthState) core.HealthState {
+	if healthPriority(left) <= healthPriority(right) {
+		return left
+	}
+	return right
+}
+
+func healthPriority(health core.HealthState) int {
+	switch health {
+	case core.HealthUnhealthy:
+		return 0
+	case core.HealthDegraded:
+		return 1
+	case core.HealthHealthy:
+		return 2
+	default:
+		return -1
+	}
 }
 
 func containerHealthFromStatus(state, status string) string {

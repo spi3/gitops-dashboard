@@ -103,6 +103,7 @@ type StatusResult struct {
 	Health         HealthState     `json:"health"`
 	Message        string          `json:"message"`
 	CheckedAt      time.Time       `json:"checkedAt"`
+	ExpiresAt      time.Time       `json:"expiresAt,omitempty"`
 	ObservedImages []ObservedImage `json:"observedImages"`
 }
 
@@ -134,13 +135,16 @@ type DashboardSummary struct {
 type AgentInfo struct {
 	Target     string            `json:"target"`
 	LastSeenAt string            `json:"lastSeenAt"`
+	StaleAfter string            `json:"staleAfter,omitempty"`
 	Configured bool              `json:"configured"`
 	Containers []ContainerStatus `json:"containers"`
 }
 
 type AgentMessage struct {
-	Target     string            `json:"target"`
-	CheckedAt  time.Time         `json:"checkedAt"`
+	Target    string    `json:"target"`
+	CheckedAt time.Time `json:"checkedAt"`
+	// StaleAfter is server-owned reporting policy, never agent input.
+	StaleAfter time.Time         `json:"-"`
 	Containers []ContainerStatus `json:"containers"`
 }
 

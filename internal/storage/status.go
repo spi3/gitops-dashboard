@@ -14,6 +14,35 @@ import (
 	"github.com/example/gitops-dashboard/internal/routetarget"
 )
 
+// SetStatusTTL configures the freshness window for a monitor target. The
+// monitor derives this from its configured work cadence; legacy callers that
+// do not register a target keep their existing non-expiring compatibility.
+func (store *Store) SetStatusTTL(target string, ttl time.Duration) {
+	target = canonicalStatusTarget(target)
+	if target == "" || ttl <= 0 {
+		return
+	}
+	store.freshnessMu.Lock()
+	if store.statusTTLs == nil {
+		store.statusTTLs = map[string]time.Duration{}
+	}
+	store.statusTTLs[target] = ttl
+	store.freshnessMu.Unlock()
+}
+
+func (store *Store) statusTTL(target string) time.Duration {
+	target = canonicalStatusTarget(target)
+	store.freshnessMu.RLock()
+	defer store.freshnessMu.RUnlock()
+	if ttl := store.statusTTLs[target]; ttl > 0 {
+		return ttl
+	}
+	if parent, _, ok := strings.Cut(target, ": "); ok {
+		return store.statusTTLs[parent]
+	}
+	return 0
+}
+
 func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, error) {
 	parentRouteOverrides, err := store.parentRouteOverrideServices(ctx)
 	if err != nil {
@@ -24,7 +53,7 @@ func (store *Store) StatusResults(ctx context.Context) ([]core.StatusResult, err
 		return nil, err
 	}
 	rows, err := store.db.QueryContext(ctx, `
-SELECT rowid, service_id, target, health, message, checked_at, observed_images_json
+SELECT rowid, service_id, target, health, message, checked_at, expires_at, observed_images_json
 FROM status_results ORDER BY checked_at DESC
 `)
 	if err != nil {
@@ -35,8 +64,8 @@ FROM status_results ORDER BY checked_at DESC
 	for rows.Next() {
 		var status core.StatusResult
 		var rowID int64
-		var health, checkedAt, observedImages string
-		if err := rows.Scan(&rowID, &status.ServiceID, &status.Target, &health, &status.Message, &checkedAt, &observedImages); err != nil {
+		var health, checkedAt, expiresAt, observedImages string
+		if err := rows.Scan(&rowID, &status.ServiceID, &status.Target, &health, &status.Message, &checkedAt, &expiresAt, &observedImages); err != nil {
 			return nil, err
 		}
 		status.Health = core.HealthState(health)
@@ -49,6 +78,45 @@ FROM status_results ORDER BY checked_at DESC
 		}
 		if parsed, err := time.Parse(time.RFC3339, checkedAt); err == nil {
 			status.CheckedAt = parsed
+		}
+		if parsed, err := time.Parse(time.RFC3339, expiresAt); err == nil {
+			status.ExpiresAt = parsed
+		} else if !status.CheckedAt.IsZero() {
+			// Pre-T-032 rows retain their data but gain the same configured
+			// freshness policy as new rows after an upgrade.
+			basis := status.CheckedAt
+			// Legacy agent reports used agent-controlled checked_at. Prefer the
+			// server receipt to prevent a preserved future clock from extending
+			// health indefinitely after upgrade.
+			var received, staleAfter string
+			agentBacked := false
+			if err := store.db.QueryRowContext(ctx, `SELECT last_seen_at, stale_after FROM agents WHERE target=?`, status.Target).Scan(&received, &staleAfter); err == nil {
+				agentBacked = true
+				if seen, parseErr := time.Parse(time.RFC3339, received); parseErr == nil {
+					basis = seen
+				}
+			}
+			if parsed, parseErr := time.Parse(time.RFC3339, staleAfter); parseErr == nil {
+				status.ExpiresAt = parsed
+			} else if ttl := store.statusTTL(status.Target); ttl > 0 {
+				status.ExpiresAt = basis.Add(ttl)
+			} else if agentBacked && !status.CheckedAt.Equal(basis) {
+				// A removed/renamed agent has no current configured reporting
+				// policy. A historical projection (whose agent-controlled
+				// checked_at differs from the server receipt) must not remain
+				// healthy. Newly accepted compatibility reports use receipt time
+				// and retain their pre-T-032 non-expiring behavior.
+				status.ExpiresAt = basis
+			}
+		}
+		if !status.ExpiresAt.IsZero() {
+			if !time.Now().UTC().Before(status.ExpiresAt) && status.Health != core.HealthNotApplicable {
+				status.Health = core.HealthUnknown
+				status.Message = "monitor result is stale; waiting for a current check"
+				status.ObservedImages = []core.ObservedImage{}
+				// This is a materialized stale view, not a future cache boundary.
+				status.ExpiresAt = time.Time{}
+			}
 		}
 		if parentRouteOverrides[status.ServiceID] && strings.HasPrefix(status.Target, routeTargetPrefix) {
 			continue
@@ -127,6 +195,7 @@ INSERT INTO status_results(service_id, target, health, message, checked_at)
 VALUES(?, ?, ?, ?, ?)
 ON CONFLICT(service_id, target) DO UPDATE SET
   health=excluded.health, message=excluded.message, checked_at=excluded.checked_at,
+  expires_at='',
   observed_images_json='[]'
 `, serviceID, target, string(core.HealthNotApplicable), "not applicable", now); err != nil {
 			return fmt.Errorf("update status override %s/%s: %w", serviceID, target, err)
@@ -553,6 +622,12 @@ func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) 
 	if status.ObservedImages == nil {
 		status.ObservedImages = []core.ObservedImage{}
 	}
+	if status.ExpiresAt.IsZero() {
+		ttl := store.statusTTL(status.Target)
+		if ttl > 0 && !status.CheckedAt.IsZero() {
+			status.ExpiresAt = status.CheckedAt.UTC().Add(ttl)
+		}
+	}
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -569,16 +644,21 @@ func (store *Store) UpsertStatus(ctx context.Context, status core.StatusResult) 
 		status.Health = core.HealthNotApplicable
 		status.Message = "not applicable"
 		status.ObservedImages = []core.ObservedImage{}
+		status.ExpiresAt = time.Time{}
 	}
 	checkedAt := status.CheckedAt.UTC().Format(time.RFC3339)
+	expiresAt := ""
+	if !status.ExpiresAt.IsZero() {
+		expiresAt = status.ExpiresAt.UTC().Format(time.RFC3339)
+	}
 	message := store.redact(status.Message)
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO status_results(service_id, target, health, message, checked_at, observed_images_json)
-VALUES(?, ?, ?, ?, ?, ?)
+INSERT INTO status_results(service_id, target, health, message, checked_at, expires_at, observed_images_json)
+VALUES(?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(service_id, target) DO UPDATE SET
-  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at,
+  health=excluded.health, message=excluded.message, checked_at=excluded.checked_at, expires_at=excluded.expires_at,
   observed_images_json=excluded.observed_images_json
-`, status.ServiceID, status.Target, string(status.Health), message, checkedAt, toJSON(status.ObservedImages))
+`, status.ServiceID, status.Target, string(status.Health), message, checkedAt, expiresAt, toJSON(status.ObservedImages))
 	if err != nil {
 		return fmt.Errorf("upsert status %s/%s: %w", status.ServiceID, status.Target, err)
 	}
