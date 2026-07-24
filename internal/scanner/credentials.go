@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -80,19 +79,52 @@ func containsControlOrWhitespace(value string) bool {
 	return false
 }
 
-// containedRepoPath resolves the on-disk cache path for repo and verifies it
-// cannot escape repoCacheDir. The check is a straightforward
-// filepath.Rel-based containment test: the resolved path must be, or be
-// nested under, repoCacheDir. safeName already excludes path separators from
-// repository names, so escape is not expected in practice; this check exists
-// so the guarantee is explicit and enforced rather than incidental.
-func containedRepoPath(repoCacheDir string, repo config.RepositoryConfig) (string, error) {
-	repoPath := filepath.Join(repoCacheDir, safeName(repo.Name))
-	rel, err := filepath.Rel(repoCacheDir, repoPath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("repository %s cache path escapes the repository cache directory", repo.Name)
+// resolveContainedRepoPath resolves repo's on-disk cache candidate under
+// resolvedRoot and verifies containment before any Git command or
+// repository mutation runs, including T-060 origin reads/scrubs, origin
+// enumeration/reconciliation, fetch, checkout, pull, clone destination
+// creation, and rev-parse HEAD.
+//
+// A missing, non-symlink candidate is valid and may proceed to clone under
+// resolvedRoot. An existing candidate — including one reached only through a
+// symlink — is resolved with filepath.EvalSymlinks and must land strictly
+// inside resolvedRoot, checked with filepath.Rel rather than a string-prefix
+// comparison so a sibling directory sharing a prefix (e.g. "root-other")
+// is never mistaken for containment. Dangling or cyclic symlinks fail.
+func resolveContainedRepoPath(resolvedRoot string, repo config.RepositoryConfig) (repoPath string, exists bool, err error) {
+	candidate := filepath.Join(resolvedRoot, safeName(repo.Name))
+	if _, statErr := os.Lstat(candidate); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			return "", false, fmt.Errorf("resolve repository %s cache path: %w", repo.Name, statErr)
+		}
+		if !containedRel(resolvedRoot, candidate) {
+			return "", false, containmentError(repo.Name)
+		}
+		return candidate, false, nil
 	}
-	return repoPath, nil
+	resolvedCandidate, evalErr := filepath.EvalSymlinks(candidate)
+	if evalErr != nil {
+		return "", false, fmt.Errorf("resolve repository %s cache path: %w", repo.Name, evalErr)
+	}
+	if !containedRel(resolvedRoot, resolvedCandidate) {
+		return "", false, containmentError(repo.Name)
+	}
+	return resolvedCandidate, true, nil
+}
+
+// containedRel reports whether resolvedCandidate is strictly nested under
+// resolvedRoot: neither equal to it, "..", above it, nor an absolute
+// component path.
+func containedRel(resolvedRoot, resolvedCandidate string) bool {
+	rel, err := filepath.Rel(resolvedRoot, resolvedCandidate)
+	if err != nil || filepath.IsAbs(rel) || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func containmentError(name string) error {
+	return fmt.Errorf("repository %s cache path escapes the repository cache directory", name)
 }
 
 // scrubCachedOriginCredentials removes HTTP(S) userinfo from every cached
@@ -152,21 +184,15 @@ func scrubConfigURLList(ctx context.Context, repoPath string, redactor sanitizer
 func gitConfigGetAll(ctx context.Context, repoPath string, redactor sanitizer.Redactor, env []string, key string) ([]string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, GitCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, "git", "config", "--get-all", key)
-	cmd.Dir = repoPath
-	cmd.Env = append(os.Environ(), env...)
-	var out, stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err == nil {
-		return splitGitConfigLines(out.String()), nil
+	result := invokeGit(runCtx, repoPath, env, "config", "--get-all", key)
+	if result.err == nil {
+		return splitGitConfigLines(result.stdout), nil
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && out.Len() == 0 {
+	if errors.As(result.err, &exitErr) && exitErr.ExitCode() == 1 && result.stdout == "" {
 		return nil, nil
 	}
-	return nil, fmt.Errorf("git config --get-all %s: %w: %s", key, err, redactor.Redact(stderr.String()))
+	return nil, fmt.Errorf("git config --get-all %s: %w: %s", key, result.err, redactor.Redact(result.stderr))
 }
 
 func gitConfigUnsetAll(ctx context.Context, repoPath string, redactor sanitizer.Redactor, env []string, key string) error {
@@ -180,13 +206,9 @@ func gitConfigAdd(ctx context.Context, repoPath string, redactor sanitizer.Redac
 func gitConfigCommand(ctx context.Context, repoPath string, redactor sanitizer.Redactor, env []string, args ...string) error {
 	runCtx, cancel := context.WithTimeout(ctx, GitCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, "git", append([]string{"config"}, args...)...)
-	cmd.Dir = repoPath
-	cmd.Env = append(os.Environ(), env...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git config %s: %w: %s", redactor.Redact(strings.Join(args, " ")), err, redactor.Redact(stderr.String()))
+	result := invokeGit(runCtx, repoPath, env, append([]string{"config"}, args...)...)
+	if result.err != nil {
+		return fmt.Errorf("git config %s: %w: %s", redactor.Redact(strings.Join(args, " ")), result.err, redactor.Redact(result.stderr))
 	}
 	return nil
 }
@@ -202,23 +224,32 @@ func splitGitConfigLines(output string) []string {
 	return lines
 }
 
-// reconcileConfiguredOrigin keeps the cached origin's fetch URL in sync with
-// the token-auth URL the scanner is about to use, so the transient
-// environment-scoped extraHeader (keyed by exact URL string) actually
-// applies. It only acts for token-based auth: credential scrubbing itself is
-// already handled by scrubCachedOriginCredentials before this runs.
-func reconcileConfiguredOrigin(ctx context.Context, repoPath string, auth gitAuth) error {
-	if !auth.useTokenAuth {
-		return nil
-	}
-	current, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "get-url", "origin")
+// reconcileOrigin keeps the cached origin's fetch URL list equal to exactly
+// one entry: configuredCleanURL, the configured remote after
+// credentialFreeRemoteURL. It runs after T-060 scrubbing and before any
+// network-capable Git command, enumerating with exactly `git config
+// --get-all remote.origin.url` (see gitConfigGetAll for exit-code
+// semantics). A read failure, or a write failure while repairing a
+// mismatch, stops before fetch. This subsumes T-060's narrower
+// token-auth-only origin sync: an origin already equal to configuredCleanURL
+// — which is always the case once fetch and the token-auth extraHeader
+// (keyed by exact URL string) need to agree — is left untouched. Push URLs,
+// already scrubbed by T-060, are never touched here.
+func reconcileOrigin(ctx context.Context, repoPath string, redactor sanitizer.Redactor, env []string, configuredCleanURL string) error {
+	fetchURLs, err := gitConfigGetAll(ctx, repoPath, redactor, env, "remote.origin.url")
 	if err != nil {
 		return err
 	}
-	current = strings.TrimSpace(current)
-	if current == auth.remoteURL {
-		return nil
+	if len(fetchURLs) == 1 {
+		clean, _, cleanErr := credentialFreeRemoteURL(fetchURLs[0])
+		if cleanErr == nil && clean == configuredCleanURL {
+			return nil
+		}
 	}
-	_, err = gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "set-url", "origin", auth.remoteURL)
-	return err
+	if len(fetchURLs) > 0 {
+		if err := gitConfigUnsetAll(ctx, repoPath, redactor, env, "remote.origin.url"); err != nil {
+			return err
+		}
+	}
+	return gitConfigAdd(ctx, repoPath, redactor, env, "remote.origin.url", configuredCleanURL)
 }

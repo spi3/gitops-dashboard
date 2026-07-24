@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -914,41 +916,33 @@ func TestScanAllFailedFetchMigratesCredentialedRemoteAndDoesNotLeak(t *testing.T
 	assertNoTokenInTree(t, dataDir, token)
 }
 
-func TestReconcileConfiguredOriginLeavesNonTokenAuthUnchanged(t *testing.T) {
+func TestOriginReconciliationLeavesMatchingSingleURLUnchanged(t *testing.T) {
 	ctx := context.Background()
 	repoPath := t.TempDir()
 	runGit(t, repoPath, "init", "-b", "main")
-	origin := "ssh://git@github.com/org/repo.git"
+	origin := "https://example.test/org/repo.git"
 	runGit(t, repoPath, "remote", "add", "origin", origin)
-	auth := gitAuth{
-		remoteURL: "https://github.com/org/other.git",
-		redactor:  sanitizer.New("token"),
-	}
-	if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
+	if err := reconcileOrigin(ctx, repoPath, sanitizer.New("token"), nil, origin); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
 	if got != origin {
-		t.Fatalf("origin = %q, want unchanged %q since auth is not token-based", got, origin)
+		t.Fatalf("origin = %q, want unchanged %q", got, origin)
 	}
 }
 
-func TestReconcileConfiguredOriginUpdatesTokenAuthOrigin(t *testing.T) {
+func TestOriginReconciliationRepairsMismatchedURL(t *testing.T) {
 	ctx := context.Background()
 	repoPath := t.TempDir()
 	runGit(t, repoPath, "init", "-b", "main")
 	runGit(t, repoPath, "remote", "add", "origin", "https://old.example.test/org/repo.git")
-	auth := gitAuth{
-		remoteURL:    "https://new.example.test/org/repo.git",
-		redactor:     sanitizer.New("token"),
-		useTokenAuth: true,
-	}
-	if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
+	want := "https://new.example.test/org/repo.git"
+	if err := reconcileOrigin(ctx, repoPath, sanitizer.New("token"), nil, want); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
-	if got != auth.remoteURL {
-		t.Fatalf("origin = %q, want reconciled to %q", got, auth.remoteURL)
+	if got != want {
+		t.Fatalf("origin = %q, want reconciled to %q", got, want)
 	}
 }
 
@@ -1083,8 +1077,10 @@ func TestCachedOriginScrubPrecedesCredentialValidation(t *testing.T) {
 // representative pre-change fixture: multiple fetch URLs, multiple push
 // URLs, credentials in at least one of each, and one credential-free
 // non-HTTP(S) URL. It proves synchronization removes every HTTP(S) userinfo
-// value, preserving counts, ordering, and the non-HTTP value, before the
-// first network attempt (an unreachable host here stands in for "network").
+// value before the first network attempt (an unreachable host here stands in
+// for "network"), preserving push URL count and ordering; the fetch URL list
+// is then reconciled (T-061) down to exactly the single configured URL,
+// since three cached fetch URLs are themselves a mismatch.
 func TestSyncRepoScrubsMultipleCachedOriginURLsBeforeNetworkAttempt(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1128,11 +1124,10 @@ func TestSyncRepoScrubsMultipleCachedOriginURLsBeforeNetworkAttempt(t *testing.T
 		assertNoToken(t, "returned error", err.Error(), pushToken)
 	}
 
-	wantFetch := []string{
-		"https://127.0.0.1:1/private/repo-a.git",
-		"https://127.0.0.1:1/private/repo-b.git",
-		"ssh://git@127.0.0.1/private/repo-c.git",
-	}
+	// T-061 origin reconciliation runs after scrub and before fetch: three
+	// cached fetch URLs can never match the single configured URL, so it
+	// repairs the list down to exactly that one value.
+	wantFetch := []string{"https://127.0.0.1:1/private/repo-a.git"}
 	gotFetch := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
 	if !reflect.DeepEqual(gotFetch, wantFetch) {
 		t.Fatalf("fetch urls = %#v, want %#v", gotFetch, wantFetch)
@@ -1371,4 +1366,628 @@ func gitOutputForTest(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v failed: %v", args, err)
 	}
 	return string(output)
+}
+
+// withGitExec substitutes the package's git-command seam for the duration of
+// the calling test, restoring the previous value on cleanup. Like
+// t.Setenv, this mutates process-wide state, so a test using it must not
+// call t.Parallel(): Go only runs parallel tests concurrently after every
+// non-parallel test (including this one) has already completed.
+func withGitExec(t *testing.T, fn gitExecFunc) {
+	t.Helper()
+	previous := currentGitExecFn.Load()
+	currentGitExecFn.Store(fn)
+	t.Cleanup(func() { currentGitExecFn.Store(previous) })
+}
+
+// failingGitCommand returns a gitExecFunc that fails only invocations whose
+// first argument is subcommand, delegating every other git invocation to the
+// real production implementation.
+func failingGitCommand(subcommand string, failure error) gitExecFunc {
+	return func(ctx context.Context, dir string, env []string, args []string) gitExecResult {
+		if len(args) > 0 && args[0] == subcommand {
+			return gitExecResult{err: failure}
+		}
+		return productionGitExec(ctx, dir, env, args)
+	}
+}
+
+// twoPhaseFixture runs one successful ScanAll against createOriginFixtureSourceA
+// and returns everything a failure test needs to induce and assert a second,
+// failing attempt against the same populated cache.
+func twoPhaseFixture(t *testing.T) (ctx context.Context, scanner Scanner, store *storage.Store, repoPath, sourceSHA string) {
+	t.Helper()
+	ctx = context.Background()
+	source, sha := createOriginFixtureSourceA(t)
+	dataDir := t.TempDir()
+	var err error
+	store, err = storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + source, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner = New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, scanner, store, filepath.Join(repoCacheDir, "fixture"), sha
+}
+
+// assertTerminalFailedScan asserts the newest persisted scan row for
+// repoName is a terminal error with the exact commit truthfulness this task
+// requires: the failed row's CommitSHA, and the repository summary's
+// LastCommit, both equal wantCommit (the prior successful SHA, or empty when
+// none ever succeeded).
+func assertTerminalFailedScan(t *testing.T, ctx context.Context, store *storage.Store, repoName, wantCommit string) {
+	t.Helper()
+	scans, err := store.Scans(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// started_at has only second resolution, so ties are possible within a
+	// fast test; select by the monotonically increasing ID rather than
+	// trusting ORDER BY started_at DESC to break ties correctly.
+	var newest core.Scan
+	found := false
+	for _, scan := range scans {
+		if scan.Repository != repoName {
+			continue
+		}
+		if !found || scan.ID > newest.ID {
+			newest = scan
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no scan found for repository %s", repoName)
+	}
+	if newest.Status != "error" {
+		t.Fatalf("newest scan status = %q, want error: %#v", newest.Status, newest)
+	}
+	if newest.CommitSHA != wantCommit {
+		t.Fatalf("newest scan commit_sha = %q, want %q", newest.CommitSHA, wantCommit)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range summary.Repositories {
+		if repo.Name == repoName && repo.LastCommit != wantCommit {
+			t.Fatalf("summary LastCommit = %q, want %q", repo.LastCommit, wantCommit)
+		}
+	}
+}
+
+func assertTerminalOKScan(t *testing.T, ctx context.Context, store *storage.Store, repoName, wantCommit string) {
+	t.Helper()
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range summary.Repositories {
+		if repo.Name == repoName {
+			if repo.Status != "ok" {
+				t.Fatalf("status = %q, want ok", repo.Status)
+			}
+			if repo.LastCommit != wantCommit {
+				t.Fatalf("LastCommit = %q, want %q", repo.LastCommit, wantCommit)
+			}
+			return
+		}
+	}
+	t.Fatalf("repository %s missing from summary", repoName)
+}
+
+func assertServiceNames(t *testing.T, ctx context.Context, store *storage.Store, repoName string, want ...string) {
+	t.Helper()
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, service := range summary.Services {
+		if service.Repository == repoName {
+			got = append(got, service.Name)
+		}
+	}
+	sort.Strings(got)
+	wantSorted := append([]string{}, want...)
+	sort.Strings(wantSorted)
+	if !reflect.DeepEqual(got, wantSorted) {
+		t.Fatalf("services for %s = %#v, want %#v", repoName, got, wantSorted)
+	}
+}
+
+func assertAncestor(t *testing.T, repoDir, ancestor, descendant string) {
+	t.Helper()
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd.Dir = repoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git merge-base --is-ancestor %s %s failed: %v", ancestor, descendant, err)
+	}
+}
+
+// createOriginFixtureSourceA builds the minimal single-service fixture the
+// origin-reconciliation and divergence tests share: branch main, a single
+// docker-compose.yml, and the exact baseline commit subject and service name
+// the spec requires.
+func createOriginFixtureSourceA(t *testing.T) (dir, sha string) {
+	t.Helper()
+	dir = t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.name", "Test")
+	runGit(t, dir, "config", "user.email", "test@example.invalid")
+	writeComposeService(t, dir, "source-a")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "fixture: source A baseline")
+	return dir, strings.TrimSpace(gitOutputForTest(t, dir, "rev-parse", "HEAD"))
+}
+
+// createOriginFixtureSourceBFastForward clones sourceA and adds one strict
+// descendant commit, so the result is a fast-forward of source A on the same
+// branch and history.
+func createOriginFixtureSourceBFastForward(t *testing.T, sourceA string) (dir, sha string) {
+	t.Helper()
+	parent := t.TempDir()
+	runGit(t, parent, "clone", sourceA, "source-b")
+	dir = filepath.Join(parent, "source-b")
+	runGit(t, dir, "config", "user.name", "Test")
+	runGit(t, dir, "config", "user.email", "test@example.invalid")
+	writeComposeService(t, dir, "source-b")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "fixture: source B fast-forward")
+	return dir, strings.TrimSpace(gitOutputForTest(t, dir, "rev-parse", "HEAD"))
+}
+
+// createOriginFixtureSourceBDiverged builds an unrelated history on branch
+// main, so its tip never contains source A's commit as an ancestor.
+func createOriginFixtureSourceBDiverged(t *testing.T) (dir, sha string) {
+	t.Helper()
+	dir = t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.name", "Test")
+	runGit(t, dir, "config", "user.email", "test@example.invalid")
+	writeComposeService(t, dir, "source-b-diverged")
+	runGit(t, dir, "add", ".")
+	runGit(t, dir, "commit", "-m", "fixture: source B diverged")
+	return dir, strings.TrimSpace(gitOutputForTest(t, dir, "rev-parse", "HEAD"))
+}
+
+func writeComposeService(t *testing.T, dir, service string) {
+	t.Helper()
+	writeFile(t, filepath.Join(dir, "docker-compose.yml"), fmt.Sprintf(`
+services:
+  %s:
+    image: example/%s:v1
+`, service, service))
+}
+
+func TestScanAllPersistsRootPreflightFailure(t *testing.T) {
+	ctx := context.Background()
+	source, sourceSHA := createOriginFixtureSourceA(t)
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + source, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+
+	// Corrupt the cache root itself so filepath.Abs+MkdirAll+EvalSymlinks
+	// preflight fails before any candidate resolution or Git command.
+	if err := os.RemoveAll(repoCacheDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repoCacheDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want root preflight failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestExternalCacheSymlinkIsUntouched(t *testing.T) {
+	ctx := context.Background()
+	external := createFixtureRepo(t)
+	resolvedExternal, err := filepath.EvalSymlinks(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	if err := os.MkdirAll(repoCacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repoName := "fixture"
+	link := filepath.Join(repoCacheDir, safeName(repoName))
+	if err := os.Symlink(external, link); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeHead := strings.TrimSpace(gitOutputForTest(t, external, "rev-parse", "HEAD"))
+	beforeRemotes := gitOutputForTest(t, external, "remote", "-v")
+	beforeStatus := gitOutputForTest(t, external, "status", "--porcelain")
+	indexPath := filepath.Join(external, ".git", "index")
+	beforeIndex, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(external, "prod", "compose.yaml")
+	beforeMarker, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var touched bool
+	withGitExec(t, func(ctx context.Context, dir string, env []string, args []string) gitExecResult {
+		if dir == external || dir == resolvedExternal {
+			mu.Lock()
+			touched = true
+			mu.Unlock()
+		}
+		return productionGitExec(ctx, dir, env, args)
+	})
+
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: repoName, URL: "file://" + external, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want containment failure for external symlink")
+	}
+	assertTerminalFailedScan(t, ctx, store, repoName, "")
+
+	mu.Lock()
+	gotTouched := touched
+	mu.Unlock()
+	if gotTouched {
+		t.Fatal("a Git command ran against the external symlinked repository")
+	}
+
+	afterHead := strings.TrimSpace(gitOutputForTest(t, external, "rev-parse", "HEAD"))
+	if afterHead != beforeHead {
+		t.Fatalf("external HEAD changed: %q -> %q", beforeHead, afterHead)
+	}
+	afterRemotes := gitOutputForTest(t, external, "remote", "-v")
+	if afterRemotes != beforeRemotes {
+		t.Fatalf("external remotes changed:\nbefore=%q\nafter=%q", beforeRemotes, afterRemotes)
+	}
+	afterStatus := gitOutputForTest(t, external, "status", "--porcelain")
+	if afterStatus != beforeStatus {
+		t.Fatalf("external worktree status changed:\nbefore=%q\nafter=%q", beforeStatus, afterStatus)
+	}
+	afterIndex, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeIndex, afterIndex) {
+		t.Fatal(".git/index bytes changed")
+	}
+	afterMarker, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeMarker, afterMarker) {
+		t.Fatal("representative worktree file changed")
+	}
+}
+
+func TestOriginEnumerationEmptyListRepairs(t *testing.T) {
+	ctx := context.Background()
+	source, sourceSHA := createOriginFixtureSourceA(t)
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	repoPath := filepath.Join(repoCacheDir, "fixture")
+	runGit(t, dataDir, "clone", "file://"+source, repoPath)
+	runGit(t, repoPath, "config", "--unset-all", "remote.origin.url")
+
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + source, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchURLs := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
+	if len(fetchURLs) != 1 || fetchURLs[0] != "file://"+source {
+		t.Fatalf("fetch urls = %#v, want repaired single configured url", fetchURLs)
+	}
+	assertTerminalOKScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestOriginEnumerationReadFailureStopsBeforeFetch(t *testing.T) {
+	ctx, scanner, store, _, sourceSHA := twoPhaseFixture(t)
+
+	urlGetAllCount := 0
+	fetchInvoked := false
+	withGitExec(t, func(ctx context.Context, dir string, env []string, args []string) gitExecResult {
+		if len(args) > 0 && args[0] == "fetch" {
+			fetchInvoked = true
+		}
+		if len(args) >= 3 && args[0] == "config" && args[1] == "--get-all" && args[2] == "remote.origin.url" {
+			urlGetAllCount++
+			// The first call is T-060's own scrub enumeration; the second is
+			// this task's origin enumeration. Only the second fails.
+			if urlGetAllCount == 2 {
+				return gitExecResult{err: errors.New("simulated origin enumeration read failure")}
+			}
+		}
+		return productionGitExec(ctx, dir, env, args)
+	})
+
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want origin enumeration read failure")
+	}
+	if fetchInvoked {
+		t.Fatal("fetch ran despite origin enumeration read failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestOriginReconciliationWriteFailureStopsBeforeFetch(t *testing.T) {
+	ctx, scanner, store, repoPath, sourceSHA := twoPhaseFixture(t)
+	// Force a mismatch so reconciliation attempts a write.
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "https://example.test/other/repo.git")
+
+	fetchInvoked := false
+	withGitExec(t, func(ctx context.Context, dir string, env []string, args []string) gitExecResult {
+		if len(args) > 0 && args[0] == "fetch" {
+			fetchInvoked = true
+		}
+		if len(args) >= 2 && args[0] == "config" && (args[1] == "--unset-all" || args[1] == "--add") {
+			return gitExecResult{err: errors.New("simulated origin reconciliation write failure")}
+		}
+		return productionGitExec(ctx, dir, env, args)
+	})
+
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want origin reconciliation write failure")
+	}
+	if fetchInvoked {
+		t.Fatal("fetch ran despite origin reconciliation write failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestScanAllPersistsFetchFailure(t *testing.T) {
+	ctx, scanner, store, _, sourceSHA := twoPhaseFixture(t)
+	withGitExec(t, failingGitCommand("fetch", errors.New("simulated fetch failure")))
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want fetch failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestScanAllPersistsCheckoutFailure(t *testing.T) {
+	ctx, scanner, store, _, sourceSHA := twoPhaseFixture(t)
+	withGitExec(t, failingGitCommand("checkout", errors.New("simulated checkout failure")))
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want checkout failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+// TestScanAllPersistsFastForwardFailureForHEAD proves the removed
+// DefaultRef-HEAD exception: before this task, a `git pull --ff-only`
+// failure was silently ignored whenever DefaultRef was "HEAD". It is fatal
+// now, for every DefaultRef.
+func TestScanAllPersistsFastForwardFailureForHEAD(t *testing.T) {
+	ctx := context.Background()
+	source, sourceSHA := createOriginFixtureSourceA(t)
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + source, DefaultRef: "HEAD"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	withGitExec(t, failingGitCommand("pull", errors.New("simulated fast-forward failure")))
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want fast-forward failure even with DefaultRef HEAD")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestScanAllPersistsRevParseFailure(t *testing.T) {
+	ctx, scanner, store, _, sourceSHA := twoPhaseFixture(t)
+	withGitExec(t, failingGitCommand("rev-parse", errors.New("simulated rev-parse failure")))
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want rev-parse failure")
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", sourceSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestScanAllReconcilesFastForwardOrigin(t *testing.T) {
+	ctx := context.Background()
+	sourceA, aSHA := createOriginFixtureSourceA(t)
+	sourceB, bSHA := createOriginFixtureSourceBFastForward(t, sourceA)
+	if aSHA == bSHA {
+		t.Fatal("fixture setup: A_SHA and B_SHA must differ")
+	}
+	assertAncestor(t, sourceB, aSHA, bSHA)
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + sourceA, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+
+	repoPath := filepath.Join(repoCacheDir, "fixture")
+	safePush := "https://example.test/safe/push.git"
+	runGit(t, repoPath, "config", "--add", "remote.origin.pushurl", safePush)
+	marker := filepath.Join(repoPath, ".git", "gitops-no-reclone-marker")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Repositories[0].URL = "file://" + sourceB
+	scanner = New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cache was recloned: marker missing: %v", err)
+	}
+	fetchURLs := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
+	if len(fetchURLs) != 1 || fetchURLs[0] != "file://"+sourceB {
+		t.Fatalf("fetch urls = %#v, want exactly [file://%s]", fetchURLs, sourceB)
+	}
+	pushURLs := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.pushurl"))
+	if len(pushURLs) != 1 || pushURLs[0] != safePush {
+		t.Fatalf("push urls = %#v, want preserved [%s]", pushURLs, safePush)
+	}
+	head := strings.TrimSpace(gitOutputForTest(t, repoPath, "rev-parse", "HEAD"))
+	if head != bSHA {
+		t.Fatalf("HEAD = %q, want fast-forwarded to %q", head, bSHA)
+	}
+	assertTerminalOKScan(t, ctx, store, "fixture", bSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-b")
+}
+
+func TestScanAllDivergedOriginFailsTruthfully(t *testing.T) {
+	ctx := context.Background()
+	sourceA, aSHA := createOriginFixtureSourceA(t)
+	sourceBDiverged, bSHA := createOriginFixtureSourceBDiverged(t)
+	if aSHA == bSHA {
+		t.Fatal("fixture setup: A_SHA and diverged B_SHA must differ")
+	}
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{Name: "fixture", URL: "file://" + sourceA, DefaultRef: "main"}},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+
+	repoPath := filepath.Join(repoCacheDir, "fixture")
+	marker := filepath.Join(repoPath, ".git", "gitops-no-reclone-marker")
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	headBefore := strings.TrimSpace(gitOutputForTest(t, repoPath, "rev-parse", "HEAD"))
+	indexBefore, err := os.ReadFile(filepath.Join(repoPath, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Repositories[0].URL = "file://" + sourceBDiverged
+	scanner = New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err == nil {
+		t.Fatal("ScanAll succeeded, want diverged fast-forward failure")
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cache was recloned or reset: marker missing: %v", err)
+	}
+	headAfter := strings.TrimSpace(gitOutputForTest(t, repoPath, "rev-parse", "HEAD"))
+	if headAfter != headBefore {
+		t.Fatalf("HEAD changed despite ff-only failure: %q -> %q", headBefore, headAfter)
+	}
+	indexAfter, err := os.ReadFile(filepath.Join(repoPath, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(indexBefore, indexAfter) {
+		t.Fatal(".git/index mutated despite ff-only failure")
+	}
+	fetchURLs := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
+	if len(fetchURLs) != 1 || fetchURLs[0] != "file://"+sourceBDiverged {
+		t.Fatalf("fetch urls = %#v, want reconciled to [file://%s] despite ff-only failure", fetchURLs, sourceBDiverged)
+	}
+	assertTerminalFailedScan(t, ctx, store, "fixture", aSHA)
+	assertServiceNames(t, ctx, store, "fixture", "source-a")
+}
+
+func TestRepositorySyncOperationBudgetIncludesOriginReconciliation(t *testing.T) {
+	t.Parallel()
+	if repoSyncGitCommands != 7 {
+		t.Fatalf("repoSyncGitCommands = %d, want 7 (origin enumeration, reconciliation unset-all+add, fetch, checkout, fast-forward pull, and HEAD resolution)", repoSyncGitCommands)
+	}
+	want := time.Duration(repoSyncGitCommands)*GitCommandTimeout + 30*time.Second
+	if repoSyncOperationTimeout != want {
+		t.Fatalf("repoSyncOperationTimeout = %v, want %v derived from repoSyncGitCommands", repoSyncOperationTimeout, want)
+	}
 }

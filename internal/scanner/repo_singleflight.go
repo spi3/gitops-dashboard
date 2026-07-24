@@ -88,10 +88,14 @@ func (group *repoOperationGroup) doDetached(ctx context.Context, key string, fn 
 	}
 }
 
-func (scanner Scanner) repoOperationKey(repo config.RepositoryConfig) (string, error) {
-	repoCacheDir, err := scanner.ensureRepoCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(repoCacheDir, safeName(repo.Name)), nil
+// repoOperationKey is a purely lexical (no I/O, cannot fail) coalescing key:
+// the configured, unresolved cache directory joined with the repository's
+// safe name. It must not perform any fallible cache-root resolution — a
+// per-repository scan row must exist before that can fail — while still
+// staying unique per Scanner configuration, since repoScanFlights and
+// repoSyncFlights are process-wide and would otherwise coalesce unrelated
+// Scanner instances (e.g. concurrent tests) that happen to share a
+// repository name.
+func (scanner Scanner) repoOperationKey(repo config.RepositoryConfig) string {
+	return filepath.Join(scanner.cfg.Server.RepoCacheDir, safeName(repo.Name))
 }

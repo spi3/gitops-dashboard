@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -10,7 +9,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -33,8 +31,18 @@ type Scanner struct {
 }
 
 const (
-	GitCommandTimeout        = 2 * time.Minute
-	repoSyncGitCommands      = 6
+	GitCommandTimeout = 2 * time.Minute
+
+	// repoSyncGitCommands bounds a single repository synchronization attempt
+	// (syncRepoUnshared, for a repository whose cache already exists) to at
+	// most 7 network- or filesystem-capable Git subprocess invocations:
+	// origin enumeration (`config --get-all`), origin reconciliation
+	// (`config --unset-all` plus `config --add`), fetch, checkout,
+	// fast-forward pull, and HEAD resolution. Each is individually bounded
+	// by GitCommandTimeout; this constant sizes the outer
+	// repoSyncOperationTimeout so a legitimate full sequence never races
+	// that per-command budget.
+	repoSyncGitCommands      = 7
 	repoSyncOperationTimeout = time.Duration(repoSyncGitCommands)*GitCommandTimeout + 30*time.Second
 )
 
@@ -44,10 +52,6 @@ func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Scanner {
 
 func (scanner Scanner) RunScheduled(ctx context.Context) {
 	if len(scanner.cfg.Repositories) == 0 {
-		return
-	}
-	if _, err := scanner.ensureRepoCacheDir(); err != nil {
-		scanner.logger.Error("scheduled scans disabled", "error", err)
 		return
 	}
 	if err := scanner.store.EnsureRepositories(ctx, scanner.cfg.Repositories); err != nil {
@@ -68,9 +72,6 @@ func (scanner Scanner) RunScheduled(ctx context.Context) {
 }
 
 func (scanner Scanner) ScanAll(ctx context.Context) error {
-	if _, err := scanner.ensureRepoCacheDir(); err != nil {
-		return err
-	}
 	if err := scanner.store.EnsureRepositories(ctx, scanner.cfg.Repositories); err != nil {
 		return err
 	}
@@ -101,11 +102,11 @@ func (scanner Scanner) runRepoLoop(ctx context.Context, repo config.RepositoryCo
 }
 
 func (scanner Scanner) scanOne(ctx context.Context, repo config.RepositoryConfig) error {
-	key, err := scanner.repoOperationKey(repo)
-	if err != nil {
-		return err
-	}
-	_, err = repoScanFlights.do(ctx, key, func() (any, error) {
+	// repoOperationKey is a non-I/O lexical key: a per-repository scan row
+	// (below, inside scanOneUnshared) must exist before cache-root
+	// resolution can fail, so key derivation itself must never touch the
+	// filesystem.
+	_, err := repoScanFlights.do(ctx, scanner.repoOperationKey(repo), func() (any, error) {
 		return nil, scanner.scanOneUnshared(ctx, repo)
 	})
 	return err
@@ -116,18 +117,15 @@ func (scanner Scanner) scanOneUnshared(ctx context.Context, repo config.Reposito
 	if err != nil {
 		return err
 	}
-	commit := ""
+	var result syncResult
 	var services []core.Service
 	scanErr := func() error {
-		path, err := scanner.syncRepo(ctx, repo)
+		var err error
+		result, err = scanner.syncRepo(ctx, repo)
 		if err != nil {
 			return err
 		}
-		commit, err = gitOutput(ctx, path, sanitizer.Redactor{}, nil, "rev-parse", "HEAD")
-		if err != nil {
-			return err
-		}
-		services, err = scanner.parseRepo(path, repo, strings.TrimSpace(commit))
+		services, err = scanner.parseRepo(result.path, repo, result.commit)
 		return err
 	}()
 	var replacements []storage.RouteTargetReplacement
@@ -152,10 +150,41 @@ func (scanner Scanner) scanOneUnshared(ctx context.Context, repo config.Reposito
 	}
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if err := scanner.store.FinishScanWithRouteTargetChanges(finishCtx, scanID, repo.Name, strings.TrimSpace(commit), services, scanErr, replacements, exclusions, scanner.cfg.Runtime.HTTP); err != nil {
+	// A failed attempt is never authoritative for the repository's last
+	// known commit: it persists whatever commit previously succeeded (or
+	// stays empty when none ever did), rather than this attempt's own
+	// partial or empty result.
+	commit := result.commit
+	if scanErr != nil {
+		prior, priorErr := scanner.priorSuccessfulCommit(finishCtx, repo.Name)
+		if priorErr != nil {
+			scanner.logger.Warn("could not resolve prior commit for failed scan", "repository", repo.Name, "error", priorErr)
+		} else {
+			commit = prior
+		}
+	}
+	if err := scanner.store.FinishScanWithRouteTargetChanges(finishCtx, scanID, repo.Name, commit, services, scanErr, replacements, exclusions, scanner.cfg.Runtime.HTTP); err != nil {
 		return err
 	}
 	return scanErr
+}
+
+// priorSuccessfulCommit returns the repository's last known commit as
+// recorded by its most recent finished scan (empty if none has ever
+// succeeded). It is read before FinishScanWithRouteTargetChanges overwrites
+// it, so a failed attempt can pass the same value back in and leave it
+// truthfully unchanged.
+func (scanner Scanner) priorSuccessfulCommit(ctx context.Context, repoName string) (string, error) {
+	repos, err := scanner.store.Repositories(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, repo := range repos {
+		if repo.Name == repoName {
+			return repo.LastCommit, nil
+		}
+	}
+	return "", nil
 }
 
 // routeTargetReplacements derives only provenance-backed, bijective replacements
@@ -270,8 +299,19 @@ func replacementInvariantMatch(oldRoute, newRoute string) bool {
 		oldURL.EscapedPath() == newURL.EscapedPath() && oldURL.RawQuery == newURL.RawQuery && oldURL.Fragment == newURL.Fragment && oldURL.Port() != newURL.Port()
 }
 
+// syncResult is what a repository synchronization attempt produces: the
+// resolved on-disk repository path and the commit it landed on.
+type syncResult struct {
+	path   string
+	commit string
+}
+
 func (scanner Scanner) SyncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
-	return scanner.syncRepo(ctx, repo)
+	result, err := scanner.syncRepo(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	return result.path, nil
 }
 
 func CurrentCommit(ctx context.Context, repoPath string) (string, error) {
@@ -279,12 +319,11 @@ func CurrentCommit(ctx context.Context, repoPath string) (string, error) {
 	return strings.TrimSpace(commit), err
 }
 
-func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfig) (string, error) {
-	key, err := scanner.repoOperationKey(repo)
-	if err != nil {
-		return "", err
-	}
-	value, err := repoSyncFlights.doDetached(ctx, key, func() (any, error) {
+func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfig) (syncResult, error) {
+	// This group coalesces the underlying Git work itself (distinct from
+	// repoScanFlights, which coalesces the scan row/attempt); see
+	// repoOperationKey and scanOne.
+	value, err := repoSyncFlights.doDetached(ctx, scanner.repoOperationKey(repo), func() (any, error) {
 		// Keep the shared git operation alive when a monitor-scoped caller times out;
 		// each caller still bounds its own wait through doDetached.
 		syncCtx, cancel := context.WithTimeout(context.Background(), repoSyncOperationTimeout)
@@ -292,19 +331,29 @@ func (scanner Scanner) syncRepo(ctx context.Context, repo config.RepositoryConfi
 		return scanner.syncRepoUnshared(syncCtx, repo)
 	})
 	if err != nil {
-		return "", err
+		return syncResult{}, err
 	}
-	return value.(string), nil
+	return value.(syncResult), nil
 }
 
-func (scanner Scanner) syncRepoUnshared(ctx context.Context, repo config.RepositoryConfig) (string, error) {
-	repoCacheDir, err := scanner.ensureRepoCacheDir()
+func (scanner Scanner) syncRepoUnshared(ctx context.Context, repo config.RepositoryConfig) (syncResult, error) {
+	resolvedRoot, err := scanner.resolveRepoCacheRoot()
 	if err != nil {
-		return "", err
+		return syncResult{}, err
 	}
-	repoPath, err := containedRepoPath(repoCacheDir, repo)
+	repoPath, pathExists, err := resolveContainedRepoPath(resolvedRoot, repo)
 	if err != nil {
-		return "", err
+		return syncResult{}, err
+	}
+	// cacheExists tracks whether repoPath holds a usable Git working copy,
+	// not merely whether something exists there: a leftover, non-git
+	// directory (e.g. from a prior interrupted clone) still routes through
+	// clone below, exactly as an absent path does.
+	cacheExists := false
+	if pathExists {
+		if _, statErr := os.Stat(filepath.Join(repoPath, ".git")); statErr == nil {
+			cacheExists = true
+		}
 	}
 
 	// Register configured URL-userinfo redaction values immediately, before
@@ -317,63 +366,74 @@ func (scanner Scanner) syncRepoUnshared(ctx context.Context, repo config.Reposit
 	redactor := sanitizer.New(redactionValues...)
 	env := gitEnv(repo)
 
-	cacheExists := false
-	if _, statErr := os.Stat(filepath.Join(repoPath, ".git")); statErr == nil {
-		cacheExists = true
+	if cacheExists {
 		// Scrub any credential-bearing cached origin URLs before resolving
 		// the repository's own credential source, validating its transport,
 		// reconciling the origin, or performing any network-capable Git
 		// command. A scrub failure fails the attempt with no network access.
 		if err := scrubCachedOriginCredentials(ctx, repoPath, redactor, env); err != nil {
-			return "", err
+			return syncResult{}, err
 		}
 	}
 
 	auth, err := scanner.gitAuth(repo)
 	if err != nil {
-		return "", err
+		return syncResult{}, err
 	}
 
 	if cacheExists {
-		if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
-			return "", err
+		if err := reconcileOrigin(ctx, repoPath, auth.redactor, auth.env, auth.remoteURL); err != nil {
+			return syncResult{}, err
 		}
 		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "fetch", "--all", "--prune"); err != nil {
-			return "", err
+			return syncResult{}, err
 		}
 		if repo.DefaultRef != "HEAD" {
 			if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "checkout", repo.DefaultRef); err != nil {
-				return "", err
+				return syncResult{}, err
 			}
 		}
-		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "pull", "--ff-only"); err != nil && repo.DefaultRef != "HEAD" {
-			return "", err
+		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "pull", "--ff-only"); err != nil {
+			return syncResult{}, err
 		}
-		return repoPath, nil
+	} else {
+		if err := os.MkdirAll(filepath.Dir(repoPath), 0o700); err != nil {
+			return syncResult{}, err
+		}
+		args := []string{"clone"}
+		if repo.DefaultRef != "" && repo.DefaultRef != "HEAD" {
+			args = append(args, "--branch", repo.DefaultRef)
+		}
+		args = append(args, auth.remoteURL, repoPath)
+		if _, err := gitOutput(ctx, resolvedRoot, auth.redactor, auth.env, args...); err != nil {
+			return syncResult{}, err
+		}
 	}
-	if err := os.MkdirAll(filepath.Dir(repoPath), 0o700); err != nil {
-		return "", err
+
+	commit, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "rev-parse", "HEAD")
+	if err != nil {
+		return syncResult{}, err
 	}
-	args := []string{"clone"}
-	if repo.DefaultRef != "" && repo.DefaultRef != "HEAD" {
-		args = append(args, "--branch", repo.DefaultRef)
-	}
-	args = append(args, auth.remoteURL, repoPath)
-	if _, err := gitOutput(ctx, repoCacheDir, auth.redactor, auth.env, args...); err != nil {
-		return "", err
-	}
-	return repoPath, nil
+	return syncResult{path: repoPath, commit: strings.TrimSpace(commit)}, nil
 }
 
-func (scanner Scanner) ensureRepoCacheDir() (string, error) {
-	repoCacheDir, err := filepath.Abs(scanner.cfg.Server.RepoCacheDir)
+// resolveRepoCacheRoot resolves the owned repository cache root: it ensures
+// the configured directory exists, then resolves it with filepath.Abs and
+// filepath.EvalSymlinks so every downstream containment check compares
+// against the same real, symlink-free path.
+func (scanner Scanner) resolveRepoCacheRoot() (string, error) {
+	abs, err := filepath.Abs(scanner.cfg.Server.RepoCacheDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve repository cache: %w", err)
 	}
-	if err := os.MkdirAll(repoCacheDir, 0o700); err != nil {
+	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return "", fmt.Errorf("create repository cache: %w", err)
 	}
-	return repoCacheDir, nil
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository cache: %w", err)
+	}
+	return resolved, nil
 }
 
 type gitAuth struct {
@@ -696,17 +756,11 @@ func normalizedName(value string) string {
 func gitOutput(ctx context.Context, dir string, redactor sanitizer.Redactor, env []string, args ...string) (string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, GitCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, "git", args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", redactor.Redact(strings.Join(args, " ")), err, redactor.Redact(stderr.String()))
+	result := invokeGit(runCtx, dir, env, args...)
+	if result.err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", redactor.Redact(strings.Join(args, " ")), result.err, redactor.Redact(result.stderr))
 	}
-	return out.String(), nil
+	return result.stdout, nil
 }
 
 func gitEnv(repo config.RepositoryConfig) []string {
