@@ -143,7 +143,7 @@ func TestNewRegistersAlertingSecretsForStorageRedaction(t *testing.T) {
 			Sinks: config.AlertingSinksConfig{
 				Webhook: config.WebhookAlertSinkConfig{
 					URL:          "https://hooks.example.test/api/services/webhook-secret?token=123456&id=services",
-					RedactValues: []string{"abc123", "x6"},
+					RedactValues: []string{"abc123", "x6", "webhook-secret"},
 					Headers: map[string]string{
 						"Authorization": "Bearer 654321",
 						"Content-Type":  "application/json",
@@ -288,6 +288,12 @@ func TestNewRegistersRawEscapedAlertURLSecretsForStorageRedaction(t *testing.T) 
 			Sinks: config.AlertingSinksConfig{
 				Webhook: config.WebhookAlertSinkConfig{
 					URL: "https://hooks.example.test/api/" + pathToken + "?token=" + queryToken,
+					// Path-embedded secrets are no longer auto-detected (see
+					// T-024 requirement 11): the decoded value must be
+					// declared explicitly. The query token is still covered
+					// automatically because "token" is a recognized secret
+					// parameter name.
+					RedactValues: []string{"secretToken42"},
 				},
 			},
 		},
@@ -489,9 +495,8 @@ alerting:
 	}
 }
 
-func TestNewWarnsAlertingWorkerDeferred(t *testing.T) {
+func TestNewEnablesAlerterWorkerWhenASinkIsConfigured(t *testing.T) {
 	t.Parallel()
-	var logs bytes.Buffer
 	cfg := config.Config{
 		Server: config.ServerConfig{
 			Listen:       ":0",
@@ -504,18 +509,40 @@ func TestNewWarnsAlertingWorkerDeferred(t *testing.T) {
 			Sinks: config.AlertingSinksConfig{
 				Discord: config.DiscordAlertSinkConfig{
 					Enabled:    true,
+					Timeout:    "10s",
 					WebhookURL: "https://discord.example.test/api/webhooks/123/token",
 				},
 			},
 		},
 	}
-	app, err := New(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	app, err := New(cfg, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer app.Close()
-	if !strings.Contains(logs.String(), "alerting configured: delivery worker not yet available (foundations only)") {
-		t.Fatalf("logs = %q, want alerting worker deferral warning", logs.String())
+	if app.alerter == nil || !app.alerter.Enabled() {
+		t.Fatalf("alerter = %#v, want an enabled worker when a sink is configured", app.alerter)
+	}
+}
+
+func TestNewLeavesAlerterWorkerDisabledWithoutSinks(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if app.alerter == nil || app.alerter.Enabled() {
+		t.Fatalf("alerter = %#v, want a disabled worker when no sink is configured", app.alerter)
 	}
 }
 

@@ -101,21 +101,102 @@ agent:
   tokenEnv: GITOPS_DASHBOARD_AGENT_TOKEN
 ```
 
-Alerting configuration is accepted for the alert-event storage foundations, but
-delivery workers are not active until the follow-up alerting tasks land. Alert
-dedupe state uses an `alert-dedupe.key` sidecar next to the SQLite database;
-when restoring a database, restore that key file with it. If a restore
-intentionally omits the key, set `alerting.resetOnMissingKey: true` for one
-startup to terminalize old alert rows and generate a fresh key, then remove the
-flag. The reset flag is one-shot: if another key problem happens while the same
-flag remains set, alerting locks instead of resetting again. To intentionally
-reset again, change `alerting.resetToken` to a new operator-chosen value for
-that startup, then remove the flag. Restart all dashboard processes after
-restoring or resetting the sidecar key; alert-state writes expect one current
-key fingerprint across running processes and will lock on stale writers. Sink
-URL and header redaction is intentionally conservative; add per-sink
-`redactValues` entries for short tokens or other secrets that are not obvious
-bearer/token values.
+### Alerting
+
+Alerting delivers persisted alert events (currently: service health
+transitions, `health.transition` for a new incident and `health.recovery`
+when a service returns to healthy) to independently configurable sinks. An
+event is delivered to every enabled sink whose `include`/`exclude` filters
+match it. Delivery is asynchronous, times out per sink, retries with capped
+exponential backoff, and dead-letters (row kept, marked `dead_lettered`) after
+`alerting.retry.maxAttempts`; a sink that is down or slow never delays
+monitoring, since delivery runs on its own goroutines against its own claimed
+batch of work.
+
+```yaml
+alerting:
+  # Debounce/cooldown/stabilitySamples control the health-transition
+  # producer: how long an unhealthy candidate state must persist before it
+  # becomes an incident (stabilitySamples/debounce), and the minimum gap
+  # between repeated alerts for the same service+transition (cooldown).
+  debounce: 30s
+  cooldown: 5m
+  stabilitySamples: 2
+  retry:
+    maxAttempts: 5
+    initialInterval: 10s
+    maxInterval: 5m
+  retention:
+    horizon: 720h   # how long a terminal (delivered/failed) row is kept
+    interval: 1h     # how often the retention sweep runs
+    batchSize: 500   # rows deleted per sweep pass
+  sinks:
+    webhook:
+      enabled: true
+      url: https://example.invalid/hooks/gitops-dashboard
+      urlEnv: GITOPS_DASHBOARD_ALERT_WEBHOOK_URL   # or url/urlFile; exactly one
+      method: POST
+      headers:
+        Content-Type: application/json
+      headerEnv:
+        Authorization: GITOPS_DASHBOARD_ALERT_WEBHOOK_AUTH
+      # Secrets embedded in the URL's path or query are not auto-detected --
+      # a purely numeric or lowercase secret is indistinguishable from a
+      # benign path segment by any content heuristic. Declare them here so
+      # they (and their raw-escaped form) are redacted from logs/errors.
+      redactValues:
+        - "REDACTED_WEBHOOK_PATH_SECRET"
+      # Go text/template rendered over EventPayload (kind, serviceId, target,
+      # repository, agent, oldState, newState, reason, occurredAt, plus a
+      # Summary()/IsRecovery() helper). Invalid templates fail at startup.
+      bodyTemplate: |
+        {"text": "{{ .Summary }}", "kind": "{{ .Kind }}", "reason": "{{ .Reason }}"}
+      timeout: 10s
+      include:
+        services: []   # empty = no restriction
+        targets: []
+      exclude:
+        services: []
+        targets: []
+    discord:
+      enabled: true
+      webhookURLEnv: GITOPS_DASHBOARD_DISCORD_WEBHOOK_URL   # or webhookURL/webhookURLFile
+      timeout: 10s
+    homeAssistant:
+      enabled: true
+      baseURL: https://homeassistant.example.invalid
+      tokenEnv: GITOPS_DASHBOARD_HA_TOKEN         # long-lived access token
+      webhookIDEnv: GITOPS_DASHBOARD_HA_WEBHOOK_ID # HA automation webhook trigger id
+      timeout: 10s
+```
+
+The Discord sink posts a short readable message (service/target, state
+transition, reason, timestamp) built into `{"content": "..."}`. The Home
+Assistant sink POSTs the event as JSON to `{baseURL}/api/webhook/{webhookID}`
+with the token as a `Bearer` `Authorization` header, so a webhook-triggered
+automation can read the alert as trigger data. Both are disabled unless their
+`enabled: true` and required fields are set; an alerting section with no
+sink enabled means the delivery worker simply does not start.
+
+Alert dedupe state uses an `alert-dedupe.key` sidecar next to the SQLite
+database; when restoring a database, restore that key file with it. If a
+restore intentionally omits the key, set `alerting.resetOnMissingKey: true`
+for one startup to terminalize old alert rows and generate a fresh key, then
+remove the flag. The reset flag is one-shot: if another key problem happens
+while the same flag remains set, alerting locks instead of resetting again.
+To intentionally reset again, change `alerting.resetToken` to a new
+operator-chosen value for that startup, then remove the flag. Restart all
+dashboard processes after restoring or resetting the sidecar key; alert-state
+writes expect one current key fingerprint across running processes and will
+lock on stale writers.
+
+Sink secret redaction from logs and dispatch error text is explicit, not
+inferred: the Discord webhook URL and Home Assistant token/webhook ID are
+always redacted (they are dedicated secret fields), but a generic webhook
+URL's embedded path or query secrets must be listed under that sink's
+`redactValues` -- query parameters with a recognized name (`token`, `key`,
+`secret`, `sig`, or a `*-token`/`*-secret`/`*-key` suffix) are redacted
+automatically by name.
 
 Repositories can optionally narrow scanning with path filters. Plain entries
 match that file or directory subtree; glob entries support `*` and recursive

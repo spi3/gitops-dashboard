@@ -135,20 +135,30 @@ type MonitoringConfig struct {
 }
 
 type AlertingConfig struct {
-	Debounce          string              `yaml:"debounce"`
-	Cooldown          string              `yaml:"cooldown"`
-	StabilitySamples  int                 `yaml:"stabilitySamples"`
-	ResetOnMissingKey bool                `yaml:"resetOnMissingKey"`
-	ResetToken        string              `yaml:"resetToken"`
-	Retry             AlertRetryConfig    `yaml:"retry"`
-	Sinks             AlertingSinksConfig `yaml:"sinks"`
-	RedactionValues   []string            `yaml:"-"`
+	Debounce          string               `yaml:"debounce"`
+	Cooldown          string               `yaml:"cooldown"`
+	StabilitySamples  int                  `yaml:"stabilitySamples"`
+	ResetOnMissingKey bool                 `yaml:"resetOnMissingKey"`
+	ResetToken        string               `yaml:"resetToken"`
+	Retry             AlertRetryConfig     `yaml:"retry"`
+	Retention         AlertRetentionConfig `yaml:"retention"`
+	Sinks             AlertingSinksConfig  `yaml:"sinks"`
+	RedactionValues   []string             `yaml:"-"`
 }
 
 type AlertRetryConfig struct {
 	MaxAttempts     int    `yaml:"maxAttempts"`
 	InitialInterval string `yaml:"initialInterval"`
 	MaxInterval     string `yaml:"maxInterval"`
+}
+
+// AlertRetentionConfig bounds how long terminal alert_events/alert_dispatches
+// rows are kept before periodic pruning removes them. Pending/in-flight rows
+// are never pruned regardless of age.
+type AlertRetentionConfig struct {
+	Horizon   string `yaml:"horizon"`
+	Interval  string `yaml:"interval"`
+	BatchSize int    `yaml:"batchSize"`
 }
 
 type AlertingSinksConfig struct {
@@ -326,6 +336,15 @@ func (cfg *Config) applyAlertingDefaults() {
 	if cfg.Alerting.Retry.MaxInterval == "" {
 		cfg.Alerting.Retry.MaxInterval = "5m"
 	}
+	if cfg.Alerting.Retention.Horizon == "" {
+		cfg.Alerting.Retention.Horizon = "720h"
+	}
+	if cfg.Alerting.Retention.Interval == "" {
+		cfg.Alerting.Retention.Interval = "1h"
+	}
+	if cfg.Alerting.Retention.BatchSize == 0 {
+		cfg.Alerting.Retention.BatchSize = 500
+	}
 	if cfg.Alerting.Sinks.Webhook.Method == "" {
 		cfg.Alerting.Sinks.Webhook.Method = "POST"
 	} else {
@@ -402,7 +421,9 @@ func (cfg *Config) resolveServerSecrets() error {
 }
 
 func (cfg *Config) resolveAlertingSecrets() error {
-	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.Webhook.RedactValues...)
+	// Webhook.RedactValues is resolved against the URL below (once it is
+	// known) so declared path/query secrets also cover their raw-escaped
+	// form as it appears in the URL; see appendAlertDeclaredURLSecretValues.
 	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.Discord.RedactValues...)
 	cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, cfg.Alerting.Sinks.HomeAssistant.RedactValues...)
 	if cfg.Alerting.Sinks.Webhook.Enabled {
@@ -421,6 +442,7 @@ func (cfg *Config) resolveAlertingSecrets() error {
 		cfg.Alerting.Sinks.Webhook.URLEnv = ""
 		cfg.Alerting.Sinks.Webhook.URLFile = ""
 		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, url)
+		cfg.Alerting.RedactionValues = appendAlertDeclaredURLSecretValues(cfg.Alerting.RedactionValues, url, cfg.Alerting.Sinks.Webhook.RedactValues)
 		headers, err := resolveSecretMap(
 			cfg.Alerting.Sinks.Webhook.Headers,
 			cfg.Alerting.Sinks.Webhook.HeaderEnv,
@@ -449,6 +471,7 @@ func (cfg *Config) resolveAlertingSecrets() error {
 		)
 		cfg.Alerting.Sinks.Webhook.URL = url.Value
 		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, url.RedactionValues...)
+		cfg.Alerting.RedactionValues = appendAlertDeclaredURLSecretValues(cfg.Alerting.RedactionValues, url.Value, cfg.Alerting.Sinks.Webhook.RedactValues)
 		headers, err := resolveSecretMapBestEffort(
 			cfg.Alerting.Sinks.Webhook.Headers,
 			cfg.Alerting.Sinks.Webhook.HeaderEnv,
@@ -480,6 +503,7 @@ func (cfg *Config) resolveAlertingSecrets() error {
 		cfg.Alerting.Sinks.Discord.WebhookURLFile = ""
 		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, webhookURL)
 		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, webhookURL)
+		cfg.Alerting.RedactionValues = appendAlertURLTrailingPathSecretValues(cfg.Alerting.RedactionValues, webhookURL, 2)
 	} else {
 		webhookURL := resolveSecretBestEffort(
 			cfg.Alerting.Sinks.Discord.WebhookURL,
@@ -492,6 +516,7 @@ func (cfg *Config) resolveAlertingSecrets() error {
 		cfg.Alerting.Sinks.Discord.WebhookURL = webhookURL.Value
 		cfg.Alerting.RedactionValues = appendAlertRedactValues(cfg.Alerting.RedactionValues, webhookURL.RedactionValues...)
 		cfg.Alerting.RedactionValues = appendAlertURLRedactValues(cfg.Alerting.RedactionValues, webhookURL.RedactionValues...)
+		cfg.Alerting.RedactionValues = appendAlertURLTrailingPathSecretValues(cfg.Alerting.RedactionValues, webhookURL.Value, 2)
 	}
 	if cfg.Alerting.Sinks.HomeAssistant.Enabled {
 		baseURL, err := resolveSecret(
@@ -601,8 +626,13 @@ func AlertingRedactionValues(alerting AlertingConfig) []string {
 	for name, value := range alerting.Sinks.Webhook.Headers {
 		values = appendAlertHeaderRedactValues(values, name, value)
 	}
-	values = appendAlertRedactValues(values, alerting.Sinks.Webhook.RedactValues...)
+	values = appendAlertDeclaredURLSecretValues(values, alerting.Sinks.Webhook.URL, alerting.Sinks.Webhook.RedactValues)
 	values = appendAlertURLRedactValues(values, alerting.Sinks.Discord.WebhookURL)
+	// The Discord webhook URL's trailing id/token path segments are the
+	// credential by protocol definition (.../api/webhooks/{id}/{token}), and
+	// the URL as a whole is a single-purpose credential too.
+	values = appendAlertRedactValues(values, alerting.Sinks.Discord.WebhookURL)
+	values = appendAlertURLTrailingPathSecretValues(values, alerting.Sinks.Discord.WebhookURL, 2)
 	values = appendAlertRedactValues(values, alerting.Sinks.Discord.RedactValues...)
 	values = appendAlertURLRedactValues(values, alerting.Sinks.HomeAssistant.BaseURL)
 	values = appendAlertRedactValues(values, alerting.Sinks.HomeAssistant.Token, alerting.Sinks.HomeAssistant.WebhookID)
@@ -611,6 +641,16 @@ func AlertingRedactionValues(alerting AlertingConfig) []string {
 	return values
 }
 
+// alertURLRedactionValues extracts redaction candidates that can be derived
+// deterministically from a URL: embedded userinfo credentials and query
+// parameters whose name is a recognized secret name (token, key, secret,
+// etc; see isAlertSecretParameterName). It intentionally does not attempt to
+// guess which path segments are secret-bearing by inspecting their contents
+// (e.g. "looks random") — that kind of entropy heuristic is unreliable (a
+// purely numeric or purely lowercase secret looks identical to a benign path
+// word) and has historically both missed real secrets and risked redacting
+// benign words. Path-embedded secrets for the generic webhook sink must be
+// declared explicitly; see appendAlertDeclaredURLSecretValues.
 func alertURLRedactionValues(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -622,13 +662,6 @@ func alertURLRedactionValues(raw string) []string {
 	}
 	values := []string{}
 	values = appendAlertRedactValues(values, sanitizer.URLUserinfoValues(raw)...)
-	for _, escapedPath := range alertEscapedPathVariants(parsed) {
-		for _, part := range strings.Split(escapedPath, "/") {
-			if unescaped, err := url.PathUnescape(part); err == nil && looksLikeAlertSecretComponent(unescaped) {
-				values = appendAlertRedactValues(values, alertEscapedSecretVariants(part, unescaped)...)
-			}
-		}
-	}
 	values = appendAlertURLQueryRedactValues(values, parsed.RawQuery)
 	for key, queryValues := range parsed.Query() {
 		if !isAlertSecretParameterName(key) {
@@ -636,6 +669,93 @@ func alertURLRedactionValues(raw string) []string {
 		}
 		for _, value := range queryValues {
 			values = appendAlertRedactValues(values, alertEscapedSecretVariants(url.QueryEscape(value), value)...)
+		}
+	}
+	return values
+}
+
+// appendAlertURLTrailingPathSecretValues registers the last count path
+// segments of a URL as redaction candidates unconditionally, regardless of
+// their content. This is not content-based guessing: for a fixed-shape
+// webhook URL such as Discord's `.../api/webhooks/{id}/{token}`, the
+// trailing segments are secret by protocol definition, so every occurrence
+// is a "complete secret-bearing path component" the operator never has to
+// declare.
+func appendAlertURLTrailingPathSecretValues(values []string, rawURL string, count int) []string {
+	if count <= 0 {
+		return values
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return values
+	}
+	segments := strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")
+	start := len(segments) - count
+	if start < 0 {
+		start = 0
+	}
+	for _, escaped := range segments[start:] {
+		if escaped == "" {
+			continue
+		}
+		if decoded, err := url.PathUnescape(escaped); err == nil {
+			values = appendAlertRedactValues(values, alertEscapedSecretVariants(escaped, decoded)...)
+		}
+	}
+	return values
+}
+
+// appendAlertDeclaredURLSecretValues registers explicitly declared secret
+// values (alerting.sinks.webhook.redactValues) as redaction candidates. Each
+// declared value is registered as-is plus its path/query-escaped variants; if
+// the value also appears (in decoded form) as a literal path or query
+// component of rawURL, the exact raw (still-escaped) substring from the URL
+// is registered too, so logs containing either the encoded or decoded form
+// are covered. This is the explicit, deterministic replacement for automatic
+// path-segment secret detection: the operator states what is secret rather
+// than the code guessing from character composition.
+func appendAlertDeclaredURLSecretValues(values []string, rawURL string, declared []string) []string {
+	declaredSet := map[string]struct{}{}
+	for _, value := range declared {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		declaredSet[value] = struct{}{}
+		values = appendAlertRedactValues(values, alertEscapedSecretVariants(value, value)...)
+	}
+	if len(declaredSet) == 0 {
+		return values
+	}
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return values
+	}
+	for _, escapedPath := range alertEscapedPathVariants(parsed) {
+		for _, part := range strings.Split(escapedPath, "/") {
+			if part == "" {
+				continue
+			}
+			unescaped, err := url.PathUnescape(part)
+			if err != nil {
+				continue
+			}
+			if _, ok := declaredSet[unescaped]; ok {
+				values = appendAlertRedactValues(values, alertEscapedSecretVariants(part, unescaped)...)
+			}
+		}
+	}
+	for _, part := range strings.Split(parsed.RawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		_, valuePart, _ := strings.Cut(part, "=")
+		unescaped, err := url.QueryUnescape(valuePart)
+		if err != nil {
+			continue
+		}
+		if _, ok := declaredSet[unescaped]; ok {
+			values = appendAlertRedactValues(values, alertEscapedSecretVariants(valuePart, unescaped)...)
 		}
 	}
 	return values
@@ -718,33 +838,6 @@ func isAlertSecretParameterName(name string) bool {
 			strings.HasSuffix(normalized, "-secret") ||
 			strings.HasSuffix(normalized, "-key")
 	}
-}
-
-func looksLikeAlertSecretComponent(value string) bool {
-	value = strings.TrimSpace(value)
-	if len(value) < 8 {
-		return false
-	}
-	classes := 0
-	var hasLower, hasUpper, hasDigit, hasSymbol bool
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			hasLower = true
-		case r >= 'A' && r <= 'Z':
-			hasUpper = true
-		case r >= '0' && r <= '9':
-			hasDigit = true
-		default:
-			hasSymbol = true
-		}
-	}
-	for _, has := range []bool{hasLower, hasUpper, hasDigit, hasSymbol} {
-		if has {
-			classes++
-		}
-	}
-	return classes >= 2
 }
 
 func (cfg *Config) resolveAgentSecrets() error {
@@ -1187,6 +1280,15 @@ func (cfg AlertingConfig) Validate() error {
 	if maximum < initial {
 		return fmt.Errorf("alerting.retry.maxInterval must be greater than or equal to alerting.retry.initialInterval")
 	}
+	if _, err := cfg.RetentionHorizonDuration(); err != nil {
+		return err
+	}
+	if _, err := cfg.RetentionIntervalDuration(); err != nil {
+		return err
+	}
+	if cfg.Retention.BatchSize <= 0 {
+		return fmt.Errorf("alerting.retention.batchSize must be greater than zero")
+	}
 	if err := cfg.validateSinkNames(); err != nil {
 		return err
 	}
@@ -1331,6 +1433,14 @@ func (cfg AlertingConfig) RetryInitialIntervalDuration() (time.Duration, error) 
 
 func (cfg AlertingConfig) RetryMaxIntervalDuration() (time.Duration, error) {
 	return requiredPositiveDuration(cfg.Retry.MaxInterval, "alerting.retry.maxInterval")
+}
+
+func (cfg AlertingConfig) RetentionHorizonDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Retention.Horizon, "alerting.retention.horizon")
+}
+
+func (cfg AlertingConfig) RetentionIntervalDuration() (time.Duration, error) {
+	return requiredPositiveDuration(cfg.Retention.Interval, "alerting.retention.interval")
 }
 
 func (sink WebhookAlertSinkConfig) Validate() error {

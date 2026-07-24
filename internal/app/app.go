@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/alerter"
 	"github.com/example/gitops-dashboard/internal/auth"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
@@ -33,6 +34,7 @@ type App struct {
 	store     *storage.Store
 	scanner   scanner.Scanner
 	monitor   monitor.Monitor
+	alerter   *alerter.Worker
 	auth      auth.BasicAuth
 	agentAuth auth.AgentTokenAuthenticator
 	logger    *slog.Logger
@@ -125,9 +127,12 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	app.readinessTTL = readinessCacheTTL
 	app.readinessNow = time.Now
 	app.readinessProbe = app.storageReadinessProbe
-	if cfg.Alerting.Enabled() {
-		logger.Warn("alerting configured: delivery worker not yet available (foundations only)")
+	alerterWorker, err := alerter.New(cfg.Alerting, store, logger)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("alerter: %w", err)
 	}
+	app.alerter = alerterWorker
 	return app, nil
 }
 
@@ -172,7 +177,7 @@ func (app *App) Close() {
 func (app *App) RunBackground(ctx context.Context) {
 	app.scanner.RunScheduled(ctx)
 	app.monitor.Run(ctx)
-	// Alert producers and the async delivery worker are intentionally deferred to T-022..T-024.
+	app.alerter.Run(ctx)
 }
 
 func (app *App) Handler() http.Handler {

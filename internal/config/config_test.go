@@ -49,6 +49,40 @@ repositories:
 	if cfg.Alerting.StabilitySamples != 2 {
 		t.Fatalf("alerting stabilitySamples = %d, want 2", cfg.Alerting.StabilitySamples)
 	}
+	if got, err := cfg.Alerting.RetentionHorizonDuration(); err != nil || got.String() != "720h0m0s" {
+		t.Fatalf("alerting retention horizon = %v, err=%v; want 720h0m0s", got, err)
+	}
+	if got, err := cfg.Alerting.RetentionIntervalDuration(); err != nil || got.String() != "1h0m0s" {
+		t.Fatalf("alerting retention interval = %v, err=%v; want 1h0m0s", got, err)
+	}
+	if cfg.Alerting.Retention.BatchSize != 500 {
+		t.Fatalf("alerting retention batchSize = %d, want 500", cfg.Alerting.Retention.BatchSize)
+	}
+}
+
+func TestLoadConfigRejectsInvalidAlertRetention(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth: {mode: dev-no-auth}
+alerting:
+  retention: {horizon: not-a-duration}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "alerting.retention.horizon") {
+		t.Fatalf("Load error = %v, want retention horizon error", err)
+	}
+	if err := os.WriteFile(path, []byte(`
+auth: {mode: dev-no-auth}
+alerting:
+  retention: {batchSize: -1}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "alerting.retention.batchSize") {
+		t.Fatalf("Load error = %v, want retention batchSize error", err)
+	}
 }
 
 func TestLoadConfigCanonicalizesAlertSinkNamesAndRejectsDescendingRetryBounds(t *testing.T) {
@@ -519,7 +553,7 @@ alerting:
 	}
 }
 
-func TestLoadConfigRejectsAlertingSinkNameContainingInferredURLSecret(t *testing.T) {
+func TestLoadConfigRejectsAlertingSinkNameContainingDeclaredURLSecret(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -531,15 +565,17 @@ alerting:
       enabled: true
       name: alerts-abc123DEF
       url: https://hooks.example.test/webhooks/abc123DEF
+      redactValues:
+        - abc123DEF
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := Load(path)
 	if err == nil {
-		t.Fatal("Load succeeded, want inferred sink name secret validation error")
+		t.Fatal("Load succeeded, want declared sink name secret validation error")
 	}
 	if !strings.Contains(err.Error(), "alerting.sinks.webhook.name") || !strings.Contains(err.Error(), "secret") {
-		t.Fatalf("error = %v, want inferred sink name secret validation", err)
+		t.Fatalf("error = %v, want declared sink name secret validation", err)
 	}
 }
 
@@ -616,6 +652,31 @@ alerting:
 	for _, nonSecret := range []string{"application/json", "https://hooks.example.test/gitops"} {
 		if stringSliceContains(cfg.Alerting.RedactionValues, nonSecret) {
 			t.Fatalf("alerting redaction values = %#v, want non-secret %q omitted", cfg.Alerting.RedactionValues, nonSecret)
+		}
+	}
+}
+
+// TestWebhookRedactValuesCoverNumericAndLowercaseURLPathSecrets guards T-024
+// requirement 11: the old automatic path-secret detector gated on character
+// diversity (classes >= 2), so a purely numeric or purely lowercase secret
+// embedded in a generic webhook URL's path was silently never redacted. That
+// automatic detector has been removed; declaring the secret explicitly via
+// redactValues must now redact it regardless of its character composition.
+func TestWebhookRedactValuesCoverNumericAndLowercaseURLPathSecrets(t *testing.T) {
+	t.Parallel()
+	for _, secret := range []string{"48213097561", "webhooksecrettoken"} {
+		cfg := AlertingConfig{
+			Sinks: AlertingSinksConfig{
+				Webhook: WebhookAlertSinkConfig{
+					Enabled:      true,
+					URL:          "https://hooks.example.test/incoming/" + secret,
+					RedactValues: []string{secret},
+				},
+			},
+		}
+		values := AlertingRedactionValues(cfg)
+		if !stringSliceContains(values, secret) {
+			t.Fatalf("secret %q = %#v, want declared low-diversity path secret redacted", secret, values)
 		}
 	}
 }

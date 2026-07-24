@@ -7700,6 +7700,84 @@ func TestAlertDispatchCompletedRowNotClaimedAfterRestart(t *testing.T) {
 	}
 }
 
+func TestRecordAlertDispatchResultRejectsConflictingTerminalReplay(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:terminal-conflict",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	// A replay carrying a different terminal status than what is already
+	// stored must be rejected as a conflict, not silently accepted as if it
+	// were an idempotent replay of the original call.
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDeadLettered, "later failure"); !errors.Is(err, ErrAlertDispatchTerminalConflict) {
+		t.Fatalf("conflicting terminal replay err = %v, want ErrAlertDispatchTerminalConflict", err)
+	}
+	dispatch, err := store.alertDispatchByID(ctx, claimed[0].Dispatch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dispatch.Status != AlertDispatchStatusDelivered || dispatch.Attempts != 1 {
+		t.Fatalf("dispatch after rejected conflict = %#v, want unchanged delivered status", dispatch)
+	}
+}
+
+func TestRecordAlertDispatchResultRejectsDeadLetteredThenDeliveredReplay(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, inserted, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind:      "health_transition",
+		ServiceID: "svc",
+		NewState:  "unhealthy",
+		DedupeKey: "health:svc:terminal-conflict-reverse",
+		CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
+	}, []string{"discord"}, time.Hour); err != nil {
+		t.Fatal(err)
+	} else if !inserted {
+		t.Fatal("inserted = false, want true")
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed = %#v, want one dispatch", claimed)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDeadLettered, "permanent failure"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); !errors.Is(err, ErrAlertDispatchTerminalConflict) {
+		t.Fatalf("conflicting terminal replay err = %v, want ErrAlertDispatchTerminalConflict", err)
+	}
+}
+
 func TestAlertEnqueueRetriesSQLiteBusyBeyondShortBudget(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
@@ -8027,6 +8105,153 @@ func TestAlertDeadLetteredDispatchSynthesizesMissingDiagnostic(t *testing.T) {
 	}
 	if dispatch.Status != AlertDispatchStatusDeadLettered || dispatch.LastError != alertDispatchDeadNoDiagnostic {
 		t.Fatalf("dead-letter dispatch = %#v, want synthesized diagnostic %q", dispatch, alertDispatchDeadNoDiagnostic)
+	}
+}
+
+func TestPruneTerminalAlertEventsRemovesOldTerminalRowsOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+
+	oldDelivered, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind: "health_transition", ServiceID: "svc-old-delivered", NewState: "unhealthy",
+		DedupeKey: "prune:old-delivered", CreatedAt: old,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPending, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind: "health_transition", ServiceID: "svc-old-pending", NewState: "unhealthy",
+		DedupeKey: "prune:old-pending", CreatedAt: old,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recentDelivered, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind: "health_transition", ServiceID: "svc-recent-delivered", NewState: "unhealthy",
+		DedupeKey: "prune:recent-delivered", CreatedAt: recent,
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// oldPending's dispatch is still pending and sorts first (created_at ASC),
+	// so claim both outstanding dispatches and only complete the one for
+	// recentDelivered, leaving oldPending untouched (still pending).
+	claimed, err = store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, delivery := range claimed {
+		if delivery.Event.ID != recentDelivered.ID {
+			continue
+		}
+		if _, err := store.RecordAlertDispatchResult(ctx, delivery.Dispatch.ID, "worker-a", delivery.Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	horizon := time.Since(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	pruned, err := store.PruneTerminalAlertEvents(ctx, horizon, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1 (only the old delivered event)", pruned)
+	}
+
+	remainingIDs := map[int64]bool{}
+	rows, err := store.db.QueryContext(ctx, `SELECT id FROM alert_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		remainingIDs[id] = true
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if remainingIDs[oldDelivered.ID] {
+		t.Fatalf("old terminal event %d survived prune, want removed", oldDelivered.ID)
+	}
+	if !remainingIDs[oldPending.ID] {
+		t.Fatalf("old pending event %d was pruned, want kept (not terminal)", oldPending.ID)
+	}
+	if !remainingIDs[recentDelivered.ID] {
+		t.Fatalf("recent delivered event %d was pruned, want kept (inside horizon)", recentDelivered.ID)
+	}
+
+	var dispatchCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_dispatches WHERE event_id=?`, oldDelivered.ID).Scan(&dispatchCount); err != nil {
+		t.Fatal(err)
+	}
+	if dispatchCount != 0 {
+		t.Fatalf("dispatches for pruned event = %d, want cascaded delete to 0", dispatchCount)
+	}
+}
+
+func TestPruneTerminalAlertEventsBoundsBatchSize(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const total = 7
+	for i := 0; i < total; i++ {
+		event, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+			Kind: "health_transition", ServiceID: fmt.Sprintf("svc-%d", i), NewState: "unhealthy",
+			DedupeKey: fmt.Sprintf("prune:batch:%d", i), CreatedAt: old,
+		}, []string{"discord"}, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.RecordAlertDispatchResult(ctx, claimed[0].Dispatch.ID, "worker-a", claimed[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+			t.Fatal(err)
+		}
+		_ = event
+	}
+
+	horizon := time.Since(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	pruned, err := store.PruneTerminalAlertEvents(ctx, horizon, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != total {
+		t.Fatalf("pruned = %d, want all %d rows removed across batches", pruned, total)
+	}
+	var remaining int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_events`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining alert_events = %d, want 0", remaining)
 	}
 }
 

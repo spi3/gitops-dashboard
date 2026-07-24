@@ -38,11 +38,12 @@ const (
 )
 
 var (
-	ErrAlertEventNotFound        = errors.New("alert event not found")
-	ErrAlertDispatchNotFound     = errors.New("alert dispatch not found")
-	ErrAlertDispatchClaimNotHeld = errors.New("alert dispatch claim not held")
-	ErrAlertDispatchLeaseExpired = errors.New(alertDispatchLeaseExpiredError)
-	ErrAlertStateLocked          = errors.New("alert state locked: dedupe key missing")
+	ErrAlertEventNotFound            = errors.New("alert event not found")
+	ErrAlertDispatchNotFound         = errors.New("alert dispatch not found")
+	ErrAlertDispatchClaimNotHeld     = errors.New("alert dispatch claim not held")
+	ErrAlertDispatchLeaseExpired     = errors.New(alertDispatchLeaseExpiredError)
+	ErrAlertStateLocked              = errors.New("alert state locked: dedupe key missing")
+	ErrAlertDispatchTerminalConflict = errors.New("alert dispatch already completed with a different terminal status")
 )
 
 type AlertEvent struct {
@@ -592,13 +593,25 @@ WHERE d.id=?
 	}
 	dispatch = store.prepareScannedAlertDispatch(dispatch, scannedDeliveredAt, scannedLeaseExpiresAt, scannedNextAttemptAtNS, updatedAt)
 	if terminalAlertDispatchStatus(dispatch.Status) {
-		if dispatch.WorkerID == workerID && dispatch.ClaimID == claimID {
-			if err := tx.Commit(); err != nil {
-				return AlertDispatch{}, err
-			}
-			return dispatch, nil
+		if dispatch.WorkerID != workerID || dispatch.ClaimID != claimID {
+			return AlertDispatch{}, ErrAlertDispatchClaimNotHeld
 		}
-		return AlertDispatch{}, ErrAlertDispatchClaimNotHeld
+		// A replay of the exact same completion call is idempotent. The
+		// requested status may have been auto-promoted from pending to
+		// dead_lettered by the original call (see resultStatus below); that
+		// promotion is deterministic from the attempts count recorded on this
+		// row, so it is recomputed here rather than re-incrementing attempts.
+		expectedStatus := status
+		if status == AlertDispatchStatusPending && dispatch.Attempts >= policy.MaxAttempts {
+			expectedStatus = AlertDispatchStatusDeadLettered
+		}
+		if expectedStatus != dispatch.Status {
+			return AlertDispatch{}, fmt.Errorf("%w: dispatch %d is already %s, cannot complete as %s", ErrAlertDispatchTerminalConflict, dispatchID, dispatch.Status, status)
+		}
+		if err := tx.Commit(); err != nil {
+			return AlertDispatch{}, err
+		}
+		return dispatch, nil
 	}
 	if dispatch.Status == AlertDispatchStatusPending && dispatch.WorkerID == workerID && dispatch.ClaimID == claimID && status == AlertDispatchStatusPending {
 		if err := tx.Commit(); err != nil {
@@ -1133,6 +1146,54 @@ func randomAlertToken() (string, error) {
 		return "", fmt.Errorf("generate alert claim id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// DefaultAlertRetentionBatchSize bounds a single retention delete when the
+// caller does not configure one, keeping individual transactions small.
+const DefaultAlertRetentionBatchSize = 500
+
+// PruneTerminalAlertEvents deletes alert_events (and, via ON DELETE CASCADE,
+// their alert_dispatches) that reached a terminal status before the given
+// horizon. Pending/in-flight events are never touched. Deletes are performed
+// in bounded batches via an id subquery rather than a single unbounded
+// statement, so a large backlog cannot hold a long-running write lock.
+func (store *Store) PruneTerminalAlertEvents(ctx context.Context, horizon time.Duration, batchSize int) (int64, error) {
+	if horizon <= 0 {
+		return 0, nil
+	}
+	if batchSize <= 0 {
+		batchSize = DefaultAlertRetentionBatchSize
+	}
+	cutoffNS := time.Now().UTC().Add(-horizon).UnixNano()
+	var total int64
+	for {
+		result, err := retryAlertSQLiteBusy(ctx, func() (sql.Result, error) {
+			return store.db.ExecContext(ctx, `
+DELETE FROM alert_events
+WHERE id IN (
+  SELECT id FROM alert_events
+  WHERE status IN (?, ?, ?, ?) AND created_at_ns < ?
+  ORDER BY id
+  LIMIT ?
+)`, AlertEventStatusDelivered, AlertEventStatusFailed, AlertEventStatusPartial, AlertEventStatusReset, cutoffNS, batchSize)
+		})
+		if err != nil {
+			return total, fmt.Errorf("prune terminal alert events: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += affected
+		if affected < int64(batchSize) {
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+	}
 }
 
 func isSQLiteBusy(err error) bool {
