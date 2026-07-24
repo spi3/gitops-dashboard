@@ -152,14 +152,16 @@ func mustAlertDebounce(alerting config.AlertingConfig) time.Duration {
 	return debounce
 }
 
+// repositoryRedactionValues registers only the configured, statically known
+// URL-userinfo redaction values for each repository. It deliberately never
+// calls RepositoryConfig.Token(): resolving a repository's credential (env
+// lookup or token file read) is deferred to the scanner, which registers the
+// resolved token/header redaction values itself once it runs, after any
+// existing repository cache has been scrubbed of stale credentials.
 func repositoryRedactionValues(repos []config.RepositoryConfig) []string {
 	values := []string{}
 	for _, repo := range repos {
 		values = append(values, sanitizer.URLUserinfoValues(repo.URL)...)
-		token, err := repo.Token()
-		if err == nil && token != "" {
-			values = append(values, token)
-		}
 	}
 	return values
 }

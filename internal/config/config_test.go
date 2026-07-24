@@ -969,6 +969,34 @@ auth:
 	}
 }
 
+func TestLoadDefersRepositoryCredentialValidationUntilCacheScrub(t *testing.T) {
+	t.Parallel()
+	os.Unsetenv("GITOPS_DASHBOARD_T060_MISSING_TOKEN")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  dataDir: `+t.TempDir()+`
+auth:
+  mode: dev-no-auth
+monitoring:
+  defaultInterval: 30s
+repositories:
+  - name: unset-token-env
+    url: https://example.invalid/repo.git
+    tokenEnv: GITOPS_DASHBOARD_T060_MISSING_TOKEN
+  - name: embedded-userinfo
+    url: https://deploy:secret@example.invalid/repo.git
+  - name: http-with-token
+    url: http://example.invalid/repo.git
+    tokenEnv: GITOPS_DASHBOARD_T060_MISSING_TOKEN
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadForMode(path, ModeServer); err != nil {
+		t.Fatalf("LoadForMode returned error, want repository credential and transport validation deferred to the scanner: %v", err)
+	}
+}
+
 func TestLoadConfigRejectsConflictingSecretSources(t *testing.T) {
 	t.Setenv("GITOPS_DASHBOARD_ADMIN_HASH", "$2a$10$env-provided-hash")
 	path := filepath.Join(t.TempDir(), "config.yaml")

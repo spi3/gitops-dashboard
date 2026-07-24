@@ -302,13 +302,40 @@ func (scanner Scanner) syncRepoUnshared(ctx context.Context, repo config.Reposit
 	if err != nil {
 		return "", err
 	}
+	repoPath, err := containedRepoPath(repoCacheDir, repo)
+	if err != nil {
+		return "", err
+	}
+
+	// Register configured URL-userinfo redaction values immediately, before
+	// any scrub mutation can fail, so a scrub error can never itself leak a
+	// credential embedded in the configured URL.
+	redactionValues := sanitizer.URLUserinfoValues(repo.URL)
+	if scanner.store != nil {
+		scanner.store.AddRedactionValues(redactionValues...)
+	}
+	redactor := sanitizer.New(redactionValues...)
+	env := gitEnv(repo)
+
+	cacheExists := false
+	if _, statErr := os.Stat(filepath.Join(repoPath, ".git")); statErr == nil {
+		cacheExists = true
+		// Scrub any credential-bearing cached origin URLs before resolving
+		// the repository's own credential source, validating its transport,
+		// reconciling the origin, or performing any network-capable Git
+		// command. A scrub failure fails the attempt with no network access.
+		if err := scrubCachedOriginCredentials(ctx, repoPath, redactor, env); err != nil {
+			return "", err
+		}
+	}
+
 	auth, err := scanner.gitAuth(repo)
 	if err != nil {
 		return "", err
 	}
-	repoPath := filepath.Join(repoCacheDir, safeName(repo.Name))
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
-		if err := migrateRemote(ctx, repoPath, auth); err != nil {
+
+	if cacheExists {
+		if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
 			return "", err
 		}
 		if _, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "fetch", "--all", "--prune"); err != nil {
@@ -350,13 +377,38 @@ func (scanner Scanner) ensureRepoCacheDir() (string, error) {
 }
 
 type gitAuth struct {
-	remoteURL           string
-	env                 []string
-	redactor            sanitizer.Redactor
-	stripRemoteUserinfo bool
+	remoteURL    string
+	env          []string
+	redactor     sanitizer.Redactor
+	useTokenAuth bool
 }
 
+// gitAuth resolves repository credential authentication. It must only be
+// called after any existing repository cache has been scrubbed of stale
+// credentials: it performs repository credential-source and URL-transport
+// validation (embedded HTTP(S) userinfo, token-auth transport, unset
+// tokenEnv) and only then reads the repository's token, so that an unset
+// tokenEnv, an unreadable tokenFile, embedded userinfo, or an invalid
+// transport surfaces as a repository scan error rather than as a startup
+// failure that could run before cache cleanup.
 func (scanner Scanner) gitAuth(repo config.RepositoryConfig) (gitAuth, error) {
+	clean, stripped, err := credentialFreeRemoteURL(repo.URL)
+	if err != nil {
+		return gitAuth{}, fmt.Errorf("repository %s has an invalid remote url", repo.Name)
+	}
+	if stripped {
+		return gitAuth{}, fmt.Errorf("repository %s remote url must not include embedded credentials", repo.Name)
+	}
+	hasTokenSource := repo.TokenEnv != "" || repo.TokenFile != ""
+	if hasTokenSource {
+		parsed, parseErr := url.Parse(repo.URL)
+		if parseErr != nil || !strings.EqualFold(parsed.Scheme, "https") {
+			return gitAuth{}, fmt.Errorf("repository %s token authentication requires an https remote url", repo.Name)
+		}
+	}
+	if repo.TokenEnv != "" && strings.TrimSpace(os.Getenv(repo.TokenEnv)) == "" {
+		return gitAuth{}, fmt.Errorf("repository %s references unset token env %s", repo.Name, repo.TokenEnv)
+	}
 	token, err := repo.Token()
 	if err != nil {
 		return gitAuth{}, err
@@ -368,15 +420,10 @@ func (scanner Scanner) gitAuth(repo config.RepositoryConfig) (gitAuth, error) {
 			scanner.store.AddRedactionValues(redactionValues...)
 		}
 		return gitAuth{
-			remoteURL: repo.URL,
+			remoteURL: clean,
 			env:       env,
 			redactor:  sanitizer.New(redactionValues...),
 		}, nil
-	}
-	remoteURL := tokenFreeRemoteURL(repo.URL)
-	parsed, err := url.Parse(remoteURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return gitAuth{}, fmt.Errorf("repository %s token auth requires an http(s) url", repo.Name)
 	}
 	basicCredential := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 	authHeader := "Authorization: Basic " + basicCredential
@@ -386,44 +433,15 @@ func (scanner Scanner) gitAuth(repo config.RepositoryConfig) (gitAuth, error) {
 	}
 	env = append(env,
 		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http."+remoteURL+".extraHeader",
+		"GIT_CONFIG_KEY_0=http."+clean+".extraHeader",
 		"GIT_CONFIG_VALUE_0="+authHeader,
 	)
 	return gitAuth{
-		remoteURL:           remoteURL,
-		env:                 env,
-		redactor:            sanitizer.New(redactionValues...),
-		stripRemoteUserinfo: true,
+		remoteURL:    clean,
+		env:          env,
+		redactor:     sanitizer.New(redactionValues...),
+		useTokenAuth: true,
 	}, nil
-}
-
-func migrateRemote(ctx context.Context, repoPath string, auth gitAuth) error {
-	if !auth.stripRemoteUserinfo {
-		return nil
-	}
-	remoteURL, err := gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "get-url", "origin")
-	if err != nil {
-		return err
-	}
-	remoteURL = strings.TrimSpace(remoteURL)
-	tokenFreeURL := tokenFreeRemoteURL(remoteURL)
-	if tokenFreeURL == remoteURL {
-		return nil
-	}
-	_, err = gitOutput(ctx, repoPath, auth.redactor, auth.env, "remote", "set-url", "origin", tokenFreeURL)
-	return err
-}
-
-func tokenFreeRemoteURL(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User == nil {
-		return raw
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return raw
-	}
-	parsed.User = nil
-	return parsed.String()
 }
 
 func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, commit string) ([]core.Service, error) {

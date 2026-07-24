@@ -1,6 +1,71 @@
+# Deny-first allowlist: everything is excluded by default, and only the
+# paths needed to build the Go binary and the UI bundle are explicitly
+# re-included below.
+*
+!go.mod
+!go.sum
+!cmd
+!cmd/**
+!internal
+!internal/**
+!package.json
+!package-lock.json
+!tsconfig.json
+!vite.config.ts
+!eslint.config.js
+!web
+!web/**
+!Dockerfile
+!docker-entrypoint.sh
+!scripts
+!scripts/docker-context-audit.sh
+
+# Deny sources and directories that are not needed to build
+# ./cmd/gitops-dashboard, even though they live under an allowed directory
+# re-included above: tests, testdata, unrelated cmd entry points, CI-only
+# tooling, Git metadata, local build/runtime artifacts, and documentation.
+**/*_test.go
+**/testdata
+cmd/release
+cmd/version-allocator
+cmd/t032-e2e
+internal/ci
 .git
 .gitdb
 node_modules
-data
 gitops-dashboard
-*.db
+docs
+examples
+tests
+README.md
+playwright.config.ts
+.env.example
+.github
+
+# Final sensitive-path rules. These come last so no broader allow rule above
+# can re-include them; Docker removes matches before ever sending the
+# context to the daemon, so the in-image context-audit stage never sees this
+# content either.
+data/**
+**/.env
+**/.env.*
+**/.kube/**
+**/kubeconfig
+**/kubeconfig.*
+**/id_rsa
+**/id_dsa
+**/id_ecdsa
+**/id_ed25519
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.sqlite3
+**/*.sqlite3-shm
+**/*.sqlite3-wal
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx

@@ -546,6 +546,41 @@ func TestNewLeavesAlerterWorkerDisabledWithoutSinks(t *testing.T) {
 	}
 }
 
+func TestAppDefersRepositoryTokenResolutionUntilScanner(t *testing.T) {
+	t.Parallel()
+	os.Unsetenv("GITOPS_DASHBOARD_T060_APP_MISSING_TOKEN")
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+		Repositories: []config.RepositoryConfig{
+			{
+				Name:      "unreadable-token-file",
+				URL:       "https://example.test/private/repo.git",
+				TokenFile: filepath.Join(t.TempDir(), "missing-token-file-t060"),
+			},
+			{
+				Name:     "unset-token-env",
+				URL:      "https://example.test/other/repo.git",
+				TokenEnv: "GITOPS_DASHBOARD_T060_APP_MISSING_TOKEN",
+			},
+		},
+	}
+	// App.New must not call RepositoryConfig.Token() (which would read the
+	// missing token file or resolve the unset env) or otherwise resolve
+	// repository credentials; those checks belong to the scanner, deferred
+	// until after any existing repository cache has been scrubbed.
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("New returned error, want repository token resolution deferred to the scanner: %v", err)
+	}
+	defer app.Close()
+}
+
 func TestReadyzReportsClosedDatabase(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{

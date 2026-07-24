@@ -41,10 +41,11 @@ not override externally managed assignment, priority, or status.
 | TASK-0031 | In Progress | P1 | Route Discovery | Route identity replacement migration | `docs/tasks/TASK-0031-route-identity-replacement-migration.md` | TASK-0030, TASK-0021 | 2026-07-10 | Atomic portless-to-portful route state migration before stale pruning; round 5 defers same-sink claimed collisions and preserves terminal delivery audit rows. |
 | TASK-0032 | In Review | P1 | Monitoring | Monitor staleness and replica truth | `docs/tasks/TASK-0032-monitor-staleness-and-replica-truth.md` | None | 2026-07-12 | Target-derived status expiry, agent receipt-time truth, and worst-replica Docker rollups. |
 | TASK-0047 | In Review | P1 | CI Reliability | CI publish wedge hotfix | `docs/tasks/TASK-0047-ci-publish-wedge-hotfix.md` | TASK-0015 | 2026-07-10 | Native UI build platform, bounded CI jobs, and exact Docker variable-reference guards. |
+| TASK-0060 | Proposed | P1 | Security | Credential and build-context safety | `docs/tasks/TASK-0060-credential-and-build-context-safety.md` | None | 2026-07-24 | Cached-origin credential scrub before repository sync; Docker context-audit stage gating local copies. |
 
 ## Next Task ID
 
-`TASK-0033`
+`TASK-0065`
 
 Reserved-task traceability:
 

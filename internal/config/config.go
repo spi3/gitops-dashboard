@@ -1112,9 +1112,11 @@ func (cfg Config) Validate() error {
 		if repo.Name == "" || repo.URL == "" {
 			return fmt.Errorf("repositories require name and url")
 		}
-		if repo.TokenEnv != "" && os.Getenv(repo.TokenEnv) == "" {
-			return fmt.Errorf("repository %s references unset token env %s", repo.Name, repo.TokenEnv)
-		}
+		// Repository credential-source and URL-transport validation (unset
+		// tokenEnv, unreadable tokenFile, embedded HTTP(S) userinfo, invalid
+		// token transport) is intentionally deferred to the scanner, which
+		// runs it only after any existing repository cache has been scrubbed
+		// of stale credentials. See internal/scanner/credentials.go.
 		if _, err := repo.ScanDuration(); err != nil {
 			return err
 		}

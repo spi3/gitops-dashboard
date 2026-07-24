@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -694,7 +696,7 @@ func TestGitAuthUsesTokenFreeRemoteAndEnvScopedHeader(t *testing.T) {
 	}
 }
 
-func TestGitAuthPreservesEmbeddedCredentialsWithoutTokenAndRedacts(t *testing.T) {
+func TestGitAuthRejectsEmbeddedCredentialsWithoutToken(t *testing.T) {
 	secret := "embedded-secret-token"
 	cfg := config.Config{}
 	scanner := New(cfg, nil, slog.Default())
@@ -702,20 +704,66 @@ func TestGitAuthPreservesEmbeddedCredentialsWithoutTokenAndRedacts(t *testing.T)
 		Name: "repo",
 		URL:  "https://deploy:" + secret + "@github.com/example/repo.git",
 	}
+	_, err := scanner.gitAuth(repo)
+	if err == nil {
+		t.Fatal("gitAuth succeeded, want rejection of embedded configured URL userinfo")
+	}
+	if !strings.Contains(err.Error(), "repo") {
+		t.Fatalf("error = %q, want it to name the repository", err)
+	}
+	assertNoToken(t, "gitAuth error", err.Error(), secret)
+	if strings.Contains(err.Error(), repo.URL) || strings.Contains(err.Error(), "deploy:") {
+		t.Fatalf("error leaks the configured URL or userinfo: %q", err)
+	}
+}
+
+func TestGitAuthRejectsEmbeddedCredentialsWithToken(t *testing.T) {
+	t.Setenv("GITOPS_TEST_TOKEN", "secret-token")
+	secret := "embedded-secret-token-with-tokenenv"
+	cfg := config.Config{}
+	scanner := New(cfg, nil, slog.Default())
+	repo := config.RepositoryConfig{
+		Name:     "repo",
+		URL:      "https://deploy:" + secret + "@github.com/example/repo.git",
+		TokenEnv: "GITOPS_TEST_TOKEN",
+	}
+	_, err := scanner.gitAuth(repo)
+	if err == nil {
+		t.Fatal("gitAuth succeeded, want rejection of embedded configured URL userinfo even with tokenEnv set")
+	}
+	assertNoToken(t, "gitAuth error", err.Error(), secret)
+	assertNoToken(t, "gitAuth error", err.Error(), "secret-token")
+}
+
+func TestGitAuthRejectsHTTPTokenAuth(t *testing.T) {
+	t.Setenv("GITOPS_TEST_TOKEN", "secret-token")
+	cfg := config.Config{}
+	scanner := New(cfg, nil, slog.Default())
+	repo := config.RepositoryConfig{
+		Name:     "repo",
+		URL:      "http://github.example.test/example/repo.git",
+		TokenEnv: "GITOPS_TEST_TOKEN",
+	}
+	_, err := scanner.gitAuth(repo)
+	if err == nil {
+		t.Fatal("gitAuth succeeded, want rejection of plain HTTP token authentication")
+	}
+	assertNoToken(t, "gitAuth error", err.Error(), "secret-token")
+}
+
+func TestGitAuthAllowsCredentialFreeHTTPWithoutToken(t *testing.T) {
+	cfg := config.Config{}
+	scanner := New(cfg, nil, slog.Default())
+	repo := config.RepositoryConfig{
+		Name: "repo",
+		URL:  "http://github.example.test/example/repo.git",
+	}
 	auth, err := scanner.gitAuth(repo)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("gitAuth failed, want credential-free HTTP left unchanged: %v", err)
 	}
 	if auth.remoteURL != repo.URL {
-		t.Fatalf("remoteURL = %q, want credentialed config URL", auth.remoteURL)
-	}
-	if auth.stripRemoteUserinfo {
-		t.Fatal("stripRemoteUserinfo = true, want false without replacement token auth")
-	}
-	redacted := auth.redactor.Redact("git clone " + repo.URL + " failed with deploy:" + secret)
-	assertNoToken(t, "redacted auth error", redacted, secret)
-	if strings.Contains(redacted, "deploy:"+secret) {
-		t.Fatalf("redacted auth error contains userinfo: %q", redacted)
+		t.Fatalf("remoteURL = %q, want unchanged %q", auth.remoteURL, repo.URL)
 	}
 }
 
@@ -834,12 +882,22 @@ func TestScanAllFailedFetchMigratesCredentialedRemoteAndDoesNotLeak(t *testing.T
 		}},
 		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
 	}
-	scanner := New(cfg, store, slog.Default())
+	// Capture logs so the credential scrub/reject path is asserted over all
+	// four leak channels the spec names: returned errors, logs, persisted
+	// fields, and .git/config. ScanAll logs every failed repository scan
+	// with the error value (see scanOne's caller in ScanAll), which is
+	// exactly the path this fetch failure drives.
+	var logs bytes.Buffer
+	scanner := New(cfg, store, slog.New(slog.NewTextHandler(&logs, nil)))
 	err = scanner.ScanAll(ctx)
 	if err == nil {
 		t.Fatal("ScanAll succeeded, want fetch failure")
 	}
 	assertNoToken(t, "returned error", err.Error(), token)
+	if !strings.Contains(logs.String(), "repository scan failed") || !strings.Contains(logs.String(), "fixture") {
+		t.Fatalf("captured logs do not show the expected failed-scan entry, want the log channel actually exercised: %s", logs.String())
+	}
+	assertNoToken(t, "captured logs", logs.String(), token)
 	after, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -856,43 +914,239 @@ func TestScanAllFailedFetchMigratesCredentialedRemoteAndDoesNotLeak(t *testing.T
 	assertNoTokenInTree(t, dataDir, token)
 }
 
-func TestMigrateRemoteLeavesSSHOriginUnchanged(t *testing.T) {
+func TestReconcileConfiguredOriginLeavesNonTokenAuthUnchanged(t *testing.T) {
 	ctx := context.Background()
 	repoPath := t.TempDir()
 	runGit(t, repoPath, "init", "-b", "main")
 	origin := "ssh://git@github.com/org/repo.git"
 	runGit(t, repoPath, "remote", "add", "origin", origin)
 	auth := gitAuth{
-		redactor:            sanitizer.New("token"),
-		stripRemoteUserinfo: true,
+		remoteURL: "https://github.com/org/other.git",
+		redactor:  sanitizer.New("token"),
 	}
-	if err := migrateRemote(ctx, repoPath, auth); err != nil {
+	if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
 	if got != origin {
-		t.Fatalf("origin = %q, want %q", got, origin)
+		t.Fatalf("origin = %q, want unchanged %q since auth is not token-based", got, origin)
 	}
 }
 
-func TestMigrateRemoteStripsHTTPSCredentialedOrigin(t *testing.T) {
+func TestReconcileConfiguredOriginUpdatesTokenAuthOrigin(t *testing.T) {
 	ctx := context.Background()
-	token := "migrate-secret-token-t008"
 	repoPath := t.TempDir()
 	runGit(t, repoPath, "init", "-b", "main")
-	runGit(t, repoPath, "remote", "add", "origin", "https://x-access-token:"+token+"@github.com/org/repo.git")
+	runGit(t, repoPath, "remote", "add", "origin", "https://old.example.test/org/repo.git")
 	auth := gitAuth{
-		redactor:            sanitizer.New(token),
-		stripRemoteUserinfo: true,
+		remoteURL:    "https://new.example.test/org/repo.git",
+		redactor:     sanitizer.New("token"),
+		useTokenAuth: true,
 	}
-	if err := migrateRemote(ctx, repoPath, auth); err != nil {
+	if err := reconcileConfiguredOrigin(ctx, repoPath, auth); err != nil {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
-	if got != "https://github.com/org/repo.git" {
-		t.Fatalf("origin = %q, want token-free HTTPS origin", got)
+	if got != auth.remoteURL {
+		t.Fatalf("origin = %q, want reconciled to %q", got, auth.remoteURL)
 	}
-	assertNoToken(t, "origin", got, token)
+}
+
+func TestCredentialFreeRemoteURL(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		raw         string
+		wantClean   string
+		wantStrip   bool
+		wantErr     bool
+		errContains string
+	}{
+		{name: "https no userinfo unchanged", raw: "https://github.com/org/repo.git", wantClean: "https://github.com/org/repo.git"},
+		{name: "http no userinfo unchanged", raw: "http://github.example.test/org/repo.git", wantClean: "http://github.example.test/org/repo.git"},
+		{name: "https strips userinfo", raw: "https://x-access-token:secret@github.com/org/repo.git", wantClean: "https://github.com/org/repo.git", wantStrip: true},
+		{name: "HTTPS scheme case insensitive strips userinfo", raw: "HTTPS://deploy:secret@GitHub.example.test/org/repo.git", wantStrip: true},
+		{name: "http missing host is invalid", raw: "http:///no-host", wantErr: true},
+		{name: "ssh url unchanged", raw: "ssh://git@github.com/org/repo.git", wantClean: "ssh://git@github.com/org/repo.git"},
+		{name: "git url unchanged", raw: "git://github.com/org/repo.git", wantClean: "git://github.com/org/repo.git"},
+		{name: "file url unchanged", raw: "file:///srv/repos/repo.git", wantClean: "file:///srv/repos/repo.git"},
+		{name: "file url without path is invalid", raw: "file://", wantErr: true},
+		{name: "scp-like with user unchanged", raw: "git@github.com:org/repo.git", wantClean: "git@github.com:org/repo.git"},
+		{name: "scp-like without user unchanged", raw: "github.com:org/repo.git", wantClean: "github.com:org/repo.git"},
+		{name: "absolute filesystem path unchanged", raw: "/srv/repos/repo.git", wantClean: "/srv/repos/repo.git"},
+		{name: "relative filesystem path unchanged", raw: "repos/repo.git", wantClean: "repos/repo.git"},
+		{name: "empty is invalid", raw: "", wantErr: true},
+		{name: "dot is invalid", raw: ".", wantErr: true},
+		{name: "control character is invalid", raw: "https://github.com/org/repo\n.git", wantErr: true},
+		{name: "whitespace is invalid", raw: "not a remote at all here", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clean, stripped, err := credentialFreeRemoteURL(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("credentialFreeRemoteURL(%q) succeeded, want error", tt.raw)
+				}
+				if strings.Contains(err.Error(), tt.raw) && tt.raw != "" {
+					t.Fatalf("error echoes raw remote: %q", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("credentialFreeRemoteURL(%q) failed: %v", tt.raw, err)
+			}
+			if stripped != tt.wantStrip {
+				t.Fatalf("stripped = %v, want %v", stripped, tt.wantStrip)
+			}
+			if tt.wantClean != "" && clean != tt.wantClean {
+				t.Fatalf("clean = %q, want %q", clean, tt.wantClean)
+			}
+			if !tt.wantStrip && clean != tt.raw {
+				t.Fatalf("clean = %q, want byte-for-byte unchanged %q", clean, tt.raw)
+			}
+		})
+	}
+}
+
+func TestScrubCachedOriginCredentialsAllFetchAndPushURLs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repoPath := t.TempDir()
+	runGit(t, repoPath, "init", "-b", "main")
+	fetchToken := "scrub-fetch-secret-t060"
+	pushToken := "scrub-push-secret-t060"
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "https://x-access-token:"+fetchToken+"@example.test/repo-a.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "ssh://git@example.test/repo-b.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.pushurl", "https://x-access-token:"+pushToken+"@example.test/repo-a.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.pushurl", "https://x-access-token:"+pushToken+"@example.test/repo-c.git")
+
+	redactor := sanitizer.New(fetchToken, pushToken)
+	if err := scrubCachedOriginCredentials(ctx, repoPath, redactor, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	wantFetch := []string{"https://example.test/repo-a.git", "ssh://git@example.test/repo-b.git"}
+	gotFetch := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
+	if !reflect.DeepEqual(gotFetch, wantFetch) {
+		t.Fatalf("fetch urls = %#v, want %#v", gotFetch, wantFetch)
+	}
+	wantPush := []string{"https://example.test/repo-a.git", "https://example.test/repo-c.git"}
+	gotPush := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.pushurl"))
+	if !reflect.DeepEqual(gotPush, wantPush) {
+		t.Fatalf("push urls = %#v, want %#v", gotPush, wantPush)
+	}
+
+	configData, err := os.ReadFile(filepath.Join(repoPath, ".git", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoToken(t, ".git/config", string(configData), fetchToken)
+	assertNoToken(t, ".git/config", string(configData), pushToken)
+}
+
+func TestCachedOriginScrubPrecedesCredentialValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	token := "policy-secret-t060"
+	dataDir := t.TempDir()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	if err := os.MkdirAll(repoCacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoCacheDir, "init", "-b", "main", "private")
+	repoPath := filepath.Join(repoCacheDir, "private")
+	runGit(t, repoPath, "remote", "add", "origin", "https://x-access-token:"+token+"@example.invalid/private/repo.git")
+
+	repo := config.RepositoryConfig{
+		Name:       "private",
+		URL:        "https://user:" + token + "@example.invalid/private/repo.git",
+		DefaultRef: "main",
+	}
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{repo},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, nil, slog.Default())
+	if _, err := scanner.SyncRepo(ctx, repo); err == nil {
+		t.Fatal("SyncRepo succeeded, want rejection of embedded configured URL userinfo")
+	} else {
+		assertNoToken(t, "returned error", err.Error(), token)
+	}
+
+	got := strings.TrimSpace(gitOutputForTest(t, repoPath, "remote", "get-url", "origin"))
+	if got != "https://example.invalid/private/repo.git" {
+		t.Fatalf("cached origin = %q, want scrubbed even though the configured URL was rejected", got)
+	}
+}
+
+// TestSyncRepoScrubsMultipleCachedOriginURLsBeforeNetworkAttempt is the
+// representative pre-change fixture: multiple fetch URLs, multiple push
+// URLs, credentials in at least one of each, and one credential-free
+// non-HTTP(S) URL. It proves synchronization removes every HTTP(S) userinfo
+// value, preserving counts, ordering, and the non-HTTP value, before the
+// first network attempt (an unreachable host here stands in for "network").
+func TestSyncRepoScrubsMultipleCachedOriginURLsBeforeNetworkAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	repoCacheDir := filepath.Join(dataDir, "repos")
+	if err := os.MkdirAll(repoCacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoCacheDir, "init", "-b", "main", "multi")
+	repoPath := filepath.Join(repoCacheDir, "multi")
+	fetchToken := "multi-fetch-secret-t060"
+	pushToken := "multi-push-secret-t060"
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "https://x-access-token:"+fetchToken+"@127.0.0.1:1/private/repo-a.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "https://x-access-token:"+fetchToken+"@127.0.0.1:1/private/repo-b.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.url", "ssh://git@127.0.0.1/private/repo-c.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.pushurl", "https://x-access-token:"+pushToken+"@127.0.0.1:1/private/repo-a.git")
+	runGit(t, repoPath, "config", "--add", "remote.origin.pushurl", "https://x-access-token:"+pushToken+"@127.0.0.1:1/private/repo-b.git")
+
+	dbPath := filepath.Join(dataDir, "dashboard.db")
+	store, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo := config.RepositoryConfig{
+		Name:       "multi",
+		URL:        "https://127.0.0.1:1/private/repo-a.git",
+		DefaultRef: "main",
+	}
+	cfg := config.Config{
+		Server:       config.ServerConfig{DataDir: dataDir, RepoCacheDir: repoCacheDir},
+		Auth:         config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{repo},
+		Monitoring:   config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if _, err := scanner.SyncRepo(ctx, repo); err == nil {
+		t.Fatal("SyncRepo succeeded, want a network fetch failure against an unreachable host")
+	} else {
+		assertNoToken(t, "returned error", err.Error(), fetchToken)
+		assertNoToken(t, "returned error", err.Error(), pushToken)
+	}
+
+	wantFetch := []string{
+		"https://127.0.0.1:1/private/repo-a.git",
+		"https://127.0.0.1:1/private/repo-b.git",
+		"ssh://git@127.0.0.1/private/repo-c.git",
+	}
+	gotFetch := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.url"))
+	if !reflect.DeepEqual(gotFetch, wantFetch) {
+		t.Fatalf("fetch urls = %#v, want %#v", gotFetch, wantFetch)
+	}
+	wantPush := []string{
+		"https://127.0.0.1:1/private/repo-a.git",
+		"https://127.0.0.1:1/private/repo-b.git",
+	}
+	gotPush := splitGitConfigLines(gitOutputForTest(t, repoPath, "config", "--get-all", "remote.origin.pushurl"))
+	if !reflect.DeepEqual(gotPush, wantPush) {
+		t.Fatalf("push urls = %#v, want %#v", gotPush, wantPush)
+	}
+	assertNoTokenInTree(t, dataDir, fetchToken)
+	assertNoTokenInTree(t, dataDir, pushToken)
 }
 
 func TestGitEnvUsesSSHKey(t *testing.T) {
