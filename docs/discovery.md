@@ -30,13 +30,32 @@ port.
 
 ## Traefik
 
-- File-provider HTTP and TCP router rules contribute `Host(...)` and
-  `HostSNI(...)` routes associated with their named service.
-- File-provider backend server URLs and TCP server addresses are collected too;
-  they retain their explicitly declared ports. Router rules are not enriched
-  with backend ports: the router host is a public-routing assertion, while a
-  backend address can be private, shared, or selected dynamically, so combining
-  them would invent an endpoint.
+- File-provider `Host(...)` router rules and `http.services` backend server
+  URLs are HTTP evidence and contribute HTTP routes associated with their
+  named service. A backend server URL keeps its explicitly declared scheme
+  and port.
+- File-provider `HostSNI(...)` router rules and `tcp.services` backend server
+  addresses are TCP evidence and never become HTTP routes, in file-provider
+  config or in Compose Traefik labels alike: an SNI host rule has no known
+  port, and a `host:port` backend address has no scheme, so guessing either
+  into an `http://`/`https://` URL would invent an endpoint and get probed as
+  one. Both are instead recorded as non-monitorable TCP inventory values,
+  `tcp/<host>` for SNI-only evidence and `tcp/<host>:<port>` for a backend
+  address, the same way `address/<literal>` records a Compose static address
+  with no port evidence. `tcp/...` values are never HTTP monitor targets.
+- Router rules are not enriched with backend ports in either direction: the
+  router host is a public-routing assertion, while a backend address can be
+  private, shared, or selected dynamically, so combining them would invent an
+  endpoint.
+- Whether `Host(...)` or `HostSNI(...)` was used, not which config section
+  (`http` or `tcp`) the rule appears under, decides HTTP vs. TCP evidence,
+  since that is what Traefik's own rule syntax guarantees and it is the only
+  information available when the same rule text appears in a Compose label.
+- There is no TCP-connect monitor check today, so `tcp/...` endpoints are
+  display-only: they surface as inventory but are never probed. A TCP-connect
+  check is a gap for future intake, not something an ICMP ping target
+  substitutes for, since ping cannot confirm the specific TCP port is
+  listening.
 
 ## Hosts and Kubernetes
 
@@ -58,8 +77,8 @@ HTTP target canonicalization lowercases scheme and authority, strips URL
 userinfo, removes default `:80` for HTTP and `:443` for HTTPS, brackets IPv6
 literals in an authority, and removes a root-only trailing slash while
 preserving meaningful paths, queries, fragments, and escapes. Non-HTTP
-inventory values such as `address/...`, `host/...`, and `service/...` are not
-HTTP monitor targets.
+inventory values such as `address/...`, `host/...`, `tcp/...`, and
+`service/...` are not HTTP monitor targets.
 
 Before a route is dialed, the egress policy checks the declared host and every
 resolved address, including redirects. A denied route is recorded as a

@@ -222,6 +222,40 @@ services:
 	}
 }
 
+func TestParseComposeTraefikTCPLabelProducesNoHTTPRoute(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "compose.yaml")
+	if err := os.WriteFile(path, []byte(`
+services:
+  db:
+    image: postgres:16
+    labels:
+      - "traefik.tcp.routers.db.rule=HostSNI('db.example.test')"
+      - "traefik.tcp.routers.db.service=db"
+  mixed:
+    image: example/mixed:v1
+    labels:
+      - "traefik.http.routers.web.rule=Host('web.example.test')"
+      - "traefik.tcp.routers.db.rule=HostSNI('db.example.test')"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project, err := ParseCompose(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := map[string]ComposeService{}
+	for _, service := range project.Services {
+		services[service.Name] = service
+	}
+	if got := services["db"].Exposure; !sameStringSlice(got, []string{"tcp/db.example.test"}) {
+		t.Fatalf("db exposure = %v, want SNI-only TCP evidence, no HTTP route", got)
+	}
+	if got := services["mixed"].Exposure; !sameStringSlice(got, []string{"https://web.example.test", "tcp/db.example.test"}) {
+		t.Fatalf("mixed exposure = %v, want both HTTP route and TCP evidence", got)
+	}
+}
+
 func TestParseComposePortRangesAndProtocols(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "compose.yaml")

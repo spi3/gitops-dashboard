@@ -9,6 +9,7 @@ import {
   serviceSortOrder,
   statusWord,
   tallyWord,
+  tcpEndpointPrefix,
   themeStorageKey
 } from "./constants";
 import type { AgentConnection, AgentInfo, BuildInfo, ContainerStatus, EnvironmentGroup, Health, ImageReference, MonitorTargetDetail, MonitorTargetKind, ObservedImage, Service, StatusResult, Tab, TargetSample, Theme, Tone, UptimeSample, UptimeStat } from "./types";
@@ -538,6 +539,20 @@ export function shortDigest(digest: string): string {
     return `${algorithm}:${value.slice(0, 8)}…`;
   }
   return digest;
+}
+
+export function tcpEndpoints(service: Service): string[] {
+  const endpoints = new Set<string>();
+  for (const value of service.exposure) {
+    if (!value.startsWith(tcpEndpointPrefix)) {
+      continue;
+    }
+    const endpoint = value.slice(tcpEndpointPrefix.length);
+    if (endpoint) {
+      endpoints.add(endpoint);
+    }
+  }
+  return Array.from(endpoints).sort();
 }
 
 export function accessTargets(service: Service) {

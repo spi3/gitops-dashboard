@@ -353,18 +353,23 @@ func composePortRange(value string) []string {
 
 func labelRoutes(value yaml.Node) []string {
 	value = resolveAlias(value)
-	var result []string
+	var httpHosts []string
+	var tcpEndpoints []TCPEndpoint
 	switch value.Kind {
 	case yaml.SequenceNode:
 		for _, item := range value.Content {
-			result = append(result, hostRules(stringifyNode(*item))...)
+			hosts, endpoints := hostRules(stringifyNode(*item))
+			httpHosts = append(httpHosts, hosts...)
+			tcpEndpoints = append(tcpEndpoints, endpoints...)
 		}
 	case yaml.MappingNode:
 		for _, item := range mappingValues(value) {
-			result = append(result, hostRules(stringValueNode(item))...)
+			hosts, endpoints := hostRules(stringValueNode(item))
+			httpHosts = append(httpHosts, hosts...)
+			tcpEndpoints = append(tcpEndpoints, endpoints...)
 		}
 	}
-	return uniqueSorted(result)
+	return uniqueSorted(append(httpHosts, tcpEndpointsExposure(tcpEndpoints)...))
 }
 
 func stringifyNode(value yaml.Node) string {

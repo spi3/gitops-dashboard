@@ -16,7 +16,8 @@ import {
   runtimeLabel,
   sortContainers,
   targetBlockClass,
-  targetDetailMeta
+  targetDetailMeta,
+  tcpEndpoints
 } from "../selectors";
 import type { AgentInfo, Service, StatusResult, UptimeStat } from "../types";
 
@@ -30,6 +31,7 @@ export function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApp
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const routes = accessTargets(service);
+  const tcp = tcpEndpoints(service);
   const commit = service.sourceCommit ? service.sourceCommit.slice(0, 7) : "";
   const targets = monitorTargetDetails(service, statuses, uptime);
 
@@ -80,6 +82,18 @@ export function ServiceDrawer({ busyMonitorOverride, onClose, onSetMonitorNotApp
             </p>
           )}
         </section>
+
+        {tcp.length ? (
+          <section className="drawerSection">
+            <h3>TCP endpoints</h3>
+            <div className="chips">
+              {tcp.map((endpoint) => (
+                <span className="chip" key={endpoint}>{endpoint}</span>
+              ))}
+            </div>
+            <p className="quiet">Not monitored — no TCP-connect check is configured.</p>
+          </section>
+        ) : null}
 
         {service.images.length ? (
           <section className="drawerSection">

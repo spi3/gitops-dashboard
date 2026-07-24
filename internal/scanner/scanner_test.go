@@ -151,6 +151,26 @@ func TestRouteTargetReplacementsReconsidersPriorAmbiguity(t *testing.T) {
 	}
 }
 
+// TestRouteTargetReplacementsRetiresStaleFabricatedTCPRouteWithoutReplacement
+// covers T-055's coordination with T-031: rescanning a service whose Exposure
+// used to hold an invented HTTP route for what is actually a TCP backend
+// (e.g. a pre-fix "https://db:5432") must drop that route outright once the
+// same evidence reparses as "tcp/db:5432" TCP inventory, not attempt to
+// "replace" it — replacement is for genuine port renumbering of a route that
+// is still a route, and a stale invented route has no HTTP-shaped candidate
+// in the new set to match against.
+func TestRouteTargetReplacementsRetiresStaleFabricatedTCPRouteWithoutReplacement(t *testing.T) {
+	previous := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"https://db:5432"}}}
+	current := []core.Service{{ID: "svc", Repository: "repo", Exposure: []string{"tcp/db:5432"}}}
+	replacements, exclusions := routeTargetReplacements(previous, current, "repo", nil)
+	if len(replacements) != 0 {
+		t.Fatalf("replacements = %#v, want none: a TCP endpoint is not a route replacement candidate", replacements)
+	}
+	if len(exclusions) != 0 {
+		t.Fatalf("exclusions = %#v, want none: the stale route retires cleanly", exclusions)
+	}
+}
+
 func TestScanAllDiscoversPingHostsFromConfiguredRepository(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -210,6 +230,77 @@ all:
 	}
 	if host.SourceCommit == "" {
 		t.Fatal("host SourceCommit is empty")
+	}
+}
+
+func TestScanAllModelsTraefikTCPEndpointsSeparatelyFromHTTPRoutes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	writeFile(t, filepath.Join(source, "prod", "db", "compose.yaml"), `
+services:
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+`)
+	writeFile(t, filepath.Join(source, "prod", "dynamic-tcp.yaml"), `
+tcp:
+  routers:
+    db:
+      rule: HostSNI(`+"`db.example.test`"+`)
+      service: db
+  services:
+    db:
+      loadBalancer:
+        servers:
+          - address: "db:5432"
+`)
+	runGit(t, source, "add", ".")
+	runGit(t, source, "commit", "-m", "add mixed http/tcp fixture")
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:       "fixture",
+			URL:        "file://" + source,
+			DefaultRef: "main",
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	if err := scanner.ScanAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicesByName := map[string][]string{}
+	for _, service := range summary.Services {
+		servicesByName[service.Name] = service.Exposure
+	}
+	dbExposure := servicesByName["db"]
+	if len(dbExposure) != 2 || !contains(dbExposure, "tcp/db.example.test") || !contains(dbExposure, "tcp/db:5432") {
+		t.Fatalf("db exposure = %v, want SNI and backend address TCP evidence only", dbExposure)
+	}
+	for _, route := range dbExposure {
+		if strings.HasPrefix(route, "http://") || strings.HasPrefix(route, "https://") {
+			t.Fatalf("db exposure = %v, TCP evidence must never become an HTTP route", dbExposure)
+		}
+	}
+	if !contains(servicesByName["web"], "https://web.example.test") {
+		t.Fatalf("web exposure = %v, unaffected by the added TCP fixture", servicesByName["web"])
 	}
 }
 

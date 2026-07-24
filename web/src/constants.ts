@@ -70,3 +70,4 @@ export const refreshIntervalMs = 30_000;
 export const themeStorageKey = "gitops-dashboard-theme";
 export const routesTarget = "routes";
 export const routeTargetPrefix = `${routesTarget}:`;
+export const tcpEndpointPrefix = "tcp/";

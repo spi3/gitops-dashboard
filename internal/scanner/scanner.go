@@ -430,6 +430,7 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 	var services []core.Service
 	var kubeResources []parser.KubernetesResource
 	var traefikRoutes []parser.TraefikRoute
+	var traefikTCPRoutes []parser.TraefikTCPRoute
 	var parseErrors []string
 	pathFilter := newRepoPathFilter(repo)
 	err := filepath.WalkDir(repoPath, func(path string, entry os.DirEntry, walkErr error) error {
@@ -472,12 +473,13 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 				parsed[i].SourcePath = rel
 			}
 			kubeResources = append(kubeResources, parsed...)
-			routes, err := parser.ParseTraefikRoutes(path)
+			routes, tcpRoutes, err := parser.ParseTraefikRoutes(path)
 			if err != nil {
 				parseErrors = append(parseErrors, fmt.Sprintf("%s: %v", rel, err))
 				return nil
 			}
 			traefikRoutes = append(traefikRoutes, routes...)
+			traefikTCPRoutes = append(traefikTCPRoutes, tcpRoutes...)
 		}
 		return nil
 	})
@@ -489,7 +491,7 @@ func (scanner Scanner) parseRepo(repoPath string, repo config.RepositoryConfig, 
 		return services, fmt.Errorf("parse errors: %s", strings.Join(parseErrors, "; "))
 	}
 	services = append(services, scanner.kubeServices(repo.Name, commit, enrichKubernetesExposure(kubeResources))...)
-	services = applyTraefikRoutes(services, traefikRoutes)
+	services = applyTraefikRoutes(services, traefikRoutes, traefikTCPRoutes)
 	pingServices, err := scanner.pingServices(repoPath, repo.Name, commit)
 	if err != nil {
 		return services, err
@@ -637,11 +639,19 @@ func namespacedName(namespace, name string) string {
 	return namespace + "/" + name
 }
 
-func applyTraefikRoutes(services []core.Service, routes []parser.TraefikRoute) []core.Service {
+func applyTraefikRoutes(services []core.Service, routes []parser.TraefikRoute, tcpRoutes []parser.TraefikTCPRoute) []core.Service {
 	routesByName := map[string][]string{}
 	for _, route := range routes {
 		key := normalizedName(route.Service)
 		routesByName[key] = append(routesByName[key], route.Routes...)
+	}
+	for _, route := range tcpRoutes {
+		key := normalizedName(route.Service)
+		for _, endpoint := range route.Endpoints {
+			if value := endpoint.Exposure(); value != "" {
+				routesByName[key] = append(routesByName[key], value)
+			}
+		}
 	}
 	for i := range services {
 		for _, key := range serviceRouteKeys(services[i]) {
