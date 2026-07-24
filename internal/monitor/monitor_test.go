@@ -37,7 +37,7 @@ func TestRunTargetLoopWithoutCheckTimeoutDoesNotAddDefaultDeadline(t *testing.T)
 			_, hasDeadline := checkCtx.Deadline()
 			checked <- hasDeadline
 			return nil
-		})
+		}, nil)
 		close(loopDone)
 	}()
 

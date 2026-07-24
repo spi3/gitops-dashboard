@@ -43,6 +43,7 @@ not override externally managed assignment, priority, or status.
 | TASK-0047 | In Review | P1 | CI Reliability | CI publish wedge hotfix | `docs/tasks/TASK-0047-ci-publish-wedge-hotfix.md` | TASK-0015 | 2026-07-10 | Native UI build platform, bounded CI jobs, and exact Docker variable-reference guards. |
 | TASK-0060 | Proposed | P1 | Security | Credential and build-context safety | `docs/tasks/TASK-0060-credential-and-build-context-safety.md` | None | 2026-07-24 | Cached-origin credential scrub before repository sync; Docker context-audit stage gating local copies. |
 | TASK-0061 | Proposed | P1 | Repository Analysis | Repository synchronization truthfulness and origin reconciliation | `docs/tasks/TASK-0061-scan-sync-truthfulness.md` | TASK-0060 | 2026-07-24 | Scan rows persist before cache-root preflight; symlink-safe containment before every Git command; origin enumeration/reconciliation with fast-forward and diverged-origin fixtures. |
+| TASK-0062 | Proposed | P2 | Monitoring | Bound Kubernetes monitor cycles | `docs/tasks/TASK-0062-bound-kubernetes-monitor-cycles.md` | None | 2026-07-24 | Per-request `rest.Config.Timeout`, a derived check-phase cycle budget applied to scheduled loops and `CheckAll`, immediate deadline abort on Get/List, and a separate bounded Kubernetes failure-write phase that never fires on parent cancellation. |
 
 ## Next Task ID
 

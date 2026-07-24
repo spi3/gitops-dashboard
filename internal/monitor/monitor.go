@@ -17,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 var ErrAgentTargetUnauthorized = errors.New("agent target is not authorized for token")
@@ -41,6 +40,9 @@ type Monitor struct {
 
 	pingCache *pingInventoryCache
 	ping      pingFunc
+
+	kubernetesCycleBudget kubernetesCycleBudgetFunc
+	kubernetesClient      kubernetesClientFunc
 }
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Monitor {
@@ -64,7 +66,15 @@ func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Monitor {
 			}
 		}
 	}
-	return Monitor{cfg: cfg, store: store, logger: logger, pingCache: newPingInventoryCache(), ping: systemPing}
+	return Monitor{
+		cfg:                   cfg,
+		store:                 store,
+		logger:                logger,
+		pingCache:             newPingInventoryCache(),
+		ping:                  systemPing,
+		kubernetesCycleBudget: computeKubernetesCycleBudget,
+		kubernetesClient:      productionKubernetesClient,
+	}
 }
 
 func statusTTL(interval time.Duration) time.Duration {
@@ -142,11 +152,15 @@ func (monitor Monitor) CheckAll(ctx context.Context) error {
 			combined = err
 		}
 	}
+	defaultInterval, _ := monitor.cfg.DefaultInterval()
+	kubernetesServices := runtimeServices(services, "kubernetes")
 	for _, target := range monitor.cfg.Runtime.Kubernetes {
-		if err := monitor.checkKubernetes(ctx, target, services); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				monitor.recordTargetFailure(ctx, target.Name, runtimeServices(services, "kubernetes"))
-			}
+		budget := monitor.kubernetesCycleBudget(kubernetesServices, target.CheckInterval(defaultInterval))
+		err := monitor.runCheckWithTimeout(ctx, budget, func(checkCtx context.Context) error {
+			return monitor.checkKubernetes(checkCtx, target, services)
+		})
+		if err != nil {
+			monitor.handleKubernetesCheckFailure(ctx, target.Name, err, services)
 			monitor.logger.Error("kubernetes monitoring failed", "target", target.Name, "error", err)
 			combined = err
 		}
@@ -258,15 +272,19 @@ func agentTargetAllowed(target string, authorizedTargets []string) bool {
 func (monitor Monitor) runDockerLoop(ctx context.Context, target config.DockerTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkDocker(checkCtx, target, services)
-	}, func(services []core.Service) []core.Service {
+	}, monitor.genericFailureHandler(target.Name, func(services []core.Service) []core.Service {
 		return dockerServicesForTarget(services, target, directDockerTargets(monitor.cfg.Runtime.Docker))
-	})
+	}))
 }
 
 func (monitor Monitor) runKubernetesLoop(ctx context.Context, target config.KubernetesTarget, interval time.Duration) {
-	monitor.runTargetLoop(ctx, target.Name, interval, nil, func(checkCtx context.Context, services []core.Service) error {
+	monitor.runTargetLoop(ctx, target.Name, interval, func(services []core.Service) time.Duration {
+		return monitor.kubernetesCycleBudget(runtimeServices(services, "kubernetes"), interval)
+	}, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkKubernetes(checkCtx, target, services)
-	}, func(services []core.Service) []core.Service { return runtimeServices(services, "kubernetes") })
+	}, func(loopCtx context.Context, err error, services []core.Service) {
+		monitor.handleKubernetesCheckFailure(loopCtx, target.Name, err, services)
+	})
 }
 
 func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPRouteTarget, interval time.Duration) {
@@ -278,16 +296,37 @@ func (monitor Monitor) runHTTPRouteLoop(ctx context.Context, target config.HTTPR
 		return monitor.httpRouteRunTimeout(target, services)
 	}, func(checkCtx context.Context, services []core.Service) error {
 		return monitor.checkHTTPRoutes(checkCtx, target, services)
-	}, func(services []core.Service) []core.Service { return routeServices(services) })
+	}, monitor.genericFailureHandler(targetName, routeServices))
 }
 
 func (monitor Monitor) runPingLoop(ctx context.Context, target config.PingTarget, interval time.Duration) {
 	monitor.runTargetLoop(ctx, target.EffectiveName(), interval, nil, func(checkCtx context.Context, _ []core.Service) error {
 		return monitor.checkPing(checkCtx, target)
-	}, func(services []core.Service) []core.Service { return pingServicesForTarget(services, target) })
+	}, monitor.genericFailureHandler(target.EffectiveName(), func(services []core.Service) []core.Service {
+		return pingServicesForTarget(services, target)
+	}))
 }
 
-func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, checkTimeout func([]core.Service) time.Duration, check func(context.Context, []core.Service) error, covered ...func([]core.Service) []core.Service) {
+// genericFailureHandler is the shared runTargetLoop failure callback used by
+// every runtime except Kubernetes: any error other than context.Canceled
+// writes the generic target failure rows for the runtime's covered services.
+// Kubernetes uses handleKubernetesCheckFailure instead, which additionally
+// distinguishes an explicit phase/request deadline from the parent context's
+// own cancellation or deadline (see kubernetes_bounds.go).
+func (monitor Monitor) genericFailureHandler(targetName string, covered func([]core.Service) []core.Service) func(context.Context, error, []core.Service) {
+	return func(loopCtx context.Context, err error, services []core.Service) {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		servicesForFailure := services
+		if covered != nil {
+			servicesForFailure = covered(services)
+		}
+		monitor.recordTargetFailure(loopCtx, targetName, servicesForFailure)
+	}
+}
+
+func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, interval time.Duration, checkTimeout func([]core.Service) time.Duration, check func(context.Context, []core.Service) error, onFailure func(context.Context, error, []core.Service)) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	failures := 0
@@ -311,12 +350,8 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 				monitor.logger.Error("status history prune failed", "target", targetName, "error", pruneErr)
 			}
 			if err != nil {
-				if !errors.Is(err, context.Canceled) {
-					servicesForFailure := services
-					if len(covered) > 0 && covered[0] != nil {
-						servicesForFailure = covered[0](services)
-					}
-					monitor.recordTargetFailure(ctx, targetName, servicesForFailure)
+				if onFailure != nil {
+					onFailure(ctx, err, services)
 				}
 				failures++
 				monitor.logger.Error("runtime monitoring failed", "target", targetName, "error", err, "failures", failures)
@@ -748,14 +783,7 @@ func composeServiceTarget(service core.Service) string {
 }
 
 func (monitor Monitor) checkKubernetes(ctx context.Context, target config.KubernetesTarget, services []core.Service) error {
-	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: target.Kubeconfig}
-	overrides := &clientcmd.ConfigOverrides{CurrentContext: target.Context}
-	clientCfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
-	restCfg, err := clientCfg.ClientConfig()
-	if err != nil {
-		return err
-	}
-	clientset, err := dynamic.NewForConfig(restCfg)
+	clientset, err := monitor.kubernetesClient(target)
 	if err != nil {
 		return err
 	}
@@ -787,14 +815,27 @@ func (monitor Monitor) checkKubernetesWithClient(ctx context.Context, target con
 		}
 		resource, err := clientset.Resource(gvr).Namespace(namespace).Get(ctx, service.ResourceName, metav1.GetOptions{})
 		if err != nil {
+			// A phase deadline, a per-request deadline, or the parent
+			// context ending (including mid-request) aborts the whole
+			// target check immediately rather than degrading into an
+			// ordinary per-service error or a write against a dead
+			// context. The caller distinguishes these cases and persists
+			// defined failure state through a separate bounded write phase
+			// (see handleKubernetesCheckFailure).
+			if isContextTerminal(err) {
+				return err
+			}
 			status.Health = core.HealthError
 			status.Message = err.Error()
 		} else {
 			status.Health, status.Message = kubeHealth(service.Kind, resource.Object)
 			status.Message = fmt.Sprintf("%s/%s found: %s", service.Kind, service.ResourceName, status.Message)
-			observedImages, err := observedKubernetesImages(ctx, clientset, target.Name, namespace, resource.Object)
-			if err != nil {
-				status.Message = fmt.Sprintf("%s; image metadata unavailable: %v", status.Message, err)
+			observedImages, imagesErr := observedKubernetesImages(ctx, clientset, target.Name, namespace, resource.Object)
+			if imagesErr != nil {
+				if isContextTerminal(imagesErr) {
+					return imagesErr
+				}
+				status.Message = fmt.Sprintf("%s; image metadata unavailable: %v", status.Message, imagesErr)
 			} else {
 				status.ObservedImages = observedImages
 			}
