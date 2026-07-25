@@ -160,6 +160,10 @@ ON route_target_exclusions(service_id, old_route);`)
 				return store.ensureColumnChanged(ctx, "health_alert_states", "service_incarnation", "TEXT NOT NULL DEFAULT ''")
 			},
 		},
+		{
+			id:    "020_scans_indexes",
+			apply: store.ensureScanIndexes,
+		},
 	}
 }
 
@@ -959,7 +963,11 @@ func (store *Store) ensureAlertIndexes(ctx context.Context) (bool, error) {
 	return changed || indexChanged, err
 }
 
-type alertIndexSpec struct {
+// indexSpec describes a named index this store reconciles by name at
+// migration time: if an index with this name already exists but its
+// definition (table, uniqueness, columns, or partial predicate) differs, it
+// is dropped and recreated rather than left stale.
+type indexSpec struct {
 	name    string
 	table   string
 	unique  bool
@@ -968,8 +976,8 @@ type alertIndexSpec struct {
 	sql     string
 }
 
-func alertIndexSpecs() []alertIndexSpec {
-	return []alertIndexSpec{
+func alertIndexSpecs() []indexSpec {
+	return []indexSpec{
 		{name: "idx_alert_events_status_created_at", table: "alert_events", columns: []string{"status", "created_at_ns", "id"}, sql: `CREATE INDEX idx_alert_events_status_created_at ON alert_events(status, created_at_ns, id)`},
 		{name: "idx_alert_events_dedupe_hash_created_at", table: "alert_events", columns: []string{"dedupe_hash", "created_at_ns", "id"}, sql: `CREATE INDEX idx_alert_events_dedupe_hash_created_at ON alert_events(dedupe_hash, created_at_ns, id)`},
 		{name: "idx_alert_events_pending_dedupe_hash", table: "alert_events", unique: true, columns: []string{"dedupe_hash"}, where: "status='pending' AND dedupe_hash<>''", sql: `CREATE UNIQUE INDEX idx_alert_events_pending_dedupe_hash ON alert_events(dedupe_hash) WHERE status='pending' AND dedupe_hash<>''`},
@@ -981,14 +989,36 @@ func alertIndexSpecs() []alertIndexSpec {
 }
 
 func (store *Store) ensureAlertIndexDefinitions(ctx context.Context) (bool, error) {
+	return store.reconcileIndexes(ctx, alertIndexSpecs())
+}
+
+// scanIndexSpecs covers the per-repository latest-terminal-scan lookup
+// (LatestTerminalScansByRepository): repository and status are equality
+// filters and id is read in MAX() order, so a single (repository, status,
+// id) index serves both the outer query and its correlated MAX subquery
+// without a full scans scan.
+func scanIndexSpecs() []indexSpec {
+	return []indexSpec{
+		{name: "idx_scans_repository_status_id", table: "scans", columns: []string{"repository", "status", "id"}, sql: `CREATE INDEX idx_scans_repository_status_id ON scans(repository, status, id)`},
+	}
+}
+
+func (store *Store) ensureScanIndexes(ctx context.Context) (bool, error) {
+	return store.reconcileIndexes(ctx, scanIndexSpecs())
+}
+
+// reconcileIndexes creates each spec's index if missing and recreates it by
+// name if an existing index with that name no longer matches the spec's
+// definition (alert-index precedent, generalized for reuse by other tables).
+func (store *Store) reconcileIndexes(ctx context.Context, specs []indexSpec) (bool, error) {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	changed := false
-	for _, spec := range alertIndexSpecs() {
-		ok, err := alertIndexMatchesTx(ctx, tx, spec)
+	for _, spec := range specs {
+		ok, err := indexSpecMatchesTx(ctx, tx, spec)
 		if err != nil {
 			return false, err
 		}
@@ -1009,7 +1039,7 @@ func (store *Store) ensureAlertIndexDefinitions(ctx context.Context) (bool, erro
 	return changed, nil
 }
 
-func alertIndexMatchesTx(ctx context.Context, tx *sql.Tx, spec alertIndexSpec) (bool, error) {
+func indexSpecMatchesTx(ctx context.Context, tx *sql.Tx, spec indexSpec) (bool, error) {
 	var table string
 	var rawSQL sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?`, spec.name).Scan(&table, &rawSQL)
@@ -1022,24 +1052,24 @@ func alertIndexMatchesTx(ctx context.Context, tx *sql.Tx, spec alertIndexSpec) (
 	if table != spec.table || !rawSQL.Valid {
 		return false, nil
 	}
-	unique, partial, err := alertIndexFlagsTx(ctx, tx, spec.table, spec.name)
+	unique, partial, err := indexFlagsTx(ctx, tx, spec.table, spec.name)
 	if err != nil {
 		return false, err
 	}
 	if unique != spec.unique || partial != (spec.where != "") {
 		return false, nil
 	}
-	columns, err := alertIndexColumnsTx(ctx, tx, spec.name)
+	columns, err := indexColumnsTx(ctx, tx, spec.name)
 	if err != nil {
 		return false, err
 	}
 	if !stringSlicesEqual(columns, spec.columns) {
 		return false, nil
 	}
-	return normalizeAlertIndexWhere(rawSQL.String) == normalizeAlertIndexWhere(spec.where), nil
+	return normalizeIndexWhere(rawSQL.String) == normalizeIndexWhere(spec.where), nil
 }
 
-func alertIndexFlagsTx(ctx context.Context, tx *sql.Tx, table, name string) (bool, bool, error) {
+func indexFlagsTx(ctx context.Context, tx *sql.Tx, table, name string) (bool, bool, error) {
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA index_list(%s)`, table))
 	if err != nil {
 		return false, false, err
@@ -1064,7 +1094,13 @@ func alertIndexFlagsTx(ctx context.Context, tx *sql.Tx, table, name string) (boo
 	return false, false, nil
 }
 
-func alertIndexColumnsTx(ctx context.Context, tx *sql.Tx, name string) ([]string, error) {
+// indexQueryer is satisfied by both *sql.Tx (mid-migration reconciliation)
+// and *sql.DB (post-migration assertions), so indexColumnsTx serves both.
+type indexQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func indexColumnsTx(ctx context.Context, tx indexQueryer, name string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA index_info(%s)`, name))
 	if err != nil {
 		return nil, err
@@ -1082,7 +1118,7 @@ func alertIndexColumnsTx(ctx context.Context, tx *sql.Tx, name string) ([]string
 	return columns, rows.Err()
 }
 
-func normalizeAlertIndexWhere(sqlText string) string {
+func normalizeIndexWhere(sqlText string) string {
 	sqlText = strings.TrimSpace(sqlText)
 	upper := strings.ToUpper(sqlText)
 	if idx := strings.LastIndex(upper, " WHERE "); idx >= 0 {

@@ -44,6 +44,13 @@ const (
 	// that per-command budget.
 	repoSyncGitCommands      = 7
 	repoSyncOperationTimeout = time.Duration(repoSyncGitCommands)*GitCommandTimeout + 30*time.Second
+
+	// scanRetentionMaintenanceInterval is fixed, not derived from any
+	// repository's scan interval, because the retention horizon is measured
+	// in days: an hourly pass is more than granular enough and needs no
+	// configuration to work.
+	scanRetentionMaintenanceInterval = time.Hour
+	scanRetentionMaintenanceTimeout  = 20 * time.Second
 )
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Scanner {
@@ -51,6 +58,7 @@ func New(cfg config.Config, store *storage.Store, logger *slog.Logger) Scanner {
 }
 
 func (scanner Scanner) RunScheduled(ctx context.Context) {
+	go scanner.runScanRetentionMaintenance(ctx)
 	if len(scanner.cfg.Repositories) == 0 {
 		return
 	}
@@ -68,6 +76,32 @@ func (scanner Scanner) RunScheduled(ctx context.Context) {
 			continue
 		}
 		go scanner.runRepoLoop(ctx, repo, interval)
+	}
+}
+
+// runScanRetentionMaintenance prunes terminal scan rows past the retention
+// horizon on a fixed schedule, with zero required configuration. It runs
+// regardless of the configured repository list so scan history left behind
+// by a repository since removed from config is still bounded.
+func (scanner Scanner) runScanRetentionMaintenance(ctx context.Context) {
+	scanner.pruneTerminalScans(ctx)
+	ticker := time.NewTicker(scanRetentionMaintenanceInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scanner.pruneTerminalScans(ctx)
+		}
+	}
+}
+
+func (scanner Scanner) pruneTerminalScans(ctx context.Context) {
+	pruneCtx, cancel := context.WithTimeout(ctx, scanRetentionMaintenanceTimeout)
+	defer cancel()
+	if _, err := scanner.store.PruneTerminalScans(pruneCtx, storage.DefaultScanRetentionHorizon, storage.DefaultScanRetentionBatchSize); err != nil {
+		scanner.logger.Error("scan retention prune failed", "error", err)
 	}
 }
 

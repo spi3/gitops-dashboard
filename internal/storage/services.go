@@ -490,16 +490,7 @@ func (store *Store) LatestTerminalScansByRepository(ctx context.Context, reposit
 	for i, name := range names {
 		args[i] = name
 	}
-	rows, err := store.db.QueryContext(ctx, `
-SELECT s.repository, s.id, s.status, COALESCE(s.error, '')
-FROM scans s
-WHERE s.repository IN (`+sqlPlaceholders(len(names))+`)
-  AND s.status IN ('ok', 'error')
-  AND s.id = (
-    SELECT MAX(s2.id) FROM scans s2
-    WHERE s2.repository = s.repository AND s2.status IN ('ok', 'error')
-  )
-`, args...)
+	rows, err := store.db.QueryContext(ctx, latestTerminalScansByRepositoryQuery(sqlPlaceholders(len(names))), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -513,6 +504,83 @@ WHERE s.repository IN (`+sqlPlaceholders(len(names))+`)
 		result[repository] = LatestTerminalScan{ID: id, Status: status, Error: strings.TrimSpace(store.redact(errText))}
 	}
 	return result, rows.Err()
+}
+
+// latestTerminalScansByRepositoryQuery builds the SQL LatestTerminalScansByRepository
+// runs, parameterized only on its repository-name placeholder list. It is
+// factored out so the query-plan test asserts against the exact statement
+// production code executes rather than a hand-copied duplicate.
+func latestTerminalScansByRepositoryQuery(placeholders string) string {
+	return `
+SELECT s.repository, s.id, s.status, COALESCE(s.error, '')
+FROM scans s
+WHERE s.repository IN (` + placeholders + `)
+  AND s.status IN ('ok', 'error')
+  AND s.id = (
+    SELECT MAX(s2.id) FROM scans s2
+    WHERE s2.repository = s.repository AND s2.status IN ('ok', 'error')
+  )
+`
+}
+
+// DefaultScanRetentionHorizon is how long a terminal scan row is kept once
+// it is no longer the newest terminal row for its repository. Seven days
+// keeps the dashboard's 50-row summary window populated at every supported
+// scan interval (see docs/tasks/TASK-0068-scans-index-and-retention.md).
+const DefaultScanRetentionHorizon = 7 * 24 * time.Hour
+
+// DefaultScanRetentionBatchSize bounds a single retention delete when the
+// caller does not configure one, keeping individual transactions small
+// (PruneTerminalAlertEvents precedent).
+const DefaultScanRetentionBatchSize = 500
+
+// PruneTerminalScans deletes terminal (ok/error) scan rows started before
+// the given horizon, in bounded batches. Running rows are never touched.
+// Each repository's newest terminal row (by id, matching
+// LatestTerminalScansByRepository's own selection) is excluded from every
+// batch regardless of age: it is the alert evaluator's baseline input and
+// must never be pruned away.
+func (store *Store) PruneTerminalScans(ctx context.Context, horizon time.Duration, batchSize int) (int64, error) {
+	if horizon <= 0 {
+		return 0, nil
+	}
+	if batchSize <= 0 {
+		batchSize = DefaultScanRetentionBatchSize
+	}
+	cutoff := time.Now().UTC().Add(-horizon).Format(time.RFC3339)
+	var total int64
+	for {
+		result, err := retryAlertSQLiteBusy(ctx, func() (sql.Result, error) {
+			return store.db.ExecContext(ctx, `
+DELETE FROM scans
+WHERE id IN (
+  SELECT id FROM scans
+  WHERE status IN ('ok', 'error') AND started_at < ?
+    AND id NOT IN (SELECT MAX(id) FROM scans WHERE status IN ('ok', 'error') GROUP BY repository)
+  ORDER BY id
+  LIMIT ?
+)`, cutoff, batchSize)
+		})
+		if err != nil {
+			return total, fmt.Errorf("prune terminal scans: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += affected
+		if affected > 0 {
+			store.invalidateSummary()
+		}
+		if affected < int64(batchSize) {
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+	}
 }
 
 func (store *Store) Services(ctx context.Context) ([]core.Service, error) {
