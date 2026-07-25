@@ -459,11 +459,12 @@ func (store *Store) mergeRouteAlertCollisionDispatches(ctx context.Context, tx *
 			}
 			continue
 		}
-		// A delivered keeper has already completed this sink, so the
-		// destination pending row is redundant. Other keeper statuses do not
-		// prove that: in particular, pending work ranks above a dead letter.
-		// Leave the rows intact and defer until their active deliveries settle.
-		if duplicate.status == AlertDispatchStatusPending && keeper.status == AlertDispatchStatusDelivered {
+		// A delivered (or skipped, T-065) keeper has already closed this sink
+		// without needing retry, so the destination pending row is redundant.
+		// Other keeper statuses do not prove that: in particular, pending work
+		// ranks above a dead letter. Leave the rows intact and defer until
+		// their active deliveries settle.
+		if duplicate.status == AlertDispatchStatusPending && closedWithoutRetryAlertDispatchStatus(keeper.status) {
 			if err := resetDuplicateAlertDispatch(ctx, tx, duplicate.id); err != nil {
 				return false, err
 			}

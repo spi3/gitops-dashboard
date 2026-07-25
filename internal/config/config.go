@@ -134,6 +134,16 @@ type MonitoringConfig struct {
 	DefaultInterval string `yaml:"defaultInterval"`
 }
 
+// AlertDeliveryLeaseDuration bounds how long the alerter worker may hold a
+// claimed dispatch before another worker is allowed to reclaim it as
+// abandoned. Every enabled sink's timeout must stay strictly below this
+// value (enforced in each sink's TimeoutDuration below) so a still-running
+// send can never outlive the lease and be reclaimed and redelivered while
+// the original attempt is still in flight (T-065). The alerter package
+// derives its lease from this constant instead of defining its own, so the
+// two can never drift out of sync.
+const AlertDeliveryLeaseDuration = 2 * time.Minute
+
 type AlertingConfig struct {
 	Debounce          string               `yaml:"debounce"`
 	Cooldown          string               `yaml:"cooldown"`
@@ -1505,7 +1515,7 @@ func validateAlertHeaderSources(values, envNames, filePaths map[string]string, v
 }
 
 func (sink WebhookAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
-	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.webhook.timeout")
+	return requiredSinkTimeout(sink.Timeout, "alerting.sinks.webhook.timeout")
 }
 
 func (sink DiscordAlertSinkConfig) Validate() error {
@@ -1523,7 +1533,7 @@ func (sink DiscordAlertSinkConfig) Validate() error {
 }
 
 func (sink DiscordAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
-	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.discord.timeout")
+	return requiredSinkTimeout(sink.Timeout, "alerting.sinks.discord.timeout")
 }
 
 func (sink HomeAssistantAlertSinkConfig) Validate() error {
@@ -1546,7 +1556,7 @@ func (sink HomeAssistantAlertSinkConfig) Validate() error {
 }
 
 func (sink HomeAssistantAlertSinkConfig) TimeoutDuration() (time.Duration, error) {
-	return requiredPositiveDuration(sink.Timeout, "alerting.sinks.homeAssistant.timeout")
+	return requiredSinkTimeout(sink.Timeout, "alerting.sinks.homeAssistant.timeout")
 }
 
 func (target DockerTarget) CheckInterval(defaultInterval time.Duration) time.Duration {
@@ -1665,6 +1675,22 @@ func requiredPositiveDuration(value, field string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s is required", field)
 	}
 	return optionalPositiveDuration(value, field)
+}
+
+// requiredSinkTimeout parses an alert sink's configured timeout and rejects
+// any value that would let it outlive AlertDeliveryLeaseDuration: a send
+// still running when the lease expires gets reclaimed and redelivered by
+// another worker while the original attempt is still in flight, so the
+// dispatch is delivered twice (T-065).
+func requiredSinkTimeout(value, field string) (time.Duration, error) {
+	timeout, err := requiredPositiveDuration(value, field)
+	if err != nil {
+		return 0, err
+	}
+	if timeout >= AlertDeliveryLeaseDuration {
+		return 0, fmt.Errorf("%s (%s) must be less than the alert delivery lease (%s)", field, timeout, AlertDeliveryLeaseDuration)
+	}
+	return timeout, nil
 }
 
 func validateHTTPURL(field, value string) error {

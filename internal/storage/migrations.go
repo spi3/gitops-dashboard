@@ -1243,7 +1243,7 @@ ORDER BY sink ASC, id ASC
 			}
 			continue
 		}
-		if existing.status == AlertDispatchStatusDelivered {
+		if closedWithoutRetryAlertDispatchStatus(existing.status) {
 			if activeAlertDispatchStatus(duplicate.status) {
 				if err := resetDuplicateAlertDispatch(ctx, tx, duplicate.id); err != nil {
 					return err
@@ -1251,7 +1251,7 @@ ORDER BY sink ASC, id ASC
 			}
 			continue
 		}
-		if duplicate.status == AlertDispatchStatusDelivered {
+		if closedWithoutRetryAlertDispatchStatus(duplicate.status) {
 			if activeAlertDispatchStatus(existing.status) {
 				if err := resetDuplicateAlertDispatch(ctx, tx, existing.id); err != nil {
 					return err
@@ -1321,6 +1321,17 @@ func activeAlertDispatchStatus(status string) bool {
 	return status == AlertDispatchStatusPending || status == AlertDispatchStatusInFlight
 }
 
+// closedWithoutRetryAlertDispatchStatus reports whether status is a terminal
+// outcome that will never be retried and pre-empts any active duplicate
+// during dedupe-hash merge, the same way AlertDispatchStatusDelivered always
+// did. Skipped joins delivered here (T-065) because, before this task, a
+// skip was itself persisted as delivered and already received this
+// protection; dead_lettered is excluded because it remains eligible to lose
+// to a more useful duplicate via alertDispatchMergePriority.
+func closedWithoutRetryAlertDispatchStatus(status string) bool {
+	return status == AlertDispatchStatusDelivered || status == AlertDispatchStatusSkipped
+}
+
 func alertDispatchForEventSink(ctx context.Context, tx *sql.Tx, eventID int64, sink string) (alertDispatchMergeRow, bool, error) {
 	var row alertDispatchMergeRow
 	err := tx.QueryRowContext(ctx, `
@@ -1353,10 +1364,10 @@ WHERE event_id=? AND sink=?
 }
 
 func alertDispatchMergeBetter(candidate, current alertDispatchMergeRow) bool {
-	if current.status == AlertDispatchStatusDelivered {
+	if closedWithoutRetryAlertDispatchStatus(current.status) {
 		return false
 	}
-	if candidate.status == AlertDispatchStatusDelivered {
+	if closedWithoutRetryAlertDispatchStatus(candidate.status) {
 		return true
 	}
 	candidatePriority := alertDispatchMergePriority(candidate.status)
@@ -2071,7 +2082,7 @@ func (store *Store) repairAlertDispatchesTableInTx(ctx context.Context, tx *sql.
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status=? WHERE status NOT IN (?, ?, ?, ?, ?)`, table), AlertDispatchStatusPending, AlertDispatchStatusPending, AlertDispatchStatusInFlight, AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertDispatchStatusReset); err != nil {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET status=? WHERE status NOT IN (?, ?, ?, ?, ?, ?)`, table), AlertDispatchStatusPending, AlertDispatchStatusPending, AlertDispatchStatusInFlight, AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertDispatchStatusReset, AlertDispatchStatusSkipped); err != nil {
 		return err
 	}
 	return backfillAlertDispatchesTableInTx(ctx, tx, table)
@@ -2179,6 +2190,12 @@ WHERE status IN (?, ?, ?, ?)
 	if err != nil {
 		return false, err
 	}
+	// The two "delivered" EXISTS checks below match status IN (delivered,
+	// skipped): a skipped dispatch (sink disabled or filtered out) closes an
+	// event exactly like a delivered one, mirroring syncAlertEventStatus
+	// (T-065). Without this, an event whose dispatches are all skipped would
+	// fall through to the ELSE branch and be reported Failed on every
+	// startup, which is exactly the truthfulness gap this task fixes.
 	closed, err := store.db.ExecContext(ctx, `
 UPDATE alert_events
 SET status=CASE
@@ -2188,14 +2205,14 @@ SET status=CASE
 	) THEN ?
   WHEN EXISTS (
     SELECT 1 FROM alert_dispatches d
-    WHERE d.event_id=alert_events.id AND d.status=?
+    WHERE d.event_id=alert_events.id AND d.status IN (?, ?)
   ) AND NOT EXISTS (
     SELECT 1 FROM alert_dispatches d
     WHERE d.event_id=alert_events.id AND d.status=?
   ) THEN ?
   WHEN EXISTS (
     SELECT 1 FROM alert_dispatches d
-    WHERE d.event_id=alert_events.id AND d.status=?
+    WHERE d.event_id=alert_events.id AND d.status IN (?, ?)
   ) AND EXISTS (
     SELECT 1 FROM alert_dispatches d
     WHERE d.event_id=alert_events.id AND d.status=?
@@ -2217,14 +2234,14 @@ WHERE NOT EXISTS (
 	) THEN ?
     WHEN EXISTS (
       SELECT 1 FROM alert_dispatches d
-      WHERE d.event_id=alert_events.id AND d.status=?
+      WHERE d.event_id=alert_events.id AND d.status IN (?, ?)
     ) AND NOT EXISTS (
       SELECT 1 FROM alert_dispatches d
       WHERE d.event_id=alert_events.id AND d.status=?
     ) THEN ?
     WHEN EXISTS (
       SELECT 1 FROM alert_dispatches d
-    WHERE d.event_id=alert_events.id AND d.status=?
+    WHERE d.event_id=alert_events.id AND d.status IN (?, ?)
   ) AND EXISTS (
     SELECT 1 FROM alert_dispatches d
     WHERE d.event_id=alert_events.id AND d.status=?
@@ -2236,13 +2253,13 @@ WHERE NOT EXISTS (
     ELSE ?
   END
 	`, AlertDispatchStatusReset, AlertEventStatusReset,
-		AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertEventStatusDelivered,
-		AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertEventStatusPartial,
+		AlertDispatchStatusDelivered, AlertDispatchStatusSkipped, AlertDispatchStatusDeadLettered, AlertEventStatusDelivered,
+		AlertDispatchStatusDelivered, AlertDispatchStatusSkipped, AlertDispatchStatusDeadLettered, AlertEventStatusPartial,
 		AlertDispatchStatusReset, AlertEventStatusReset,
 		AlertEventStatusFailed, AlertDispatchStatusPending, AlertDispatchStatusInFlight,
 		AlertDispatchStatusReset, AlertEventStatusReset,
-		AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertEventStatusDelivered,
-		AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertEventStatusPartial,
+		AlertDispatchStatusDelivered, AlertDispatchStatusSkipped, AlertDispatchStatusDeadLettered, AlertEventStatusDelivered,
+		AlertDispatchStatusDelivered, AlertDispatchStatusSkipped, AlertDispatchStatusDeadLettered, AlertEventStatusPartial,
 		AlertDispatchStatusReset, AlertEventStatusReset,
 		AlertEventStatusFailed)
 	if err != nil {

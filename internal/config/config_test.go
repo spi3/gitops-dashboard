@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigAppliesDefaults(t *testing.T) {
@@ -777,6 +778,57 @@ alerting:
 	errText := loadError(t, path)
 	if !strings.Contains(errText, "alerting.sinks.webhook.url") {
 		t.Fatalf("error = %q, want alerting webhook URL context", errText)
+	}
+}
+
+// TestLoadConfigRejectsSinkTimeoutAtOrAboveTheAlertDeliveryLease covers
+// T-065's lease invariant: no accepted configuration may let a sink timeout
+// outlive the alerter's delivery lease, because a send still running when
+// the lease expires gets reclaimed and redelivered by another worker while
+// the original attempt is still in flight, delivering the same dispatch
+// twice.
+func TestLoadConfigRejectsSinkTimeoutAtOrAboveTheAlertDeliveryLease(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      timeout: 2m
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	errText := loadError(t, path)
+	if !strings.Contains(errText, "alerting.sinks.webhook.timeout") || !strings.Contains(errText, "lease") {
+		t.Fatalf("error = %q, want it to name the sink timeout field and the delivery lease", errText)
+	}
+
+	if err := os.WriteFile(path, []byte(`
+auth:
+  mode: dev-no-auth
+alerting:
+  sinks:
+    webhook:
+      enabled: true
+      url: https://hooks.example.test/gitops
+      timeout: 1m59s
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load with a sink timeout under the lease failed: %v", err)
+	}
+	got, err := cfg.Alerting.Sinks.Webhook.TimeoutDuration()
+	if err != nil || got != 119*time.Second {
+		t.Fatalf("webhook timeout = %v, %v, want 1m59s accepted", got, err)
+	}
+	if AlertDeliveryLeaseDuration <= got {
+		t.Fatalf("AlertDeliveryLeaseDuration = %s, want it to strictly exceed the accepted %s sink timeout", AlertDeliveryLeaseDuration, got)
 	}
 }
 

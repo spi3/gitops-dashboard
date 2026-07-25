@@ -80,10 +80,29 @@ func alertEventStatus(t *testing.T, dbPath string, eventID int64) string {
 	return status
 }
 
+// alertDispatchStatus reads alert_dispatches.status directly from the
+// SQLite file, for the same reason alertEventStatus does.
+func alertDispatchStatus(t *testing.T, dbPath string, eventID int64, sink string) string {
+	t.Helper()
+	raw, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var status string
+	if err := raw.QueryRowContext(context.Background(), `SELECT status FROM alert_dispatches WHERE event_id=? AND sink=?`, eventID, sink).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
 // TestWorkerRoutesOnlyToMatchingSinksAndSkipsExcluded covers requirement 8's
 // routing/filtering item: an event enqueued for a sink is only actually
 // delivered when it passes that sink's include/exclude filter; a filtered
-// event is completed without a network call.
+// event is completed without a network call, and (T-065) persisted with
+// dispatch status "skipped" rather than "delivered", since it was never
+// attempted -- alert history must not assert a delivery that never
+// happened.
 func TestWorkerRoutesOnlyToMatchingSinksAndSkipsExcluded(t *testing.T) {
 	t.Parallel()
 	var requests int32
@@ -126,6 +145,12 @@ func TestWorkerRoutesOnlyToMatchingSinksAndSkipsExcluded(t *testing.T) {
 	})
 	if got := atomic.LoadInt32(&requests); got != 1 {
 		t.Fatalf("requests = %d, want exactly one delivery (excluded event must not reach the sink)", got)
+	}
+	if got := alertDispatchStatus(t, dbPath, matching.ID, "webhook"); got != storage.AlertDispatchStatusDelivered {
+		t.Fatalf("matching dispatch status = %q, want delivered", got)
+	}
+	if got := alertDispatchStatus(t, dbPath, excluded.ID, "webhook"); got != storage.AlertDispatchStatusSkipped {
+		t.Fatalf("excluded dispatch status = %q, want skipped (it was never attempted, so it must not be recorded as delivered)", got)
 	}
 }
 
@@ -262,7 +287,7 @@ func TestStallingSinkDoesNotBlockOtherDeliveriesOrTheStore(t *testing.T) {
 	cfg := config.AlertingConfig{
 		Sinks: config.AlertingSinksConfig{
 			Webhook: config.WebhookAlertSinkConfig{
-				Enabled: true, Name: "stalling", URL: stalling.URL, Method: "POST", Timeout: time.Hour.String(),
+				Enabled: true, Name: "stalling", URL: stalling.URL, Method: "POST", Timeout: time.Minute.String(),
 			},
 			Discord: config.DiscordAlertSinkConfig{
 				Enabled: true, Name: "healthy", WebhookURL: healthy.URL, Timeout: "2s",
@@ -437,6 +462,27 @@ func TestDiscordSinkFormatsReadableMessagesForEventKinds(t *testing.T) {
 			name:  "scan failure (future producer kind)",
 			event: storage.AlertEvent{Kind: "scan.failure", Repository: "infra", NewState: "failed", Reason: "git fetch failed"},
 			want:  []string{"infra", "git fetch failed"},
+		},
+		{
+			// T-065 (survey 2026-07-25 IR-1): the alert_evaluator's recovery
+			// kinds must render with the recovery (checkmark) icon, not the
+			// incident (red circle) one, in every sink. This is the exact
+			// literal kind the evaluator emits; Summary()'s "recovered"
+			// phrasing is covered directly in payload_recovery_test.go.
+			name: "agent recovery renders with the recovery icon, not the incident icon",
+			event: storage.AlertEvent{
+				Kind: "agent.recovery", Agent: "serenity", OldState: "offline", NewState: "online",
+				Reason: "agent report received",
+			},
+			want: []string{"✅", "serenity", "offline → online"},
+		},
+		{
+			name: "scan recovery renders with the recovery icon, not the incident icon",
+			event: storage.AlertEvent{
+				Kind: "scan.recovery", Repository: "infra", OldState: "error", NewState: "ok",
+				Reason: "repository scan recovered",
+			},
+			want: []string{"✅", "infra", "error → ok"},
 		},
 	}
 	for _, testCase := range cases {

@@ -4458,6 +4458,182 @@ VALUES(999, 'discord', 'pending', ?, ?)
 	}
 }
 
+// TestSkippedDispatchStatusFixtureOpensAndOperatesNormally is the T-065
+// pre-change fixture for the alert_dispatches status contract (standing
+// invariant 3): a database created by the release before "skipped" existed,
+// containing dispatch rows in pending, delivered, and dead_lettered states,
+// must open and keep operating normally after this change. It is built with
+// the exact current-schema DDL (alertEventsCreateSQL/alertDispatchesCreateSQL)
+// and raw INSERTs, bypassing the Go API entirely, so it reflects genuinely
+// pre-existing bytes on disk rather than anything the current code produced.
+func TestSkippedDispatchStatusFixtureOpensAndOperatesNormally(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, alertEventsCreateSQL); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, alertDispatchesCreateSQL); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO alert_events(id, kind, service_id, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'health.transition', 'svc-pending', 'unhealthy', 'fixture-pending', 'hash-pending', '2026-07-20T12:00:00Z', 100, 'pending'),
+  (2, 'health.transition', 'svc-delivered', 'unhealthy', 'fixture-delivered', 'hash-delivered', '2026-07-20T12:01:00Z', 200, 'delivered'),
+  (3, 'health.transition', 'svc-failed', 'unhealthy', 'fixture-failed', 'hash-failed', '2026-07-20T12:02:00Z', 300, 'failed');
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns, delivered_at, delivered_at_ns)
+VALUES
+  (1, 'discord', 'pending', '2026-07-20T12:00:00Z', 100, NULL, NULL),
+  (2, 'discord', 'delivered', '2026-07-20T12:01:05Z', 205, '2026-07-20T12:01:05Z', 205),
+  (3, 'discord', 'dead_lettered', '2026-07-20T12:02:05Z', 305, NULL, NULL);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Pre-existing delivered/dead_lettered rows and their event statuses
+	// must survive untouched: they are not among the statuses the new
+	// reconcile/repair logic folds "skipped" into, so nothing about this
+	// change should move them.
+	if got := alertDispatchStatus(t, store, 2, "discord"); got != AlertDispatchStatusDelivered {
+		t.Fatalf("delivered dispatch status = %q, want unchanged delivered", got)
+	}
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusDelivered {
+		t.Fatalf("delivered event status = %q, want unchanged delivered", got)
+	}
+	if got := alertDispatchStatus(t, store, 3, "discord"); got != AlertDispatchStatusDeadLettered {
+		t.Fatalf("dead_lettered dispatch status = %q, want unchanged dead_lettered", got)
+	}
+	if got := alertEventStatus(t, store, 3); got != AlertEventStatusFailed {
+		t.Fatalf("failed event status = %q, want unchanged failed", got)
+	}
+
+	// Claiming and completion must continue to work for the pre-existing
+	// pending row.
+	deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Dispatch.EventID != 1 {
+		t.Fatalf("claimed deliveries = %#v, want exactly the pending fixture row", deliveries)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, deliveries[0].Dispatch.ID, "worker-a", deliveries[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusDelivered {
+		t.Fatalf("previously-pending event status = %q, want delivered after completion", got)
+	}
+
+	// The new status must also work going forward: a fresh event dispatched
+	// to no sink (via an empty sinks match) completes as skipped and the
+	// event still reaches a terminal status.
+	fresh, _, err := store.EnqueueAlertEvent(ctx, AlertEvent{
+		Kind: "health.transition", ServiceID: "svc-fresh", NewState: "unhealthy", DedupeKey: "fixture-fresh",
+	}, []string{"discord"}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshDeliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(freshDeliveries) != 1 {
+		t.Fatalf("claimed deliveries = %#v, want exactly the fresh fixture row", freshDeliveries)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, freshDeliveries[0].Dispatch.ID, "worker-a", freshDeliveries[0].Dispatch.ClaimID, AlertDispatchStatusSkipped, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, store, fresh.ID); got != AlertEventStatusDelivered {
+		t.Fatalf("freshly-skipped event status = %q, want delivered (skipped closes an event like delivered)", got)
+	}
+}
+
+// TestUnderscoreAlertKindFixtureOpensAndOperatesNormally is the T-065
+// (survey 2026-07-25 IR-1) pre-change fixture: a database created by the
+// T-064 release, before the evaluator's kinds were renamed to the dot
+// convention, containing alert_events rows with the underscore kinds --
+// one pending event with an undelivered dispatch, and one terminal event --
+// must open and operate normally after this change, and the pending
+// dispatch must still deliver (accepted one-time under the old,
+// non-recovery presentation: the alerter's IsRecovery() only recognizes the
+// new ".recovery" suffix, so an old-style "agent_recovered" row renders as
+// an incident rather than a recovery on this one delivery).
+func TestUnderscoreAlertKindFixtureOpensAndOperatesNormally(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "dashboard.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, alertEventsCreateSQL); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, alertDispatchesCreateSQL); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO alert_events(id, kind, agent, old_state, new_state, dedupe_key, dedupe_hash, created_at, created_at_ns, status)
+VALUES
+  (1, 'agent_recovered', 'serenity', 'offline', 'online', 'fixture-agent-recovered', 'hash-agent-recovered', '2026-07-24T12:00:00Z', 100, 'pending'),
+  (2, 'scan_failed', '', 'ok', 'error', 'fixture-scan-failed', 'hash-scan-failed', '2026-07-24T12:01:00Z', 200, 'delivered');
+INSERT INTO alert_dispatches(event_id, sink, status, updated_at, updated_at_ns, delivered_at, delivered_at_ns)
+VALUES
+  (1, 'discord', 'pending', '2026-07-24T12:00:00Z', 100, NULL, NULL),
+  (2, 'discord', 'delivered', '2026-07-24T12:01:05Z', 205, '2026-07-24T12:01:05Z', 205);
+`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeTestAlertDedupeKey(t, dbPath)
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if got := alertEventStatus(t, store, 2); got != AlertEventStatusDelivered {
+		t.Fatalf("pre-existing terminal event status = %q, want unchanged delivered", got)
+	}
+
+	deliveries, err := store.ClaimPendingAlertDeliveries(ctx, "worker-a", time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 || deliveries[0].Event.Kind != "agent_recovered" {
+		t.Fatalf("claimed deliveries = %#v, want the pending underscore-kind fixture row, kind preserved verbatim", deliveries)
+	}
+	if _, err := store.RecordAlertDispatchResult(ctx, deliveries[0].Dispatch.ID, "worker-a", deliveries[0].Dispatch.ClaimID, AlertDispatchStatusDelivered, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := alertEventStatus(t, store, 1); got != AlertEventStatusDelivered {
+		t.Fatalf("previously-pending underscore-kind event status = %q, want delivered", got)
+	}
+}
+
 func TestAlertMigrationReconcilesDuplicatePendingLegacyDedupeHashes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -8332,6 +8508,15 @@ func alertEventStatus(t *testing.T, store *Store, eventID int64) string {
 	t.Helper()
 	var status string
 	if err := store.db.QueryRowContext(context.Background(), `SELECT status FROM alert_events WHERE id=?`, eventID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+func alertDispatchStatus(t *testing.T, store *Store, eventID int64, sink string) string {
+	t.Helper()
+	var status string
+	if err := store.db.QueryRowContext(context.Background(), `SELECT status FROM alert_dispatches WHERE event_id=? AND sink=?`, eventID, sink).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	return status

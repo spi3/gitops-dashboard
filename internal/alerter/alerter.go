@@ -22,10 +22,15 @@ import (
 
 const (
 	defaultPollInterval        = 5 * time.Second
-	defaultLeaseDuration       = 2 * time.Minute
 	defaultClaimBatchSize      = 20
 	defaultSinkRequestTimeout  = 10 * time.Second
 	alertRetentionPruneTimeout = 30 * time.Second
+
+	// defaultLeaseDuration is derived from config.AlertDeliveryLeaseDuration
+	// rather than defined independently, so the lease the worker actually
+	// enforces can never drift from the bound every sink timeout is
+	// validated against at config load (see config.requiredSinkTimeout).
+	defaultLeaseDuration = config.AlertDeliveryLeaseDuration
 )
 
 // Worker consumes undelivered alert_events, routes each to every enabled
@@ -203,7 +208,7 @@ func (w *Worker) deliverOne(ctx context.Context, delivery storage.AlertDelivery)
 	sink, ok := w.sinks[delivery.Dispatch.Sink]
 	if !ok || !sink.Matches(delivery.Event) {
 		w.logger.Info("alert dispatch skipped", "sink", delivery.Dispatch.Sink, "event", delivery.Event.DedupeKey, "reason", "sink disabled or excluded by filter")
-		w.complete(ctx, delivery, storage.AlertDispatchStatusDelivered, "")
+		w.complete(ctx, delivery, storage.AlertDispatchStatusSkipped, "")
 		return
 	}
 	deliverCtx, cancel := context.WithTimeout(ctx, sink.Timeout())

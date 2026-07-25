@@ -20,6 +20,16 @@ const (
 	agentRecoveredReason     = "agent report received"
 	scanFailedFallbackReason = "repository scan failed"
 	scanRecoveredReason      = "repository scan recovered"
+
+	// Event kinds follow the health-transition producer's dot convention
+	// (T-022: "health.transition" / "health.recovery") so the alerter's
+	// IsRecovery() (".recovery" suffix) renders these correctly. T-065
+	// renamed these from the evaluator's original underscore-separated kinds
+	// (see docs/tasks/TASK-0064-agent-and-scan-alert-evaluator.md).
+	alertKindAgentOffline  = "agent.offline"
+	alertKindAgentRecovery = "agent.recovery"
+	alertKindScanFailure   = "scan.failure"
+	alertKindScanRecovery  = "scan.recovery"
 )
 
 // agentBaseline is the process-local state the evaluator tracks for one
@@ -150,13 +160,13 @@ func (e *alertEvaluator) evaluateAgent(ctx context.Context, target string, info 
 
 func (e *alertEvaluator) handleAgentOffline(ctx context.Context, target string, baseline *agentBaseline, staleAfter time.Time) {
 	event := storage.AlertEvent{
-		Kind:        "agent_offline",
+		Kind:        alertKindAgentOffline,
 		Agent:       target,
 		OldState:    "online",
 		NewState:    "offline",
 		Reason:      agentOfflineReason,
-		DedupeKey:   "agent:" + target + ":agent_offline:" + staleAfter.UTC().Format(time.RFC3339Nano),
-		CooldownKey: "agent:" + target + ":agent_offline",
+		DedupeKey:   "agent:" + target + ":" + alertKindAgentOffline + ":" + staleAfter.UTC().Format(time.RFC3339Nano),
+		CooldownKey: "agent:" + target + ":" + alertKindAgentOffline,
 	}
 	if _, _, err := e.store.EnqueueAlertEvent(ctx, event, e.sinks, e.cooldown); err != nil {
 		e.logAdvisory(err, "alert evaluator agent offline enqueue failed")
@@ -181,13 +191,13 @@ func (e *alertEvaluator) handleAgentOnline(ctx context.Context, target string, i
 		return
 	}
 	event := storage.AlertEvent{
-		Kind:        "agent_recovered",
+		Kind:        alertKindAgentRecovery,
 		Agent:       target,
 		OldState:    "offline",
 		NewState:    "online",
 		Reason:      agentRecoveredReason,
-		DedupeKey:   "agent:" + target + ":agent_recovered:" + lastSeenAt.UTC().Format(time.RFC3339Nano),
-		CooldownKey: "agent:" + target + ":agent_recovered",
+		DedupeKey:   "agent:" + target + ":" + alertKindAgentRecovery + ":" + lastSeenAt.UTC().Format(time.RFC3339Nano),
+		CooldownKey: "agent:" + target + ":" + alertKindAgentRecovery,
 	}
 	if _, _, err := e.store.EnqueueAlertEvent(ctx, event, e.sinks, e.cooldown); err != nil {
 		e.logAdvisory(err, "alert evaluator agent recovered enqueue failed")
@@ -249,13 +259,13 @@ func (e *alertEvaluator) handleScanFailed(ctx context.Context, name string, scan
 		reason = scanFailedFallbackReason
 	}
 	event := storage.AlertEvent{
-		Kind:        "scan_failed",
+		Kind:        alertKindScanFailure,
 		Repository:  name,
 		OldState:    "ok",
 		NewState:    "error",
 		Reason:      reason,
-		DedupeKey:   fmt.Sprintf("repository:%s:scan_failed:%d", name, scan.ID),
-		CooldownKey: "repository:" + name + ":scan_failed",
+		DedupeKey:   fmt.Sprintf("repository:%s:%s:%d", name, alertKindScanFailure, scan.ID),
+		CooldownKey: "repository:" + name + ":" + alertKindScanFailure,
 	}
 	if _, _, err := e.store.EnqueueAlertEvent(ctx, event, e.sinks, e.cooldown); err != nil {
 		e.logAdvisory(err, "alert evaluator scan failed enqueue failed")
@@ -274,13 +284,13 @@ func (e *alertEvaluator) handleScanRecovered(ctx context.Context, name string, s
 		return
 	}
 	event := storage.AlertEvent{
-		Kind:        "scan_recovered",
+		Kind:        alertKindScanRecovery,
 		Repository:  name,
 		OldState:    "error",
 		NewState:    "ok",
 		Reason:      scanRecoveredReason,
-		DedupeKey:   fmt.Sprintf("repository:%s:scan_recovered:%d", name, scan.ID),
-		CooldownKey: "repository:" + name + ":scan_recovered",
+		DedupeKey:   fmt.Sprintf("repository:%s:%s:%d", name, alertKindScanRecovery, scan.ID),
+		CooldownKey: "repository:" + name + ":" + alertKindScanRecovery,
 	}
 	if _, _, err := e.store.EnqueueAlertEvent(ctx, event, e.sinks, e.cooldown); err != nil {
 		e.logAdvisory(err, "alert evaluator scan recovered enqueue failed")

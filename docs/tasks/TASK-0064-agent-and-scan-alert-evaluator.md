@@ -262,6 +262,19 @@ never persisted as text):
 - `repository:<name>:scan_failed`
 - `repository:<name>:scan_recovered`
 
+> **2026-07-25 update (T-065, survey 2026-07-25 IR-1):** the four kinds and
+> every key above that embeds one are historical. TASK-0065 renamed the
+> evaluator's kinds to the dot convention already used by the health
+> producer, because the alerter's `IsRecovery()` only recognizes a
+> `.recovery` suffix: `agent_offline` -> `agent.offline`,
+> `agent_recovered` -> `agent.recovery`, `scan_failed` -> `scan.failure`,
+> `scan_recovered` -> `scan.recovery`. Before the rename, every agent/scan
+> recovery rendered as a fresh incident in every sink. Dedupe/cooldown key
+> *shapes* are unchanged; only the embedded kind substrings change, so keys
+> persisted while T-064 was live (~1 day of homelab rows) stop matching new
+> lookups -- a one-time, accepted effect (see
+> `docs/tasks/TASK-0065-startup-scan-and-alert-dispatch-truthfulness.md`).
+
 ## Out of scope
 
 Immediate close alerts, exact disconnect timing, first-failure alerts

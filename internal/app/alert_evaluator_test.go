@@ -369,8 +369,8 @@ func TestAlertEvaluatorAgentExactStaleBoundaryIsOffline(t *testing.T) {
 	ev.now = func() time.Time { return staleAfter } // now == stale_after: offline (equality is offline)
 	ev.evaluate(ctx)
 	got := pendingAlertEvents(t, app.store)
-	if len(got) != 1 || got[0].Kind != "agent_offline" {
-		t.Fatalf("events at exact stale boundary = %v, want exactly one agent_offline", got)
+	if len(got) != 1 || got[0].Kind != "agent.offline" {
+		t.Fatalf("events at exact stale boundary = %v, want exactly one agent.offline", got)
 	}
 }
 
@@ -395,9 +395,9 @@ func TestAlertEvaluatorAgentFailureThenRecoveryEmitsExactEdges(t *testing.T) {
 		t.Fatalf("events after failure (with a repeated offline sample) = %v, want exactly one", got)
 	}
 	want := capturedAlertEvent{
-		Kind: "agent_offline", Agent: "alpha", OldState: "online", NewState: "offline",
+		Kind: "agent.offline", Agent: "alpha", OldState: "online", NewState: "offline",
 		Reason:    "agent report is stale",
-		DedupeKey: "agent:alpha:agent_offline:" + staleAfter.UTC().Format(time.RFC3339Nano),
+		DedupeKey: "agent:alpha:agent.offline:" + staleAfter.UTC().Format(time.RFC3339Nano),
 	}
 	if got[0] != want {
 		t.Fatalf("failure event = %+v, want %+v", got[0], want)
@@ -416,9 +416,9 @@ func TestAlertEvaluatorAgentFailureThenRecoveryEmitsExactEdges(t *testing.T) {
 		t.Fatalf("events after recovery (with a repeated online sample) = %v, want exactly two", got)
 	}
 	wantRecovery := capturedAlertEvent{
-		Kind: "agent_recovered", Agent: "alpha", OldState: "offline", NewState: "online",
+		Kind: "agent.recovery", Agent: "alpha", OldState: "offline", NewState: "online",
 		Reason:    "agent report received",
-		DedupeKey: "agent:alpha:agent_recovered:" + newReceivedAt.UTC().Format(time.RFC3339Nano),
+		DedupeKey: "agent:alpha:agent.recovery:" + newReceivedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if got[1] != wantRecovery {
 		t.Fatalf("recovery event = %+v, want %+v", got[1], wantRecovery)
@@ -481,8 +481,8 @@ func TestAlertEvaluatorAgentEnqueueErrorRetriesNextSample(t *testing.T) {
 	ev.sinks = []string{"webhook"}
 	ev.evaluate(ctx)
 	got := pendingAlertEvents(t, app.store)
-	if len(got) != 1 || got[0].Kind != "agent_offline" {
-		t.Fatalf("events after the retried enqueue = %v, want exactly one agent_offline", got)
+	if len(got) != 1 || got[0].Kind != "agent.offline" {
+		t.Fatalf("events after the retried enqueue = %v, want exactly one agent.offline", got)
 	}
 }
 
@@ -519,9 +519,9 @@ func TestAlertEvaluatorScanFailureThenRecoveryEmitsExactEdges(t *testing.T) {
 		t.Fatalf("events after failure (with a repeat) = %v, want exactly one", got)
 	}
 	wantFailed := capturedAlertEvent{
-		Kind: "scan_failed", Repository: "repo", OldState: "ok", NewState: "error",
+		Kind: "scan.failure", Repository: "repo", OldState: "ok", NewState: "error",
 		Reason:    "clone failed: exit status 128",
-		DedupeKey: fmt.Sprintf("repository:repo:scan_failed:%d", failID),
+		DedupeKey: fmt.Sprintf("repository:repo:scan.failure:%d", failID),
 	}
 	if got[0] != wantFailed {
 		t.Fatalf("failure event = %+v, want %+v", got[0], wantFailed)
@@ -536,9 +536,9 @@ func TestAlertEvaluatorScanFailureThenRecoveryEmitsExactEdges(t *testing.T) {
 		t.Fatalf("events after recovery (with a repeat) = %v, want exactly two", got)
 	}
 	wantRecovered := capturedAlertEvent{
-		Kind: "scan_recovered", Repository: "repo", OldState: "error", NewState: "ok",
+		Kind: "scan.recovery", Repository: "repo", OldState: "error", NewState: "ok",
 		Reason:    "repository scan recovered",
-		DedupeKey: fmt.Sprintf("repository:repo:scan_recovered:%d", recoverID),
+		DedupeKey: fmt.Sprintf("repository:repo:scan.recovery:%d", recoverID),
 	}
 	if got[1] != wantRecovered {
 		t.Fatalf("recovery event = %+v, want %+v", got[1], wantRecovered)
@@ -561,7 +561,7 @@ func TestAlertEvaluatorScanFailureFallsBackToDefaultReasonWhenErrorEmpty(t *test
 	ev.evaluate(ctx)
 	got := pendingAlertEvents(t, app.store)
 	if len(got) != 1 || got[0].Reason != "repository scan failed" {
-		t.Fatalf("events = %v, want one scan_failed with the fallback reason", got)
+		t.Fatalf("events = %v, want one scan.failure with the fallback reason", got)
 	}
 }
 
@@ -601,8 +601,8 @@ func TestAlertEvaluatorScanSanitizesLateRegisteredSecretInReason(t *testing.T) {
 	ev.evaluate(ctx)
 
 	got := pendingAlertEvents(t, app.store)
-	if len(got) != 1 || got[0].Kind != "scan_failed" {
-		t.Fatalf("events = %v, want one scan_failed", got)
+	if len(got) != 1 || got[0].Kind != "scan.failure" {
+		t.Fatalf("events = %v, want one scan.failure", got)
 	}
 	if strings.Contains(got[0].Reason, secret) {
 		t.Fatalf("reason %q leaks a registered secret", got[0].Reason)
@@ -647,7 +647,7 @@ func TestAlertEvaluatorCrossAgentCooldownIsolation(t *testing.T) {
 		agents[event.Agent] = true
 	}
 	if !agents["alpha"] || !agents["beta"] {
-		t.Fatalf("events = %v, want one agent_offline for each of alpha and beta", got)
+		t.Fatalf("events = %v, want one agent.offline for each of alpha and beta", got)
 	}
 }
 
@@ -777,24 +777,24 @@ func TestAlertEvaluatorPersistedEdgesE2E(t *testing.T) {
 	got := pendingAlertEvents(t, app.store)
 	want := []capturedAlertEvent{
 		{
-			Kind: "agent_offline", Agent: "alpha", OldState: "online", NewState: "offline",
+			Kind: "agent.offline", Agent: "alpha", OldState: "online", NewState: "offline",
 			Reason:    "agent report is stale",
-			DedupeKey: "agent:alpha:agent_offline:" + staleAfter.UTC().Format(time.RFC3339Nano),
+			DedupeKey: "agent:alpha:agent.offline:" + staleAfter.UTC().Format(time.RFC3339Nano),
 		},
 		{
-			Kind: "scan_failed", Repository: "repo", OldState: "ok", NewState: "error",
+			Kind: "scan.failure", Repository: "repo", OldState: "ok", NewState: "error",
 			Reason:    "clone failed: exit status 128",
-			DedupeKey: fmt.Sprintf("repository:repo:scan_failed:%d", failID),
+			DedupeKey: fmt.Sprintf("repository:repo:scan.failure:%d", failID),
 		},
 		{
-			Kind: "agent_recovered", Agent: "alpha", OldState: "offline", NewState: "online",
+			Kind: "agent.recovery", Agent: "alpha", OldState: "offline", NewState: "online",
 			Reason:    "agent report received",
-			DedupeKey: "agent:alpha:agent_recovered:" + recoveredSeenAt.UTC().Format(time.RFC3339Nano),
+			DedupeKey: "agent:alpha:agent.recovery:" + recoveredSeenAt.UTC().Format(time.RFC3339Nano),
 		},
 		{
-			Kind: "scan_recovered", Repository: "repo", OldState: "error", NewState: "ok",
+			Kind: "scan.recovery", Repository: "repo", OldState: "error", NewState: "ok",
 			Reason:    "repository scan recovered",
-			DedupeKey: fmt.Sprintf("repository:repo:scan_recovered:%d", recoverID),
+			DedupeKey: fmt.Sprintf("repository:repo:scan.recovery:%d", recoverID),
 		},
 	}
 	if len(got) != 4 {

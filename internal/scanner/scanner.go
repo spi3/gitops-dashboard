@@ -86,7 +86,7 @@ func (scanner Scanner) ScanAll(ctx context.Context) error {
 }
 
 func (scanner Scanner) runRepoLoop(ctx context.Context, repo config.RepositoryConfig, interval time.Duration) {
-	timer := time.NewTimer(interval)
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {

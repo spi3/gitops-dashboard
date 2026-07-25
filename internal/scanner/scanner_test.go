@@ -521,6 +521,133 @@ func TestConcurrentScanAllCoalescesRepositoryScan(t *testing.T) {
 	}
 }
 
+// TestRunScheduledScansPromptlyAtStartup covers T-065's startup scan
+// immediacy requirement: the first scheduled scan for a configured
+// repository must fire immediately, not one full interval after startup.
+// The repo's scanInterval is set far longer than the test's own timeout, so
+// a scan recorded within that window can only be explained by an immediate
+// first tick, not the configured interval elapsing.
+func TestRunScheduledScansPromptlyAtStartup(t *testing.T) {
+	source := createFixtureRepo(t)
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:         "fixture",
+			URL:          "file://" + source,
+			DefaultRef:   "main",
+			ScanInterval: time.Hour.String(),
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	scanner.RunScheduled(ctx)
+
+	// Wait for the scan to reach a terminal status, not just for its row to
+	// appear, so the background repo loop goroutine is done touching the
+	// store before this test's deferred cancel/close run.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		scans, err := store.Scans(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal := false
+		for _, scan := range scans {
+			if scan.Repository == "fixture" && scan.Status != "running" {
+				terminal = true
+			}
+		}
+		if terminal {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no scan reached a terminal status within %s of RunScheduled with a %s interval; startup scan must not wait a full interval", 2*time.Second, time.Hour)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+}
+
+// TestRunScheduledCoalescesWithConcurrentManualScan covers T-065's
+// requirement that the immediate startup scan still coalesces with a
+// concurrent manual scan (POST /api/scan) for the same repository, exactly
+// as two concurrent ScanAll calls already coalesce
+// (TestConcurrentScanAllCoalescesRepositoryScan).
+func TestRunScheduledCoalescesWithConcurrentManualScan(t *testing.T) {
+	ctx := context.Background()
+	source := createFixtureRepo(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	gitShim := filepath.Join(binDir, "git")
+	if err := os.WriteFile(gitShim, []byte("#!/bin/sh\nif [ \"$1\" = \"clone\" ]; then sleep 0.2; fi\nexec "+shellQuote(realGit)+" \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	dataDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(dataDir, "dashboard.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			DataDir:      dataDir,
+			RepoCacheDir: filepath.Join(dataDir, "repos"),
+		},
+		Auth: config.AuthConfig{Mode: "dev-no-auth"},
+		Repositories: []config.RepositoryConfig{{
+			Name:         "fixture",
+			URL:          "file://" + source,
+			DefaultRef:   "main",
+			ScanInterval: time.Hour.String(),
+		}},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	scanner := New(cfg, store, slog.Default())
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var manualErr error
+	go func() {
+		defer wg.Done()
+		manualErr = scanner.ScanAll(ctx)
+	}()
+	scanner.RunScheduled(runCtx)
+	wg.Wait()
+	if manualErr != nil {
+		t.Fatal(manualErr)
+	}
+
+	// ScanAll returns synchronously only once its singleflight call (shared
+	// with the startup scheduled scan via repoScanFlights, whichever of the
+	// two happened to lead) has fully completed, so no separate poll for
+	// scan completion is needed here.
+	summary, err := store.Summary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Scans) != 1 {
+		t.Fatalf("scans = %#v, want one coalesced scan between the startup scheduled scan and the concurrent manual scan", summary.Scans)
+	}
+}
+
 func TestDetachedRepoSyncLeaderTimeoutDoesNotCancelJoiningScan(t *testing.T) {
 	source := createFixtureRepo(t)
 	realGit, err := exec.LookPath("git")

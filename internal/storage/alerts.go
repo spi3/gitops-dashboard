@@ -25,6 +25,12 @@ const (
 	AlertDispatchStatusDelivered    = "delivered"
 	AlertDispatchStatusDeadLettered = "dead_lettered"
 	AlertDispatchStatusReset        = "reset"
+	// AlertDispatchStatusSkipped marks a dispatch that was never attempted
+	// because its sink was disabled or the event failed the sink's filters
+	// (T-065). It is terminal and, for event-status derivation and
+	// dedupe/cooldown purposes, closes an event exactly like
+	// AlertDispatchStatusDelivered.
+	AlertDispatchStatusSkipped = "skipped"
 
 	alertSQLiteBusyMaxRetryDuration = 5 * time.Second
 
@@ -541,11 +547,11 @@ func (store *Store) recordAlertDispatchResultOnce(ctx context.Context, dispatchI
 	}
 	status = strings.TrimSpace(status)
 	if !validAlertDispatchResultStatus(status) {
-		return AlertDispatch{}, fmt.Errorf("alert dispatch result status must be pending, delivered, or dead_lettered")
+		return AlertDispatch{}, fmt.Errorf("alert dispatch result status must be pending, delivered, skipped, or dead_lettered")
 	}
 	lastError = strings.TrimSpace(store.redact(lastError))
 	switch {
-	case status == AlertDispatchStatusDelivered:
+	case status == AlertDispatchStatusDelivered, status == AlertDispatchStatusSkipped:
 		lastError = ""
 	case status == AlertDispatchStatusPending && lastError == "":
 		lastError = alertDispatchRetryNoDiagnostic
@@ -782,28 +788,35 @@ LIMIT 1
 }
 
 func (store *Store) syncAlertEventStatus(ctx context.Context, tx *sql.Tx, eventID int64) error {
-	var pending, delivered, deadLettered, reset int
+	var pending, delivered, skipped, deadLettered, reset int
 	if err := tx.QueryRowContext(ctx, `
 SELECT
   COALESCE(SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status=? THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status=? THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN status=? THEN 1 ELSE 0 END), 0),
   COALESCE(SUM(CASE WHEN status=? THEN 1 ELSE 0 END), 0)
 FROM alert_dispatches
 WHERE event_id=?
-`, AlertDispatchStatusPending, AlertDispatchStatusInFlight, AlertDispatchStatusDelivered, AlertDispatchStatusDeadLettered, AlertDispatchStatusReset, eventID).Scan(&pending, &delivered, &deadLettered, &reset); err != nil {
+`, AlertDispatchStatusPending, AlertDispatchStatusInFlight, AlertDispatchStatusDelivered, AlertDispatchStatusSkipped, AlertDispatchStatusDeadLettered, AlertDispatchStatusReset, eventID).Scan(&pending, &delivered, &skipped, &deadLettered, &reset); err != nil {
 		return err
 	}
+	// skipped is folded into the same bucket as delivered: a dispatch skipped
+	// because its sink was disabled or filtered out closes the event exactly
+	// as a delivered dispatch does, preserving today's event-status and
+	// dedupe/cooldown behavior from when skips were (incorrectly) recorded
+	// as delivered (T-065).
+	closed := delivered + skipped
 	status := AlertEventStatusPending
 	if pending == 0 {
 		switch {
-		case delivered > 0 && deadLettered == 0:
+		case closed > 0 && deadLettered == 0:
 			status = AlertEventStatusDelivered
-		case delivered > 0 && deadLettered > 0:
+		case closed > 0 && deadLettered > 0:
 			status = AlertEventStatusPartial
-		case delivered == 0 && deadLettered > 0:
+		case closed == 0 && deadLettered > 0:
 			status = AlertEventStatusFailed
-		case delivered == 0 && deadLettered == 0 && reset > 0:
+		case closed == 0 && deadLettered == 0 && reset > 0:
 			status = AlertEventStatusReset
 		default:
 			status = AlertEventStatusFailed
@@ -1091,7 +1104,7 @@ func validAlertDispatchResultStatus(status string) bool {
 }
 
 func terminalAlertDispatchStatus(status string) bool {
-	return status == AlertDispatchStatusDelivered || status == AlertDispatchStatusDeadLettered
+	return status == AlertDispatchStatusDelivered || status == AlertDispatchStatusDeadLettered || status == AlertDispatchStatusSkipped
 }
 
 func (policy AlertRetryPolicy) normalized() AlertRetryPolicy {
