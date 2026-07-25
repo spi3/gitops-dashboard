@@ -248,9 +248,9 @@ func (store *Store) cooldownSuppressedAlertEventForEvent(ctx context.Context, tx
 SELECT e.id, e.kind, e.service_id, e.target, e.repository, e.agent, e.old_state, e.new_state, e.reason, e.dedupe_key, e.dedupe_hash, e.created_at, e.status,
   MAX(COALESCE(d.delivered_at_ns, d.updated_at_ns, 0)) AS closed_at_ns
 FROM alert_events e JOIN alert_dispatches d ON d.event_id=e.id
-WHERE e.kind=? AND e.service_id=? AND e.old_state=? AND e.new_state=? AND e.status IN (?, ?)
+WHERE e.kind=? AND e.service_id=? AND e.target=? AND e.repository=? AND e.agent=? AND e.old_state=? AND e.new_state=? AND e.status IN (?, ?)
 GROUP BY e.id HAVING SUM(CASE WHEN d.status IN (?, ?) THEN 1 ELSE 0 END)=0 AND MAX(COALESCE(d.delivered_at_ns, d.updated_at_ns, 0)) > 0
-ORDER BY closed_at_ns DESC, e.id DESC LIMIT 1`, event.Kind, event.ServiceID, event.OldState, event.NewState, AlertEventStatusDelivered, AlertEventStatusPartial, AlertDispatchStatusPending, AlertDispatchStatusInFlight), &closedAtNS)
+ORDER BY closed_at_ns DESC, e.id DESC LIMIT 1`, event.Kind, event.ServiceID, event.Target, event.Repository, event.Agent, event.OldState, event.NewState, AlertEventStatusDelivered, AlertEventStatusPartial, AlertDispatchStatusPending, AlertDispatchStatusInFlight), &closedAtNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertEvent{}, false, nil
 	}

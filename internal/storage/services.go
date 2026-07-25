@@ -489,6 +489,59 @@ FROM scans ORDER BY started_at DESC LIMIT 50
 	return scans, rows.Err()
 }
 
+// LatestTerminalScan is the latest terminal (status ok or error) scan row
+// observed for a repository, selected by greatest id among terminal rows.
+// Error is redacted using the storage layer's live redaction registry, so a
+// secret registered after the row was persisted is still scrubbed on read.
+type LatestTerminalScan struct {
+	ID     int64
+	Status string
+	Error  string
+}
+
+// LatestTerminalScansByRepository returns, for each named repository that
+// has one, its latest terminal scan. Running rows (and any other
+// non-terminal status) are ignored in every position: they are neither
+// returned nor allowed to hide an older terminal row. A repository with no
+// terminal scan is simply absent from the result. This is deliberately
+// narrower than Scans/the dashboard summary: it never consults repository
+// summary status, started_at ordering, the newest row regardless of status,
+// or the 50-row summary limit.
+func (store *Store) LatestTerminalScansByRepository(ctx context.Context, repositoryNames []string) (map[string]LatestTerminalScan, error) {
+	names := dedupeStrings(repositoryNames)
+	result := make(map[string]LatestTerminalScan, len(names))
+	if len(names) == 0 {
+		return result, nil
+	}
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = name
+	}
+	rows, err := store.db.QueryContext(ctx, `
+SELECT s.repository, s.id, s.status, COALESCE(s.error, '')
+FROM scans s
+WHERE s.repository IN (`+sqlPlaceholders(len(names))+`)
+  AND s.status IN ('ok', 'error')
+  AND s.id = (
+    SELECT MAX(s2.id) FROM scans s2
+    WHERE s2.repository = s.repository AND s2.status IN ('ok', 'error')
+  )
+`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var repository, status, errText string
+		var id int64
+		if err := rows.Scan(&repository, &id, &status, &errText); err != nil {
+			return nil, err
+		}
+		result[repository] = LatestTerminalScan{ID: id, Status: status, Error: strings.TrimSpace(store.redact(errText))}
+	}
+	return result, rows.Err()
+}
+
 func (store *Store) Services(ctx context.Context) ([]core.Service, error) {
 	rows, err := store.db.QueryContext(ctx, `
 SELECT rowid, id, name, repository, source_commit, source_path, runtime, kind, namespace,

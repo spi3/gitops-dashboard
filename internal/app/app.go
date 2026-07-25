@@ -51,6 +51,13 @@ type App struct {
 	// validation.
 	applyAgentReport func(ctx context.Context, message core.AgentMessage, authorizedTargets []string) error
 
+	alertEvaluator *alertEvaluator
+	// alertEvaluate is a test seam matching alertEvaluator.evaluate's
+	// signature, initialized to production behavior. It exists so
+	// scheduler tests can control and observe evaluations directly instead
+	// of exercising the real storage-backed producers.
+	alertEvaluate func(ctx context.Context)
+
 	// agentConnsWG tracks in-flight agentConnect calls, including their
 	// keepalive ping goroutine. net/http/httptest.Server.Close does not wait
 	// for hijacked connections (which is what a completed WebSocket upgrade
@@ -151,6 +158,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("alerter: %w", err)
 	}
 	app.alerter = alerterWorker
+	app.alertEvaluator = newAlertEvaluator(cfg, store, logger)
 	return app, nil
 }
 
@@ -198,6 +206,7 @@ func (app *App) RunBackground(ctx context.Context) {
 	app.scanner.RunScheduled(ctx)
 	app.monitor.Run(ctx)
 	app.alerter.Run(ctx)
+	app.startAlertEvaluatorScheduler(ctx)
 }
 
 func (app *App) Handler() http.Handler {
