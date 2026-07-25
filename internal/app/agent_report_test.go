@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/gorilla/websocket"
@@ -155,7 +156,7 @@ func assertAgentReportRejected(t *testing.T, wsURL string, data []byte, wantCode
 		t.Fatal(err)
 	}
 	ack := readAgentReportAck(t, conn)
-	if ack.Type != agentReportAckType || ack.Status != agentAckStatusError || ack.Code != wantCode {
+	if ack.Type != agentprotocol.AckType || ack.Status != agentprotocol.AckStatusError || ack.Code != wantCode {
 		t.Fatalf("ack = %#v, want error/%s", ack, wantCode)
 	}
 	if code := readAgentReportCloseCode(t, conn); code != wantClose {
@@ -165,12 +166,12 @@ func assertAgentReportRejected(t *testing.T, wsURL string, data []byte, wantCode
 
 func assertAgentReportSchemaInvalid(t *testing.T, wsURL string, data []byte) {
 	t.Helper()
-	assertAgentReportRejected(t, wsURL, data, agentAckCodeInvalidReport, websocket.CloseInvalidFramePayloadData)
+	assertAgentReportRejected(t, wsURL, data, agentprotocol.AckCodeInvalidReport, websocket.CloseInvalidFramePayloadData)
 }
 
 func assertAgentReportSemanticInvalid(t *testing.T, wsURL string, data []byte) {
 	t.Helper()
-	assertAgentReportRejected(t, wsURL, data, agentAckCodeInvalidReport, websocket.ClosePolicyViolation)
+	assertAgentReportRejected(t, wsURL, data, agentprotocol.AckCodeInvalidReport, websocket.ClosePolicyViolation)
 }
 
 func assertAgentReportPersisted(t *testing.T, wsURL string, data []byte) {
@@ -180,7 +181,7 @@ func assertAgentReportPersisted(t *testing.T, wsURL string, data []byte) {
 		t.Fatal(err)
 	}
 	ack := readAgentReportAck(t, conn)
-	if ack.Type != agentReportAckType || ack.Status != agentAckStatusOK || ack.Code != agentAckCodePersisted {
+	if ack.Type != agentprotocol.AckType || ack.Status != agentprotocol.AckStatusOK || ack.Code != agentprotocol.AckCodePersisted {
 		t.Fatalf("ack = %#v, want ok/persisted", ack)
 	}
 	if code := readAgentReportCloseCode(t, conn); code != websocket.CloseNormalClosure {
@@ -225,7 +226,7 @@ func TestAgentReportRejectsBinaryMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	ack := readAgentReportAck(t, conn)
-	if ack.Type != agentReportAckType || ack.Status != agentAckStatusError || ack.Code != agentAckCodeInvalidReport {
+	if ack.Type != agentprotocol.AckType || ack.Status != agentprotocol.AckStatusError || ack.Code != agentprotocol.AckCodeInvalidReport {
 		t.Fatalf("ack = %#v, want error/invalid_report", ack)
 	}
 	if code := readAgentReportCloseCode(t, conn); code != websocket.CloseInvalidFramePayloadData {
@@ -474,7 +475,7 @@ func TestAgentReportResponseMatrix(t *testing.T) {
 	t.Run("authorization_rejected", func(t *testing.T) {
 		_, wsURL := newAgentReportTestApp(t, "serenity")
 		report := validAgentReport("some-other-target", validAgentReportContainer("container-1"))
-		assertAgentReportRejected(t, wsURL, marshalAgentReport(t, report), agentAckCodeUnauthorizedTarget, websocket.ClosePolicyViolation)
+		assertAgentReportRejected(t, wsURL, marshalAgentReport(t, report), agentprotocol.AckCodeUnauthorizedTarget, websocket.ClosePolicyViolation)
 	})
 
 	t.Run("syntax_invalid_json", func(t *testing.T) {
@@ -549,7 +550,7 @@ func TestAgentReportResponseMatrix(t *testing.T) {
 			return fmt.Errorf("simulated backing store outage")
 		}
 		report := validAgentReport("serenity", validAgentReportContainer("container-1"))
-		assertAgentReportRejected(t, wsURL, marshalAgentReport(t, report), agentAckCodePersistenceFailed, websocket.CloseInternalServerErr)
+		assertAgentReportRejected(t, wsURL, marshalAgentReport(t, report), agentprotocol.AckCodePersistenceFailed, websocket.CloseInternalServerErr)
 	})
 
 	t.Run("oversized_message", func(t *testing.T) {
@@ -650,7 +651,7 @@ func TestAgentReportResponseMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 		ack := readAgentReportAck(t, conn)
-		if ack.Status != agentAckStatusOK || ack.Code != agentAckCodePersisted {
+		if ack.Status != agentprotocol.AckStatusOK || ack.Code != agentprotocol.AckCodePersisted {
 			t.Fatalf("ack = %#v, want ok/persisted despite a persistence stage slower than the write-wait deadline", ack)
 		}
 		if code := readAgentReportCloseCode(t, conn); code != websocket.CloseNormalClosure {
@@ -728,7 +729,7 @@ func TestAgentReportResponseMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 		ack2 := readAgentReportAck(t, conn2)
-		if ack2.Status != agentAckStatusError || ack2.Code != agentAckCodePersistenceFailed {
+		if ack2.Status != agentprotocol.AckStatusError || ack2.Code != agentprotocol.AckCodePersistenceFailed {
 			t.Fatalf("ack = %#v, want error/persistence_failed", ack2)
 		}
 		ack2Bytes, err := json.Marshal(ack2)
@@ -826,7 +827,7 @@ func TestAgentReportPersistsBeforeAcknowledgement(t *testing.T) {
 
 	select {
 	case ack := <-ackReceived:
-		if ack.Status != agentAckStatusOK || ack.Code != agentAckCodePersisted {
+		if ack.Status != agentprotocol.AckStatusOK || ack.Code != agentprotocol.AckCodePersisted {
 			t.Fatalf("ack = %#v, want ok/persisted", ack)
 		}
 	case <-time.After(2 * time.Second):

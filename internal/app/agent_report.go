@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/core"
 )
 
@@ -16,32 +16,20 @@ import (
 // of the agent report protocol. internal/agent defines a structurally
 // identical private type of its own: internal/core is frozen for this
 // protocol, so the two packages intentionally do not share one wire type.
+// The type/status/code values themselves are the shared external contract,
+// defined once in internal/agentprotocol.
 type agentReportAck struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
 	Code   string `json:"code"`
 }
 
-const agentReportAckType = "agent_report_ack"
-
-const (
-	agentAckStatusOK    = "ok"
-	agentAckStatusError = "error"
-)
-
-const (
-	agentAckCodePersisted          = "persisted"
-	agentAckCodeUnauthorizedTarget = "unauthorized_target"
-	agentAckCodeInvalidReport      = "invalid_report"
-	agentAckCodePersistenceFailed  = "persistence_failed"
-)
-
 func newAgentReportAckOK() agentReportAck {
-	return agentReportAck{Type: agentReportAckType, Status: agentAckStatusOK, Code: agentAckCodePersisted}
+	return agentReportAck{Type: agentprotocol.AckType, Status: agentprotocol.AckStatusOK, Code: agentprotocol.AckCodePersisted}
 }
 
 func newAgentReportAckError(code string) agentReportAck {
-	return agentReportAck{Type: agentReportAckType, Status: agentAckStatusError, Code: code}
+	return agentReportAck{Type: agentprotocol.AckType, Status: agentprotocol.AckStatusError, Code: code}
 }
 
 // Schema and semantic validation failures are distinguished so the caller can
@@ -93,18 +81,18 @@ var agentReportContainerFields = map[string]struct{}{
 // not reach logs.
 func decodeAgentReportWire(data []byte) (agentReportWire, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	top, err := decodeStrictJSONObject(decoder, agentReportTopFields)
+	top, err := agentprotocol.DecodeStrictJSONObject(decoder, agentReportTopFields)
 	if err != nil {
 		return agentReportWire{}, fmt.Errorf("%w: top-level: %v", errAgentReportSchemaInvalid, err)
 	}
-	if err := ensureNoTrailingJSON(decoder); err != nil {
+	if err := agentprotocol.EnsureNoTrailingJSON(decoder); err != nil {
 		return agentReportWire{}, fmt.Errorf("%w: trailing content after report", errAgentReportSchemaInvalid)
 	}
 
 	var wire agentReportWire
 
 	targetRaw, ok := top["target"]
-	if !ok || isAgentJSONNull(targetRaw) {
+	if !ok || agentprotocol.IsJSONNull(targetRaw) {
 		return agentReportWire{}, fmt.Errorf("%w: missing or null target", errAgentReportSchemaInvalid)
 	}
 	if err := json.Unmarshal(targetRaw, &wire.Target); err != nil {
@@ -112,7 +100,7 @@ func decodeAgentReportWire(data []byte) (agentReportWire, error) {
 	}
 
 	checkedAtRaw, ok := top["checkedAt"]
-	if !ok || isAgentJSONNull(checkedAtRaw) {
+	if !ok || agentprotocol.IsJSONNull(checkedAtRaw) {
 		return agentReportWire{}, fmt.Errorf("%w: missing or null checkedAt", errAgentReportSchemaInvalid)
 	}
 	if err := json.Unmarshal(checkedAtRaw, &wire.CheckedAt); err != nil {
@@ -120,7 +108,7 @@ func decodeAgentReportWire(data []byte) (agentReportWire, error) {
 	}
 
 	containersRaw, ok := top["containers"]
-	if !ok || isAgentJSONNull(containersRaw) {
+	if !ok || agentprotocol.IsJSONNull(containersRaw) {
 		return agentReportWire{}, fmt.Errorf("%w: missing or null containers", errAgentReportSchemaInvalid)
 	}
 	var containerItems []json.RawMessage
@@ -141,45 +129,30 @@ func decodeAgentReportWire(data []byte) (agentReportWire, error) {
 }
 
 func decodeAgentReportContainerWire(raw json.RawMessage) (agentReportContainerWire, error) {
-	if isAgentJSONNull(raw) {
+	if agentprotocol.IsJSONNull(raw) {
 		return agentReportContainerWire{}, errors.New("container entry is null")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	fields, err := decodeStrictJSONObject(decoder, agentReportContainerFields)
+	fields, err := agentprotocol.DecodeStrictJSONObject(decoder, agentReportContainerFields)
 	if err != nil {
 		return agentReportContainerWire{}, err
 	}
 
 	var container agentReportContainerWire
-	stringField := func(name string, dest *string) error {
-		fieldRaw, ok := fields[name]
-		if !ok || isAgentJSONNull(fieldRaw) {
-			return fmt.Errorf("missing or null %q", name)
-		}
-		if err := json.Unmarshal(fieldRaw, dest); err != nil {
-			return fmt.Errorf("%q is not a string", name)
-		}
-		return nil
-	}
-	for _, field := range []struct {
-		name string
-		dest *string
-	}{
-		{"id", &container.ID},
-		{"name", &container.Name},
-		{"image", &container.Image},
-		{"imageId", &container.ImageID},
-		{"state", &container.State},
-		{"status", &container.Status},
-		{"health", &container.Health},
-	} {
-		if err := stringField(field.name, field.dest); err != nil {
-			return agentReportContainerWire{}, err
-		}
+	if err := agentprotocol.DecodeStringFields(fields, []agentprotocol.StringField{
+		{Name: "id", Dest: &container.ID},
+		{Name: "name", Dest: &container.Name},
+		{Name: "image", Dest: &container.Image},
+		{Name: "imageId", Dest: &container.ImageID},
+		{Name: "state", Dest: &container.State},
+		{Name: "status", Dest: &container.Status},
+		{Name: "health", Dest: &container.Health},
+	}); err != nil {
+		return agentReportContainerWire{}, err
 	}
 
 	repoDigestsRaw, ok := fields["repoDigests"]
-	if !ok || isAgentJSONNull(repoDigestsRaw) {
+	if !ok || agentprotocol.IsJSONNull(repoDigestsRaw) {
 		return agentReportContainerWire{}, errors.New("missing or null repoDigests")
 	}
 	var repoDigests []string
@@ -192,7 +165,7 @@ func decodeAgentReportContainerWire(raw json.RawMessage) (agentReportContainerWi
 	container.RepoDigests = repoDigests
 
 	restartCountRaw, ok := fields["restartCount"]
-	if !ok || isAgentJSONNull(restartCountRaw) {
+	if !ok || agentprotocol.IsJSONNull(restartCountRaw) {
 		return agentReportContainerWire{}, errors.New("missing or null restartCount")
 	}
 	if err := json.Unmarshal(restartCountRaw, &container.RestartCount); err != nil {
@@ -200,7 +173,7 @@ func decodeAgentReportContainerWire(raw json.RawMessage) (agentReportContainerWi
 	}
 
 	if labelsRaw, ok := fields["labels"]; ok {
-		if isAgentJSONNull(labelsRaw) {
+		if agentprotocol.IsJSONNull(labelsRaw) {
 			return agentReportContainerWire{}, errors.New("labels is null")
 		}
 		labels, err := decodeAgentReportLabelsWire(labelsRaw)
@@ -221,7 +194,7 @@ func decodeAgentReportLabelsWire(raw json.RawMessage) (map[string]string, error)
 	}
 	labels := make(map[string]string, len(rawLabels))
 	for key, value := range rawLabels {
-		if isAgentJSONNull(value) {
+		if agentprotocol.IsJSONNull(value) {
 			return nil, fmt.Errorf("label %q value is null", key)
 		}
 		var strValue string
@@ -231,39 +204,6 @@ func decodeAgentReportLabelsWire(raw json.RawMessage) (map[string]string, error)
 		labels[key] = strValue
 	}
 	return labels, nil
-}
-
-// decodeStrictJSONObject decodes exactly one JSON object from decoder,
-// rejecting any key not present in allowed. It rejects non-object JSON
-// values (including null, which decodes to a nil map) up front.
-func decodeStrictJSONObject(decoder *json.Decoder, allowed map[string]struct{}) (map[string]json.RawMessage, error) {
-	var raw map[string]json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
-		return nil, err
-	}
-	if raw == nil {
-		return nil, errors.New("value is not a JSON object")
-	}
-	for key := range raw {
-		if _, ok := allowed[key]; !ok {
-			return nil, fmt.Errorf("unknown field %q", key)
-		}
-	}
-	return raw, nil
-}
-
-func ensureNoTrailingJSON(decoder *json.Decoder) error {
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return errors.New("trailing JSON content")
-		}
-		return err
-	}
-	return nil
-}
-
-func isAgentJSONNull(raw json.RawMessage) bool {
-	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 // Semantic bounds, all pinned by the spec (not configurable).

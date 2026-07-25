@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/gorilla/websocket"
@@ -283,7 +284,7 @@ func TestAgentEndpointRejectsMismatchedTargetReport(t *testing.T) {
 	if err := conn.ReadJSON(&ack); err != nil {
 		t.Fatalf("read acknowledgement: %v", err)
 	}
-	if ack.Type != agentReportAckType || ack.Status != agentAckStatusError || ack.Code != agentAckCodeUnauthorizedTarget {
+	if ack.Type != agentprotocol.AckType || ack.Status != agentprotocol.AckStatusError || ack.Code != agentprotocol.AckCodeUnauthorizedTarget {
 		t.Fatalf("ack = %#v, want unauthorized_target error", ack)
 	}
 	_, _, err = conn.ReadMessage()

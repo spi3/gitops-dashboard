@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/app"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
@@ -77,7 +78,7 @@ func newFakeAgentServer(t *testing.T, handle func(t *testing.T, conn *websocket.
 }
 
 func validAckJSON(status, code string) string {
-	return fmt.Sprintf(`{"type":%q,"status":%q,"code":%q}`, agentReportAckType, status, code)
+	return fmt.Sprintf(`{"type":%q,"status":%q,"code":%q}`, agentprotocol.AckType, status, code)
 }
 
 // --- TestSendOnceCollectsAndNormalizesBeforeDial ----------------------------
@@ -127,7 +128,7 @@ func TestSendOnceCollectsAndNormalizesBeforeDial(t *testing.T) {
 			// artificial delay measured from process start. If the ack
 			// deadline were (incorrectly) started before collection/dial,
 			// this reply would already be too late.
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(validAckJSON(agentAckStatusOK, agentAckCodePersisted)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodePersisted)))
 		})
 
 		cfg := config.Config{Agent: config.AgentConfig{
@@ -269,20 +270,20 @@ func TestSendOnceAcknowledgementMatrix(t *testing.T) {
 	}
 
 	cases := []ackCase{
-		{name: "ok_persisted", rawJSON: validAckJSON(agentAckStatusOK, agentAckCodePersisted), wantErr: nil},
-		{name: "error_unauthorized_target", rawJSON: validAckJSON(agentAckStatusError, agentAckCodeUnauthorizedTarget), wantErr: errAgentServerRejection},
-		{name: "error_invalid_report", rawJSON: validAckJSON(agentAckStatusError, agentAckCodeInvalidReport), wantErr: errAgentServerRejection},
-		{name: "error_persistence_failed", rawJSON: validAckJSON(agentAckStatusError, agentAckCodePersistenceFailed), wantErr: errAgentServerRejection},
-		{name: "ok_with_unauthorized_target_code", rawJSON: validAckJSON(agentAckStatusOK, agentAckCodeUnauthorizedTarget), wantErr: errAgentProtocolFailure},
-		{name: "ok_with_invalid_report_code", rawJSON: validAckJSON(agentAckStatusOK, agentAckCodeInvalidReport), wantErr: errAgentProtocolFailure},
-		{name: "ok_with_persistence_failed_code", rawJSON: validAckJSON(agentAckStatusOK, agentAckCodePersistenceFailed), wantErr: errAgentProtocolFailure},
-		{name: "error_with_persisted_code", rawJSON: validAckJSON(agentAckStatusError, agentAckCodePersisted), wantErr: errAgentProtocolFailure},
-		{name: "unknown_status", rawJSON: validAckJSON("pending", agentAckCodePersisted), wantErr: errAgentProtocolFailure},
-		{name: "unknown_code", rawJSON: validAckJSON(agentAckStatusError, "network_partition"), wantErr: errAgentProtocolFailure},
-		{name: "missing_fields", rawJSON: fmt.Sprintf(`{"type":%q,"status":%q}`, agentReportAckType, agentAckStatusOK), wantErr: errAgentProtocolFailure},
-		{name: "unknown_fields", rawJSON: fmt.Sprintf(`{"type":%q,"status":%q,"code":%q,"extra":"x"}`, agentReportAckType, agentAckStatusOK, agentAckCodePersisted), wantErr: errAgentProtocolFailure},
+		{name: "ok_persisted", rawJSON: validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodePersisted), wantErr: nil},
+		{name: "error_unauthorized_target", rawJSON: validAckJSON(agentprotocol.AckStatusError, agentprotocol.AckCodeUnauthorizedTarget), wantErr: errAgentServerRejection},
+		{name: "error_invalid_report", rawJSON: validAckJSON(agentprotocol.AckStatusError, agentprotocol.AckCodeInvalidReport), wantErr: errAgentServerRejection},
+		{name: "error_persistence_failed", rawJSON: validAckJSON(agentprotocol.AckStatusError, agentprotocol.AckCodePersistenceFailed), wantErr: errAgentServerRejection},
+		{name: "ok_with_unauthorized_target_code", rawJSON: validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodeUnauthorizedTarget), wantErr: errAgentProtocolFailure},
+		{name: "ok_with_invalid_report_code", rawJSON: validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodeInvalidReport), wantErr: errAgentProtocolFailure},
+		{name: "ok_with_persistence_failed_code", rawJSON: validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodePersistenceFailed), wantErr: errAgentProtocolFailure},
+		{name: "error_with_persisted_code", rawJSON: validAckJSON(agentprotocol.AckStatusError, agentprotocol.AckCodePersisted), wantErr: errAgentProtocolFailure},
+		{name: "unknown_status", rawJSON: validAckJSON("pending", agentprotocol.AckCodePersisted), wantErr: errAgentProtocolFailure},
+		{name: "unknown_code", rawJSON: validAckJSON(agentprotocol.AckStatusError, "network_partition"), wantErr: errAgentProtocolFailure},
+		{name: "missing_fields", rawJSON: fmt.Sprintf(`{"type":%q,"status":%q}`, agentprotocol.AckType, agentprotocol.AckStatusOK), wantErr: errAgentProtocolFailure},
+		{name: "unknown_fields", rawJSON: fmt.Sprintf(`{"type":%q,"status":%q,"code":%q,"extra":"x"}`, agentprotocol.AckType, agentprotocol.AckStatusOK, agentprotocol.AckCodePersisted), wantErr: errAgentProtocolFailure},
 		{name: "malformed_json", rawJSON: `{not valid json`, wantErr: errAgentProtocolFailure},
-		{name: "binary_acknowledgement", binary: true, rawJSON: validAckJSON(agentAckStatusOK, agentAckCodePersisted), wantErr: errAgentProtocolFailure},
+		{name: "binary_acknowledgement", binary: true, rawJSON: validAckJSON(agentprotocol.AckStatusOK, agentprotocol.AckCodePersisted), wantErr: errAgentProtocolFailure},
 		{name: "early_close", closeOnly: true, wantErr: errAgentProtocolFailure},
 	}
 

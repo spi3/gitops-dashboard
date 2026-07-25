@@ -363,14 +363,28 @@ func (monitor Monitor) runTargetLoop(ctx context.Context, targetName string, int
 	}
 }
 
+// recordTargetFailure persists HealthError/"monitor target check failed" for
+// every given service, overwriting any earlier results from the same failed
+// attempt. It is the single shared writer for every runtime, including
+// Kubernetes (see handleKubernetesCheckFailure), via statusWriteContext's
+// write budget and cancellation gate below.
 func (monitor Monitor) recordTargetFailure(ctx context.Context, target string, services []core.Service) {
+	monitor.recordTargetFailureLogged(ctx, target, services, "persist monitor target failure")
+}
+
+// recordTargetFailureLogged is recordTargetFailure with a caller-chosen
+// write-failure log message, so a caller with its own operational log
+// vocabulary (see handleKubernetesCheckFailure's deadline branch) can keep
+// it distinct while still sharing the write budget, cancellation gate, and
+// persisted row contract below.
+func (monitor Monitor) recordTargetFailureLogged(ctx context.Context, target string, services []core.Service, logMessage string) {
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return
 	}
 	now := time.Now().UTC()
 	for _, service := range services {
 		if err := monitor.upsertMonitorStatus(ctx, core.StatusResult{ServiceID: service.ID, Target: target, Health: core.HealthError, Message: "monitor target check failed", CheckedAt: now}); err != nil {
-			monitor.logger.Error("persist monitor target failure", "target", target, "service", service.ID, "error", err)
+			monitor.logger.Error(logMessage, "target", target, "service", service.ID, "error", err)
 		}
 	}
 }

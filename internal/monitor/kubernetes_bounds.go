@@ -32,11 +32,6 @@ const (
 	// short or very long interval still yields a sane phase budget.
 	kubernetesIntervalFloor   = 5 * time.Second
 	kubernetesIntervalCeiling = 2 * time.Minute
-
-	// kubernetesFailureWriteTimeout bounds the separate failure-row write
-	// phase that follows a Kubernetes phase or request deadline. It is
-	// intentionally outside the check-phase budget itself.
-	kubernetesFailureWriteTimeout = 2 * time.Second
 )
 
 // kubernetesCycleBudgetFunc computes the context budget for one Kubernetes
@@ -148,43 +143,18 @@ func productionKubernetesClient(target config.KubernetesTarget) (dynamic.Interfa
 	return dynamic.NewForConfig(restCfg)
 }
 
-// recordKubernetesTargetFailure persists HealthError/"monitor target check
-// failed" for every applicable service after a Kubernetes phase or request
-// deadline, overwriting any earlier results from the same failed attempt.
-//
-// It writes nothing when the parent context is itself canceled or has
-// reached its own deadline: at that point there is no remaining time budget
-// to spend on a generic write, so the attempt returns promptly and the next
-// scheduled attempt is left to recover instead.
-func (monitor Monitor) recordKubernetesTargetFailure(parent context.Context, target string, services []core.Service) {
-	if parent.Err() != nil {
-		return
-	}
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), kubernetesFailureWriteTimeout)
-	defer cancel()
-	now := time.Now().UTC()
-	for _, service := range applicableKubernetesServices(services) {
-		if err := monitor.store.UpsertStatus(writeCtx, core.StatusResult{
-			ServiceID: service.ID,
-			Target:    target,
-			Health:    core.HealthError,
-			Message:   "monitor target check failed",
-			CheckedAt: now,
-		}); err != nil {
-			monitor.logger.Error("persist kubernetes target failure", "target", target, "service", service.ID, "error", err)
-		}
-	}
-}
-
 // handleKubernetesCheckFailure records the effect of a failed Kubernetes
-// check attempt. A phase or request deadline routes through the bounded,
-// parent-aware Kubernetes failure writer above; every other error (for
-// example an invalid kubeconfig) falls back to the shared generic target
-// failure writer used by the other runtimes, unless the parent context was
+// check attempt, through the same shared target-failure writer used by every
+// other runtime (see recordTargetFailure and statusWriteContext). A phase or
+// request deadline writes only the applicable-kind services, overwriting any
+// earlier results from the same failed attempt, and logs a write failure
+// under its own Kubernetes-specific message; every other error (for example
+// an invalid kubeconfig) falls back to covering every kubernetes-runtime
+// service under the generic message, unless the parent context was
 // canceled, in which case nothing is written.
 func (monitor Monitor) handleKubernetesCheckFailure(parent context.Context, target string, err error, services []core.Service) {
 	if errors.Is(err, context.DeadlineExceeded) {
-		monitor.recordKubernetesTargetFailure(parent, target, services)
+		monitor.recordTargetFailureLogged(parent, target, applicableKubernetesServices(services), "persist kubernetes target failure")
 		return
 	}
 	if errors.Is(err, context.Canceled) {

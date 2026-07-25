@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/dockerapi"
@@ -15,13 +17,14 @@ import (
 
 func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if cfg.Agent.ServerURL == "" || cfg.Agent.Token == "" {
-		return nil
+		return errors.New("agent.serverUrl and agent.token are required")
 	}
-	interval := 30 * time.Second
-	if cfg.Agent.Interval != "" {
-		if parsed, err := time.ParseDuration(cfg.Agent.Interval); err == nil {
-			interval = parsed
-		}
+	interval, err := cfg.Agent.IntervalDuration()
+	if err != nil {
+		return err
+	}
+	if interval == 0 {
+		interval = 30 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -93,9 +96,9 @@ func sendOnce(ctx context.Context, cfg config.Config) error {
 	}
 
 	switch {
-	case ack.Status == agentAckStatusOK && ack.Code == agentAckCodePersisted:
+	case ack.Status == agentprotocol.AckStatusOK && ack.Code == agentprotocol.AckCodePersisted:
 		return nil
-	case ack.Status == agentAckStatusError && isAgentAckErrorCode(ack.Code):
+	case ack.Status == agentprotocol.AckStatusError && isAgentAckErrorCode(ack.Code):
 		return classifyAgentErrorCode(errAgentServerRejection, ack.Code)
 	default:
 		return classifyAgentError(errAgentProtocolFailure, errInvalidAcknowledgementPairing)

@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"time"
+
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 )
 
 // Timeouts and limits for the collect-before-dial report protocol. These are
@@ -54,31 +55,23 @@ func isAgentReadTimeout(err error) bool {
 // agentReportAck is the private acknowledgement wire type for the agent side
 // of the protocol. internal/app defines a structurally identical private
 // type of its own; internal/core is frozen for this protocol, so the two
-// packages intentionally do not share one wire type.
+// packages intentionally do not share one wire type. The type/status/code
+// values themselves are the shared external contract, defined once in
+// internal/agentprotocol.
 type agentReportAck struct {
 	Type   string
 	Status string
 	Code   string
 }
 
-const agentReportAckType = "agent_report_ack"
-
-const (
-	agentAckStatusOK    = "ok"
-	agentAckStatusError = "error"
-)
-
-const (
-	agentAckCodePersisted          = "persisted"
-	agentAckCodeUnauthorizedTarget = "unauthorized_target"
-	agentAckCodeInvalidReport      = "invalid_report"
-	agentAckCodePersistenceFailed  = "persistence_failed"
-)
+var agentReportAckFields = map[string]struct{}{
+	"type": {}, "status": {}, "code": {},
+}
 
 var agentAckErrorCodes = map[string]struct{}{
-	agentAckCodeUnauthorizedTarget: {},
-	agentAckCodeInvalidReport:      {},
-	agentAckCodePersistenceFailed:  {},
+	agentprotocol.AckCodeUnauthorizedTarget: {},
+	agentprotocol.AckCodeInvalidReport:      {},
+	agentprotocol.AckCodePersistenceFailed:  {},
 }
 
 func isAgentAckErrorCode(code string) bool {
@@ -91,47 +84,24 @@ func isAgentAckErrorCode(code string) bool {
 // fields, nothing else, and nothing trailing.
 func decodeAgentReportAck(data []byte) (agentReportAck, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	var raw map[string]json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
+	raw, err := agentprotocol.DecodeStrictJSONObject(decoder, agentReportAckFields)
+	if err != nil {
 		return agentReportAck{}, fmt.Errorf("acknowledgement is not a JSON object: %w", err)
 	}
-	if raw == nil {
-		return agentReportAck{}, errors.New("acknowledgement is not a JSON object")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
+	if err := agentprotocol.EnsureNoTrailingJSON(decoder); err != nil {
 		return agentReportAck{}, errors.New("trailing content after acknowledgement")
-	}
-	for key := range raw {
-		switch key {
-		case "type", "status", "code":
-		default:
-			return agentReportAck{}, fmt.Errorf("unknown acknowledgement field %q", key)
-		}
 	}
 
 	var ack agentReportAck
-	for _, field := range []struct {
-		name string
-		dest *string
-	}{
-		{"type", &ack.Type},
-		{"status", &ack.Status},
-		{"code", &ack.Code},
-	} {
-		fieldRaw, ok := raw[field.name]
-		if !ok || isAgentAckJSONNull(fieldRaw) {
-			return agentReportAck{}, fmt.Errorf("missing or null %q", field.name)
-		}
-		if err := json.Unmarshal(fieldRaw, field.dest); err != nil {
-			return agentReportAck{}, fmt.Errorf("%q is not a string", field.name)
-		}
+	if err := agentprotocol.DecodeStringFields(raw, []agentprotocol.StringField{
+		{Name: "type", Dest: &ack.Type},
+		{Name: "status", Dest: &ack.Status},
+		{Name: "code", Dest: &ack.Code},
+	}); err != nil {
+		return agentReportAck{}, err
 	}
-	if ack.Type != agentReportAckType {
+	if ack.Type != agentprotocol.AckType {
 		return agentReportAck{}, errors.New("unexpected acknowledgement type")
 	}
 	return ack, nil
-}
-
-func isAgentAckJSONNull(raw json.RawMessage) bool {
-	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }

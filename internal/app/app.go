@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/example/gitops-dashboard/internal/agentprotocol"
 	"github.com/example/gitops-dashboard/internal/alerter"
 	"github.com/example/gitops-dashboard/internal/auth"
 	"github.com/example/gitops-dashboard/internal/config"
@@ -511,21 +512,21 @@ func (app *App) handleAgentReport(ctx context.Context, conn *websocket.Conn, aut
 	}
 	if messageType != websocket.TextMessage {
 		app.logger.Warn("agent report rejected", "classification", "binary_message")
-		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report must be a text message")
+		app.respondAgentReport(conn, newAgentReportAckError(agentprotocol.AckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report must be a text message")
 		return
 	}
 
 	wire, err := decodeAgentReportWire(data)
 	if err != nil {
 		app.logger.Warn("agent report rejected", "classification", "schema_invalid")
-		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report failed schema validation")
+		app.respondAgentReport(conn, newAgentReportAckError(agentprotocol.AckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report failed schema validation")
 		return
 	}
 
 	message, err := validateAgentReportSemantics(wire)
 	if err != nil {
 		app.logger.Warn("agent report rejected", "classification", "semantic_invalid", "target", agentTargetDigest(wire.Target))
-		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.ClosePolicyViolation, "agent report failed semantic validation")
+		app.respondAgentReport(conn, newAgentReportAckError(agentprotocol.AckCodeInvalidReport), websocket.ClosePolicyViolation, "agent report failed semantic validation")
 		return
 	}
 
@@ -536,11 +537,11 @@ func (app *App) handleAgentReport(ctx context.Context, conn *websocket.Conn, aut
 	if err := applyAgentReport(ctx, message, authorizedTargets); err != nil {
 		if errors.Is(err, monitor.ErrAgentTargetUnauthorized) {
 			app.logger.Warn("agent report rejected", "classification", "unauthorized_target", "target", agentTargetDigest(message.Target))
-			app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeUnauthorizedTarget), websocket.ClosePolicyViolation, "agent target is not authorized")
+			app.respondAgentReport(conn, newAgentReportAckError(agentprotocol.AckCodeUnauthorizedTarget), websocket.ClosePolicyViolation, "agent target is not authorized")
 			return
 		}
 		app.logger.Error("agent report rejected", "classification", "persistence_failed", "target", agentTargetDigest(message.Target))
-		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodePersistenceFailed), websocket.CloseInternalServerErr, "agent report persistence failed")
+		app.respondAgentReport(conn, newAgentReportAckError(agentprotocol.AckCodePersistenceFailed), websocket.CloseInternalServerErr, "agent report persistence failed")
 		return
 	}
 
