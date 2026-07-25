@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +43,21 @@ type App struct {
 	upgrader  websocket.Upgrader
 	scanAll   func(context.Context) error
 	checkAll  func(context.Context) error
+
+	// applyAgentReport is a test seam matching monitor.ApplyAgentReport's
+	// signature, initialized to production behavior. It exists solely so
+	// tests can inject a deterministic persistence failure after an agent
+	// report has already passed schema, semantic, and authorization
+	// validation.
+	applyAgentReport func(ctx context.Context, message core.AgentMessage, authorizedTargets []string) error
+
+	// agentConnsWG tracks in-flight agentConnect calls, including their
+	// keepalive ping goroutine. net/http/httptest.Server.Close does not wait
+	// for hijacked connections (which is what a completed WebSocket upgrade
+	// produces) to finish, so tests that mutate the package-level agent
+	// WebSocket deadline/limit variables wait on this directly to avoid
+	// racing a still-finishing connection's use of the previous value.
+	agentConnsWG sync.WaitGroup
 
 	actionCtx     context.Context
 	actionCancel  context.CancelFunc
@@ -124,6 +141,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 	app.scanAll = app.scanner.ScanAll
 	app.checkAll = app.monitor.CheckAll
+	app.applyAgentReport = app.monitor.ApplyAgentReport
 	app.readinessTTL = readinessCacheTTL
 	app.readinessNow = time.Now
 	app.readinessProbe = app.storageReadinessProbe
@@ -439,6 +457,8 @@ func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	app.agentConnsWG.Add(1)
+	defer app.agentConnsWG.Done()
 	defer conn.Close()
 	conn.SetReadLimit(agentWSReadLimit)
 	_ = conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
@@ -446,26 +466,98 @@ func (app *App) agentConnect(w http.ResponseWriter, r *http.Request) {
 		return conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
 	})
 	stopPings := make(chan struct{})
-	defer close(stopPings)
-	go pingAgentConnection(conn, stopPings)
+	pingsDone := make(chan struct{})
+	defer func() {
+		close(stopPings)
+		<-pingsDone
+	}()
+	go func() {
+		defer close(pingsDone)
+		pingAgentConnection(conn, stopPings)
+	}()
 
-	authorizedTargets := binding.Targets()
-	for {
-		var message core.AgentMessage
-		if err := conn.ReadJSON(&message); err != nil {
-			app.logger.Info("agent disconnected", "error", err)
-			return
-		}
-		if err := app.monitor.ApplyAgentReport(r.Context(), message, authorizedTargets); err != nil {
-			if errors.Is(err, monitor.ErrAgentTargetUnauthorized) {
-				app.logger.Warn("agent report rejected unauthorized target", "target", message.Target, "authorizedTargets", authorizedTargets)
-				closeAgentConnection(conn, websocket.ClosePolicyViolation, "agent target is not authorized")
-				return
-			}
-			app.logger.Error("agent status persist failed", "error", err)
-			return
-		}
+	// The connection carries exactly one report and one acknowledgement: no
+	// negotiation, retransmission, or multi-message session is supported.
+	app.handleAgentReport(r.Context(), conn, binding.Targets())
+}
+
+// handleAgentReport reads and validates exactly one agent report message and
+// sends exactly one acknowledgement, in the exact order the protocol
+// requires: message type/usability/size, JSON syntax/schema, semantic
+// fields, target authorization, persistence. Every rejection is logged with
+// only a fixed classification and a bounded, non-reversible target digest —
+// never the report content, the agent token, or raw error text that could
+// echo attacker-controlled field names or values.
+func (app *App) handleAgentReport(ctx context.Context, conn *websocket.Conn, authorizedTargets []string) {
+	messageType, data, err := conn.ReadMessage()
+	if err != nil {
+		// Peer close before a report, an oversized message, and broken
+		// WebSocket protocol framing are all handled below the application
+		// layer: gorilla either has already written the applicable close
+		// frame (1009 for oversize, 1002 for protocol errors) or the peer
+		// has already closed. In every case the correct response is no
+		// acknowledgement and no further write from us.
+		app.logger.Info("agent report connection ended before a usable message")
+		return
 	}
+	if messageType != websocket.TextMessage {
+		app.logger.Warn("agent report rejected", "classification", "binary_message")
+		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report must be a text message")
+		return
+	}
+
+	wire, err := decodeAgentReportWire(data)
+	if err != nil {
+		app.logger.Warn("agent report rejected", "classification", "schema_invalid")
+		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.CloseInvalidFramePayloadData, "agent report failed schema validation")
+		return
+	}
+
+	message, err := validateAgentReportSemantics(wire)
+	if err != nil {
+		app.logger.Warn("agent report rejected", "classification", "semantic_invalid", "target", agentTargetDigest(wire.Target))
+		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeInvalidReport), websocket.ClosePolicyViolation, "agent report failed semantic validation")
+		return
+	}
+
+	applyAgentReport := app.applyAgentReport
+	if applyAgentReport == nil {
+		applyAgentReport = app.monitor.ApplyAgentReport
+	}
+	if err := applyAgentReport(ctx, message, authorizedTargets); err != nil {
+		if errors.Is(err, monitor.ErrAgentTargetUnauthorized) {
+			app.logger.Warn("agent report rejected", "classification", "unauthorized_target", "target", agentTargetDigest(message.Target))
+			app.respondAgentReport(conn, newAgentReportAckError(agentAckCodeUnauthorizedTarget), websocket.ClosePolicyViolation, "agent target is not authorized")
+			return
+		}
+		app.logger.Error("agent report rejected", "classification", "persistence_failed", "target", agentTargetDigest(message.Target))
+		app.respondAgentReport(conn, newAgentReportAckError(agentAckCodePersistenceFailed), websocket.CloseInternalServerErr, "agent report persistence failed")
+		return
+	}
+
+	app.respondAgentReport(conn, newAgentReportAckOK(), websocket.CloseNormalClosure, "agent report persisted")
+}
+
+// respondAgentReport writes the acknowledgement under its own refreshed
+// write deadline, then refreshes the deadline again before the close control
+// message: ack and close never share one deadline. A failed acknowledgement
+// write is logged as such rather than claimed as sent, but the connection is
+// still closed either way.
+func (app *App) respondAgentReport(conn *websocket.Conn, ack agentReportAck, closeCode int, closeText string) {
+	_ = conn.SetWriteDeadline(time.Now().Add(agentWSWriteWait))
+	if err := conn.WriteJSON(ack); err != nil {
+		app.logger.Warn("agent report acknowledgement write failed", "status", ack.Status, "code", ack.Code)
+	}
+	closeAgentConnection(conn, closeCode, closeText)
+}
+
+// agentTargetDigest returns a fixed-length, non-reversible identifier for a
+// reported target, safe to place in logs even when the target itself is
+// attacker-controlled or unvalidated (schema failures may occur before a
+// target is known to be well-formed).
+func agentTargetDigest(target string) string {
+	sum := sha256.Sum256([]byte(target))
+	return hex.EncodeToString(sum[:6])
 }
 
 func pingAgentConnection(conn *websocket.Conn, done <-chan struct{}) {

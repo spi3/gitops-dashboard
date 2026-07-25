@@ -37,18 +37,83 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 }
 
+// sendOnce collects and normalizes a Docker report before ever constructing
+// or dialing the WebSocket, then dials, writes exactly one text report
+// message, and reads exactly one acknowledgement. Every returned error wraps
+// one of the classification sentinels in this package so callers can test
+// the category with errors.Is regardless of the underlying cause, and no
+// returned error ever includes the agent token, a response body, or raw
+// handshake headers.
 func sendOnce(ctx context.Context, cfg config.Config) error {
-	header := http.Header{"X-Agent-Token": []string{cfg.Agent.Token}}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.Agent.ServerURL, header)
+	message, err := collectDocker(ctx, cfg.Agent)
 	if err != nil {
-		return err
+		return classifyAgentError(errAgentCollectionFailure, err)
+	}
+	normalizeAgentMessage(&message)
+
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = agentDialHandshakeTimeout
+
+	header := http.Header{"X-Agent-Token": []string{cfg.Agent.Token}}
+	conn, resp, err := dialer.DialContext(ctx, cfg.Agent.ServerURL, header)
+	if err != nil {
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return classifyAgentError(errAgentServerRejection, err)
+		}
+		return classifyAgentError(errAgentConnectionFailure, err)
 	}
 	defer conn.Close()
-	status, err := collectDocker(ctx, cfg.Agent)
-	if err != nil {
-		return err
+
+	if err := conn.SetWriteDeadline(time.Now().Add(agentReportWriteTimeout)); err != nil {
+		return classifyAgentError(errAgentConnectionFailure, err)
 	}
-	return conn.WriteJSON(status)
+	if err := conn.WriteJSON(message); err != nil {
+		return classifyAgentError(errAgentConnectionFailure, err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(agentAckReadTimeout)); err != nil {
+		return classifyAgentError(errAgentConnectionFailure, err)
+	}
+	conn.SetReadLimit(agentAckReadLimit)
+
+	messageType, data, err := conn.ReadMessage()
+	if err != nil {
+		if isAgentReadTimeout(err) {
+			return classifyAgentError(errAgentAcknowledgementTimeout, err)
+		}
+		return classifyAgentError(errAgentProtocolFailure, err)
+	}
+	if messageType != websocket.TextMessage {
+		return classifyAgentError(errAgentProtocolFailure, errBinaryAcknowledgement)
+	}
+
+	ack, err := decodeAgentReportAck(data)
+	if err != nil {
+		return classifyAgentError(errAgentProtocolFailure, err)
+	}
+
+	switch {
+	case ack.Status == agentAckStatusOK && ack.Code == agentAckCodePersisted:
+		return nil
+	case ack.Status == agentAckStatusError && isAgentAckErrorCode(ack.Code):
+		return classifyAgentErrorCode(errAgentServerRejection, ack.Code)
+	default:
+		return classifyAgentError(errAgentProtocolFailure, errInvalidAcknowledgementPairing)
+	}
+}
+
+// normalizeAgentMessage applies the collect-before-dial normalization
+// contract: Containers is always non-null, and every container's
+// RepoDigests is always non-null.
+func normalizeAgentMessage(message *core.AgentMessage) {
+	if message.Containers == nil {
+		message.Containers = []core.ContainerStatus{}
+	}
+	for i := range message.Containers {
+		if message.Containers[i].RepoDigests == nil {
+			message.Containers[i].RepoDigests = []string{}
+		}
+	}
 }
 
 func collectDocker(ctx context.Context, cfg config.AgentConfig) (core.AgentMessage, error) {

@@ -53,16 +53,23 @@ func TestAgentReportAppearsInSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	message := core.AgentMessage{
-		Target: "serenity",
+		Target:    "serenity",
+		CheckedAt: time.Now().UTC(),
 		Containers: []core.ContainerStatus{{
-			Name:  "/stack-web-1",
-			Image: "example/web:v1",
+			ID:      "container-1",
+			Name:    "/stack-web-1",
+			Image:   "example/web:v1",
+			ImageID: "sha256:web",
 			Labels: map[string]string{
 				core.DockerComposeProjectLabel:                  "stack",
 				core.DockerComposeServiceLabel:                  "web",
 				"traefik.http.middlewares.auth.basicauth.users": "admin:$2y$05$secret",
 			},
-			State: "running",
+			RepoDigests:  []string{},
+			State:        "running",
+			Status:       "Up 1 minute",
+			Health:       "healthy",
+			RestartCount: 0,
 		}},
 	}
 	if err := conn.WriteJSON(message); err != nil {
@@ -264,10 +271,21 @@ func TestAgentEndpointRejectsMismatchedTargetReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(core.AgentMessage{Target: "albert"}); err != nil {
+	if err := conn.WriteJSON(core.AgentMessage{
+		Target:     "albert",
+		CheckedAt:  time.Now().UTC(),
+		Containers: []core.ContainerStatus{},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var ack agentReportAck
+	if err := conn.ReadJSON(&ack); err != nil {
+		t.Fatalf("read acknowledgement: %v", err)
+	}
+	if ack.Type != agentReportAckType || ack.Status != agentAckStatusError || ack.Code != agentAckCodeUnauthorizedTarget {
+		t.Fatalf("ack = %#v, want unauthorized_target error", ack)
+	}
 	_, _, err = conn.ReadMessage()
 	if err == nil {
 		t.Fatal("mismatched target report left websocket open")
@@ -328,6 +346,10 @@ func TestAgentWebSocketReadLimitClosesOversizedMessage(t *testing.T) {
 	if isNetTimeout(err) {
 		t.Fatalf("read timed out waiting for close after oversized message: %v", err)
 	}
+	// net/http/httptest.Server.Close does not wait for hijacked (WebSocket)
+	// connections, so wait explicitly for this connection's handler and its
+	// ping goroutine to finish before the deferred restore above runs.
+	app.agentConnsWG.Wait()
 }
 
 func TestAgentWebSocketReadDeadlineClosesIdleConnection(t *testing.T) {
@@ -377,6 +399,10 @@ func TestAgentWebSocketReadDeadlineClosesIdleConnection(t *testing.T) {
 	if isNetTimeout(err) {
 		t.Fatalf("read timed out waiting for idle close: %v", err)
 	}
+	// net/http/httptest.Server.Close does not wait for hijacked (WebSocket)
+	// connections, so wait explicitly for this connection's handler and its
+	// ping goroutine to finish before the deferred restore above runs.
+	app.agentConnsWG.Wait()
 }
 
 func isNetTimeout(err error) bool {
