@@ -486,42 +486,78 @@ func (store *Store) mergeRouteAlertCollisionDispatches(ctx context.Context, tx *
 	return false, nil
 }
 
+// applyMonitorOverrideMigration is the shared update-or-merge-then-delete
+// rule behind both migrateRouteOverride and canonicalizeMonitorOverrides: if
+// no row exists yet at newTarget, rename old's row in place; otherwise merge
+// old's fields into the existing newTarget row (max of each field) and
+// delete old's row.
+func applyMonitorOverrideMigration(ctx context.Context, tx *sql.Tx, old monitorOverrideRouteAlias, newTarget string) error {
+	var existing monitorOverrideRouteAlias
+	err := tx.QueryRowContext(ctx, `SELECT not_applicable, updated_at FROM monitor_overrides WHERE service_id=? AND target=?`, old.serviceID, newTarget).Scan(&existing.notApplicable, &existing.updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err := tx.ExecContext(ctx, `UPDATE monitor_overrides SET target=? WHERE service_id=? AND target=?`, newTarget, old.serviceID, old.target)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	mergedNotApplicable := existing.notApplicable
+	if old.notApplicable > mergedNotApplicable {
+		mergedNotApplicable = old.notApplicable
+	}
+	mergedUpdatedAt := existing.updatedAt
+	if old.updatedAt > mergedUpdatedAt {
+		mergedUpdatedAt = old.updatedAt
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE monitor_overrides SET not_applicable=?, updated_at=? WHERE service_id=? AND target=?`, mergedNotApplicable, mergedUpdatedAt, old.serviceID, newTarget); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM monitor_overrides WHERE service_id=? AND target=?`, old.serviceID, old.target)
+	return err
+}
+
 func migrateRouteOverride(ctx context.Context, tx *sql.Tx, serviceID, oldTarget, newTarget string) error {
-	var oldNotApplicable int
-	var oldUpdatedAt string
-	err := tx.QueryRowContext(ctx, `SELECT not_applicable, updated_at FROM monitor_overrides WHERE service_id=? AND target=?`, serviceID, oldTarget).Scan(&oldNotApplicable, &oldUpdatedAt)
+	old := monitorOverrideRouteAlias{serviceID: serviceID, target: oldTarget}
+	err := tx.QueryRowContext(ctx, `SELECT not_applicable, updated_at FROM monitor_overrides WHERE service_id=? AND target=?`, serviceID, oldTarget).Scan(&old.notApplicable, &old.updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	var newNotApplicable int
-	var newUpdatedAt string
-	err = tx.QueryRowContext(ctx, `SELECT not_applicable, updated_at FROM monitor_overrides WHERE service_id=? AND target=?`, serviceID, newTarget).Scan(&newNotApplicable, &newUpdatedAt)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		_, err = tx.ExecContext(ctx, `UPDATE monitor_overrides SET target=? WHERE service_id=? AND target=?`, newTarget, serviceID, oldTarget)
-	case err == nil:
-		if oldNotApplicable > newNotApplicable {
-			newNotApplicable = oldNotApplicable
-		}
-		if oldUpdatedAt > newUpdatedAt {
-			newUpdatedAt = oldUpdatedAt
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE monitor_overrides SET not_applicable=?, updated_at=? WHERE service_id=? AND target=?`, newNotApplicable, newUpdatedAt, serviceID, newTarget)
-		if err == nil {
-			_, err = tx.ExecContext(ctx, `DELETE FROM monitor_overrides WHERE service_id=? AND target=?`, serviceID, oldTarget)
-		}
-	}
-	if err != nil {
+	if err := applyMonitorOverrideMigration(ctx, tx, old, newTarget); err != nil {
 		return fmt.Errorf("migrate route override: %w", err)
 	}
 	return nil
 }
 
+// applyStatusResultMigration is the status_results counterpart of
+// applyMonitorOverrideMigration: rename, or merge via
+// shouldReplaceCanonicalStatus and delete. Shared by migrateRouteStatus and
+// canonicalizeStatusResults.
+func applyStatusResultMigration(ctx context.Context, tx *sql.Tx, old statusResultRouteAlias, newTarget string) error {
+	var existing statusResultRouteAlias
+	err := tx.QueryRowContext(ctx, `SELECT service_id, target, health, message, checked_at FROM status_results WHERE service_id=? AND target=?`, old.serviceID, newTarget).Scan(&existing.serviceID, &existing.target, &existing.health, &existing.message, &existing.checkedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err := tx.ExecContext(ctx, `UPDATE status_results SET target=? WHERE service_id=? AND target=?`, newTarget, old.serviceID, old.target)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	chosen := existing
+	if shouldReplaceCanonicalStatus(old, existing) {
+		chosen = old
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE status_results SET health=?, message=?, checked_at=? WHERE service_id=? AND target=?`, chosen.health, chosen.message, chosen.checkedAt, old.serviceID, newTarget); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target=?`, old.serviceID, old.target)
+	return err
+}
+
 func migrateRouteStatus(ctx context.Context, tx *sql.Tx, serviceID, oldTarget, newTarget string) error {
-	var old statusResultRouteAlias
+	old := statusResultRouteAlias{serviceID: serviceID, target: oldTarget}
 	err := tx.QueryRowContext(ctx, `SELECT service_id, target, health, message, checked_at FROM status_results WHERE service_id=? AND target=?`, serviceID, oldTarget).Scan(&old.serviceID, &old.target, &old.health, &old.message, &old.checkedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -529,98 +565,81 @@ func migrateRouteStatus(ctx context.Context, tx *sql.Tx, serviceID, oldTarget, n
 	if err != nil {
 		return err
 	}
-	var newer statusResultRouteAlias
-	err = tx.QueryRowContext(ctx, `SELECT service_id, target, health, message, checked_at FROM status_results WHERE service_id=? AND target=?`, serviceID, newTarget).Scan(&newer.serviceID, &newer.target, &newer.health, &newer.message, &newer.checkedAt)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		_, err = tx.ExecContext(ctx, `UPDATE status_results SET target=? WHERE service_id=? AND target=?`, newTarget, serviceID, oldTarget)
-	case err == nil:
-		chosen := newer
-		if shouldReplaceCanonicalStatus(old, newer) {
-			chosen = old
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE status_results SET health=?, message=?, checked_at=? WHERE service_id=? AND target=?`, chosen.health, chosen.message, chosen.checkedAt, serviceID, newTarget)
-		if err == nil {
-			_, err = tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target=?`, serviceID, oldTarget)
-		}
-	}
-	if err != nil {
+	if err := applyStatusResultMigration(ctx, tx, old, newTarget); err != nil {
 		return fmt.Errorf("migrate route status: %w", err)
 	}
 	return nil
 }
 
-func canonicalizeMonitorOverrides(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
-	targetPrefix := routeTargetPrefixForName(targetName)
-	rows, err := tx.QueryContext(ctx, `
-SELECT service_id, target, not_applicable, updated_at
-FROM monitor_overrides
-WHERE target LIKE ?
-`, targetPrefix+"%")
+// canonicalizeRouteAliasRows is the shared gather core of the canonicalize*
+// triplet: select rows matching targetName's prefix, keep only those whose
+// routetarget.CanonicalTargetForName differs from their stored target, and
+// hand each surviving alias to apply. Row shape and merge rule are supplied
+// by the caller.
+func canonicalizeRouteAliasRows[T any](
+	ctx context.Context,
+	tx *sql.Tx,
+	targetName string,
+	query string,
+	scan func(rows *sql.Rows) (T, error),
+	target func(alias T) string,
+	withCanonical func(alias T, canonical string) T,
+	apply func(ctx context.Context, tx *sql.Tx, alias T) error,
+) (bool, error) {
+	rows, err := tx.QueryContext(ctx, query, routeTargetPrefixForName(targetName)+"%")
 	if err != nil {
-		return false, fmt.Errorf("query route override aliases: %w", err)
+		return false, fmt.Errorf("query route aliases: %w", err)
 	}
-	var aliases []monitorOverrideRouteAlias
+	var aliases []T
 	sensitiveChanged := false
 	for rows.Next() {
-		var alias monitorOverrideRouteAlias
-		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.notApplicable, &alias.updatedAt); err != nil {
+		alias, err := scan(rows)
+		if err != nil {
 			_ = rows.Close()
 			return false, err
 		}
-		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
-		if !ok || canonical == alias.target {
+		current := target(alias)
+		canonical, ok := routetarget.CanonicalTargetForName(current, targetName)
+		if !ok || canonical == current {
 			continue
 		}
-		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
-		alias.canonical = canonical
-		aliases = append(aliases, alias)
+		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(current) != current
+		aliases = append(aliases, withCanonical(alias, canonical))
 	}
 	if err := rows.Close(); err != nil {
 		return false, err
 	}
 	for _, alias := range aliases {
-		var existingNotApplicable int
-		var existingUpdatedAt string
-		err := tx.QueryRowContext(ctx, `
-SELECT not_applicable, updated_at
-FROM monitor_overrides
-WHERE service_id=? AND target=?
-`, alias.serviceID, alias.canonical).Scan(&existingNotApplicable, &existingUpdatedAt)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			if _, err := tx.ExecContext(ctx, `
-UPDATE monitor_overrides SET target=?
-WHERE service_id=? AND target=?
-`, alias.canonical, alias.serviceID, alias.target); err != nil {
-				return false, fmt.Errorf("canonicalize route override %s/%s: %w", alias.serviceID, alias.target, err)
-			}
-		case err != nil:
+		if err := apply(ctx, tx, alias); err != nil {
 			return false, err
-		default:
-			mergedNotApplicable := existingNotApplicable
-			if alias.notApplicable > mergedNotApplicable {
-				mergedNotApplicable = alias.notApplicable
-			}
-			mergedUpdatedAt := existingUpdatedAt
-			if alias.updatedAt > mergedUpdatedAt {
-				mergedUpdatedAt = alias.updatedAt
-			}
-			if _, err := tx.ExecContext(ctx, `
-UPDATE monitor_overrides SET not_applicable=?, updated_at=?
-WHERE service_id=? AND target=?
-`, mergedNotApplicable, mergedUpdatedAt, alias.serviceID, alias.canonical); err != nil {
-				return false, fmt.Errorf("merge route override %s/%s: %w", alias.serviceID, alias.target, err)
-			}
-			if _, err := tx.ExecContext(ctx, `
-DELETE FROM monitor_overrides
-WHERE service_id=? AND target=?
-`, alias.serviceID, alias.target); err != nil {
-				return false, fmt.Errorf("delete route override alias %s/%s: %w", alias.serviceID, alias.target, err)
-			}
 		}
 	}
 	return sensitiveChanged, nil
+}
+
+func canonicalizeMonitorOverrides(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
+	return canonicalizeRouteAliasRows(ctx, tx, targetName, `
+SELECT service_id, target, not_applicable, updated_at
+FROM monitor_overrides
+WHERE target LIKE ?
+`,
+		func(rows *sql.Rows) (monitorOverrideRouteAlias, error) {
+			var alias monitorOverrideRouteAlias
+			err := rows.Scan(&alias.serviceID, &alias.target, &alias.notApplicable, &alias.updatedAt)
+			return alias, err
+		},
+		func(alias monitorOverrideRouteAlias) string { return alias.target },
+		func(alias monitorOverrideRouteAlias, canonical string) monitorOverrideRouteAlias {
+			alias.canonical = canonical
+			return alias
+		},
+		func(ctx context.Context, tx *sql.Tx, alias monitorOverrideRouteAlias) error {
+			if err := applyMonitorOverrideMigration(ctx, tx, alias, alias.canonical); err != nil {
+				return fmt.Errorf("canonicalize route override %s/%s: %w", alias.serviceID, alias.target, err)
+			}
+			return nil
+		},
+	)
 }
 
 type statusResultRouteAlias struct {
@@ -633,71 +652,28 @@ type statusResultRouteAlias struct {
 }
 
 func canonicalizeStatusResults(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
-	targetPrefix := routeTargetPrefixForName(targetName)
-	rows, err := tx.QueryContext(ctx, `
+	return canonicalizeRouteAliasRows(ctx, tx, targetName, `
 SELECT service_id, target, health, message, checked_at
 FROM status_results
 WHERE target LIKE ?
-`, targetPrefix+"%")
-	if err != nil {
-		return false, fmt.Errorf("query route status aliases: %w", err)
-	}
-	var aliases []statusResultRouteAlias
-	sensitiveChanged := false
-	for rows.Next() {
-		var alias statusResultRouteAlias
-		if err := rows.Scan(&alias.serviceID, &alias.target, &alias.health, &alias.message, &alias.checkedAt); err != nil {
-			_ = rows.Close()
-			return false, err
-		}
-		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
-		if !ok || canonical == alias.target {
-			continue
-		}
-		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
-		alias.canonical = canonical
-		aliases = append(aliases, alias)
-	}
-	if err := rows.Close(); err != nil {
-		return false, err
-	}
-	for _, alias := range aliases {
-		var existing statusResultRouteAlias
-		err := tx.QueryRowContext(ctx, `
-SELECT service_id, target, health, message, checked_at
-FROM status_results
-WHERE service_id=? AND target=?
-`, alias.serviceID, alias.canonical).Scan(&existing.serviceID, &existing.target, &existing.health, &existing.message, &existing.checkedAt)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			if _, err := tx.ExecContext(ctx, `
-UPDATE status_results SET target=?
-WHERE service_id=? AND target=?
-`, alias.canonical, alias.serviceID, alias.target); err != nil {
-				return false, fmt.Errorf("canonicalize route status %s/%s: %w", alias.serviceID, alias.target, err)
+`,
+		func(rows *sql.Rows) (statusResultRouteAlias, error) {
+			var alias statusResultRouteAlias
+			err := rows.Scan(&alias.serviceID, &alias.target, &alias.health, &alias.message, &alias.checkedAt)
+			return alias, err
+		},
+		func(alias statusResultRouteAlias) string { return alias.target },
+		func(alias statusResultRouteAlias, canonical string) statusResultRouteAlias {
+			alias.canonical = canonical
+			return alias
+		},
+		func(ctx context.Context, tx *sql.Tx, alias statusResultRouteAlias) error {
+			if err := applyStatusResultMigration(ctx, tx, alias, alias.canonical); err != nil {
+				return fmt.Errorf("canonicalize route status %s/%s: %w", alias.serviceID, alias.target, err)
 			}
-		case err != nil:
-			return false, err
-		default:
-			chosen := existing
-			if shouldReplaceCanonicalStatus(alias, existing) {
-				chosen = alias
-			}
-			if _, err := tx.ExecContext(ctx, `
-UPDATE status_results SET health=?, message=?, checked_at=?
-WHERE service_id=? AND target=?
-`, chosen.health, chosen.message, chosen.checkedAt, alias.serviceID, alias.canonical); err != nil {
-				return false, fmt.Errorf("merge route status %s/%s: %w", alias.serviceID, alias.target, err)
-			}
-			if _, err := tx.ExecContext(ctx, `
-DELETE FROM status_results
-WHERE service_id=? AND target=?
-`, alias.serviceID, alias.target); err != nil {
-				return false, fmt.Errorf("delete route status alias %s/%s: %w", alias.serviceID, alias.target, err)
-			}
-		}
-	}
-	return sensitiveChanged, nil
+			return nil
+		},
+	)
 }
 
 func shouldReplaceCanonicalStatus(candidate, existing statusResultRouteAlias) bool {
@@ -719,43 +695,28 @@ type statusHistoryRouteAlias struct {
 }
 
 func canonicalizeStatusHistory(ctx context.Context, tx *sql.Tx, targetName string) (bool, error) {
-	targetPrefix := routeTargetPrefixForName(targetName)
-	rows, err := tx.QueryContext(ctx, `
+	return canonicalizeRouteAliasRows(ctx, tx, targetName, `
 SELECT id, target
 FROM status_history
 WHERE target LIKE ?
-`, targetPrefix+"%")
-	if err != nil {
-		return false, fmt.Errorf("query route history aliases: %w", err)
-	}
-	var aliases []statusHistoryRouteAlias
-	sensitiveChanged := false
-	for rows.Next() {
-		var alias statusHistoryRouteAlias
-		if err := rows.Scan(&alias.id, &alias.target); err != nil {
-			_ = rows.Close()
-			return false, err
-		}
-		canonical, ok := routetarget.CanonicalTargetForName(alias.target, targetName)
-		if !ok || canonical == alias.target {
-			continue
-		}
-		sensitiveChanged = sensitiveChanged || sanitizer.StripURLUserinfo(alias.target) != alias.target
-		alias.canonical = canonical
-		aliases = append(aliases, alias)
-	}
-	if err := rows.Close(); err != nil {
-		return false, err
-	}
-	for _, alias := range aliases {
-		if _, err := tx.ExecContext(ctx, `
-UPDATE status_history SET target=?
-WHERE id=?
-`, alias.canonical, alias.id); err != nil {
-			return false, fmt.Errorf("canonicalize route history %d/%s: %w", alias.id, alias.target, err)
-		}
-	}
-	return sensitiveChanged, nil
+`,
+		func(rows *sql.Rows) (statusHistoryRouteAlias, error) {
+			var alias statusHistoryRouteAlias
+			err := rows.Scan(&alias.id, &alias.target)
+			return alias, err
+		},
+		func(alias statusHistoryRouteAlias) string { return alias.target },
+		func(alias statusHistoryRouteAlias, canonical string) statusHistoryRouteAlias {
+			alias.canonical = canonical
+			return alias
+		},
+		func(ctx context.Context, tx *sql.Tx, alias statusHistoryRouteAlias) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE status_history SET target=? WHERE id=?`, alias.canonical, alias.id); err != nil {
+				return fmt.Errorf("canonicalize route history %d/%s: %w", alias.id, alias.target, err)
+			}
+			return nil
+		},
+	)
 }
 
 type activeRouteOverride struct {

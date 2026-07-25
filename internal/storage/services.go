@@ -33,6 +33,59 @@ ON CONFLICT(name) DO UPDATE SET url=excluded.url, default_ref=excluded.default_r
 	return nil
 }
 
+// replaceServiceRows is the shared core of the three service-replacement call
+// sites (ReplaceConfiguredServices, ReplaceRuntimeServices, and the success
+// branch of FinishScanWithRouteTargetChanges), run inside the caller's open
+// transaction: load current service IDs+incarnations for the scope,
+// optionally delete orphaned status rows for IDs about to disappear, delete
+// the scoped services rows, then re-insert preserving each surviving ID's
+// incarnation.
+//
+// pruneOrphanedStatus is the one deliberate divergence between call sites:
+// true for ReplaceConfiguredServices/ReplaceRuntimeServices, false for
+// FinishScanWithRouteTargetChanges — see its caller.
+func replaceServiceRows(ctx context.Context, tx *sql.Tx, currentIDsQuery string, currentIDsArgs []any, deleteQuery string, deleteArgs []any, services []core.Service, pruneOrphanedStatus bool) error {
+	currentRows, err := tx.QueryContext(ctx, currentIDsQuery, currentIDsArgs...)
+	if err != nil {
+		return err
+	}
+	currentIDs := map[string]string{}
+	for currentRows.Next() {
+		var id, incarnation string
+		if err := currentRows.Scan(&id, &incarnation); err != nil {
+			_ = currentRows.Close()
+			return err
+		}
+		currentIDs[id] = incarnation
+	}
+	if err := currentRows.Close(); err != nil {
+		return err
+	}
+	if pruneOrphanedStatus {
+		newIDs := make(map[string]struct{}, len(services))
+		for _, service := range services {
+			newIDs[service.ID] = struct{}{}
+		}
+		for id := range currentIDs {
+			if _, ok := newIDs[id]; ok {
+				continue
+			}
+			if err := deleteStatusForService(ctx, tx, id); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, deleteQuery, deleteArgs...); err != nil {
+		return err
+	}
+	for _, service := range services {
+		if err := insertService(ctx, tx, service, currentIDs[service.ID]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (store *Store) ReplaceConfiguredServices(ctx context.Context, repositoryName, source string, services []core.Service) error {
 	if source == "" {
 		source = repositoryName
@@ -58,44 +111,12 @@ ON CONFLICT(name) DO UPDATE SET
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=?`, repositoryName)
-	if err != nil {
+	if err := replaceServiceRows(ctx, tx,
+		`SELECT id, incarnation FROM services WHERE repository=?`, []any{repositoryName},
+		`DELETE FROM services WHERE repository=?`, []any{repositoryName},
+		services, true,
+	); err != nil {
 		return err
-	}
-	currentIDs := map[string]string{}
-	for currentRows.Next() {
-		var id, incarnation string
-		if err := currentRows.Scan(&id, &incarnation); err != nil {
-			_ = currentRows.Close()
-			return err
-		}
-		currentIDs[id] = incarnation
-	}
-	if err := currentRows.Close(); err != nil {
-		return err
-	}
-	newIDs := map[string]struct{}{}
-	for _, service := range services {
-		newIDs[service.ID] = struct{}{}
-	}
-	for id := range currentIDs {
-		if _, ok := newIDs[id]; ok {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repositoryName); err != nil {
-		return err
-	}
-	for _, service := range services {
-		if err := insertService(ctx, tx, service, currentIDs[service.ID]); err != nil {
-			return err
-		}
 	}
 	if err := store.commitAndInvalidateSummary(tx); err != nil {
 		return err
@@ -124,44 +145,12 @@ ON CONFLICT(name) DO NOTHING
 		return fmt.Errorf("upsert configured repository %s: %w", repositoryName, err)
 	}
 
-	currentRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source)
-	if err != nil {
+	if err := replaceServiceRows(ctx, tx,
+		`SELECT id, incarnation FROM services WHERE repository=? AND runtime=? AND source_path=?`, []any{repositoryName, runtime, source},
+		`DELETE FROM services WHERE repository=? AND runtime=? AND source_path=?`, []any{repositoryName, runtime, source},
+		services, true,
+	); err != nil {
 		return err
-	}
-	currentIDs := map[string]string{}
-	for currentRows.Next() {
-		var id, incarnation string
-		if err := currentRows.Scan(&id, &incarnation); err != nil {
-			_ = currentRows.Close()
-			return err
-		}
-		currentIDs[id] = incarnation
-	}
-	if err := currentRows.Close(); err != nil {
-		return err
-	}
-	newIDs := map[string]struct{}{}
-	for _, service := range services {
-		newIDs[service.ID] = struct{}{}
-	}
-	for id := range currentIDs {
-		if _, ok := newIDs[id]; ok {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=? AND runtime=? AND source_path=?`, repositoryName, runtime, source); err != nil {
-		return err
-	}
-	for _, service := range services {
-		if err := insertService(ctx, tx, service, currentIDs[service.ID]); err != nil {
-			return err
-		}
 	}
 	if err := store.commitAndInvalidateSummary(tx); err != nil {
 		return err
@@ -204,10 +193,7 @@ func (store *Store) PruneRuntimeServices(ctx context.Context, runtime string, ke
 		return err
 	}
 	for _, id := range removeIDs {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, id); err != nil {
+		if err := deleteStatusForService(ctx, tx, id); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE id=?`, id); err != nil {
@@ -315,30 +301,17 @@ UPDATE repositories SET last_commit=?, last_scan_at=?, status=?, error=? WHERE n
 		for _, service := range services {
 			newIDs[service.ID] = struct{}{}
 		}
-		existingRows, err := tx.QueryContext(ctx, `SELECT id, incarnation FROM services WHERE repository=?`, repoName)
-		if err != nil {
-			return err
-		}
-		existingIncarnations := make(map[string]string)
-		for existingRows.Next() {
-			var id, incarnation string
-			if err := existingRows.Scan(&id, &incarnation); err != nil {
-				_ = existingRows.Close()
-				return err
-			}
-			existingIncarnations[id] = incarnation
-		}
-		if err := existingRows.Close(); err != nil {
-			return err
-		}
 		retainedReplacementIDs = routeReplacementServiceIDs(replacements, newIDs)
-		if _, err := tx.ExecContext(ctx, `DELETE FROM services WHERE repository=?`, repoName); err != nil {
+		// pruneOrphanedStatus=false (preserved, not a fix target — see
+		// docs/tasks/TASK-0066-storage-dedup-and-file-organization.md):
+		// unlike Replace{Configured,Runtime}Services, a successful scan does
+		// not delete status rows for service IDs dropped from this result.
+		if err := replaceServiceRows(ctx, tx,
+			`SELECT id, incarnation FROM services WHERE repository=?`, []any{repoName},
+			`DELETE FROM services WHERE repository=?`, []any{repoName},
+			services, false,
+		); err != nil {
 			return err
-		}
-		for _, service := range services {
-			if err := insertService(ctx, tx, service, existingIncarnations[service.ID]); err != nil {
-				return err
-			}
 		}
 	}
 	if err := store.commitAndInvalidateSummary(tx); err != nil {

@@ -63,3 +63,46 @@ func deleteByServiceAndTargets(ctx context.Context, tx *sql.Tx, table string, se
 	}
 	return nil
 }
+
+// sqlExecutor lets a helper run both inside a transaction (*sql.Tx) and
+// directly against store.db (*sql.DB).
+type sqlExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func deleteStatusForService(ctx context.Context, tx *sql.Tx, serviceID string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=?`, serviceID); err != nil {
+		return fmt.Errorf("delete status_results rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=?`, serviceID); err != nil {
+		return fmt.Errorf("delete status_history rows: %w", err)
+	}
+	return nil
+}
+
+func deleteStatusForServiceTargetPrefix(ctx context.Context, tx *sql.Tx, serviceID, prefix string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target LIKE ?`, serviceID, prefix); err != nil {
+		return fmt.Errorf("delete status_results rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target LIKE ?`, serviceID, prefix); err != nil {
+		return fmt.Errorf("delete status_history rows: %w", err)
+	}
+	return nil
+}
+
+func deleteStatusHistoryForServiceTarget(ctx context.Context, exec sqlExecutor, serviceID, target string) error {
+	if _, err := exec.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target=?`, serviceID, target); err != nil {
+		return fmt.Errorf("delete status_history rows: %w", err)
+	}
+	return nil
+}
+
+// deleteStatusHistoryBefore runs both inside a transaction and directly on
+// store.db (age-cutoff prune), hence the sqlExecutor parameter.
+func deleteStatusHistoryBefore(ctx context.Context, exec sqlExecutor, cutoff string) (sql.Result, error) {
+	result, err := exec.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("delete status_history rows: %w", err)
+	}
+	return result, nil
+}

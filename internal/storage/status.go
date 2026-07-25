@@ -201,16 +201,11 @@ ON CONFLICT(service_id, target) DO UPDATE SET
 			return fmt.Errorf("update status override %s/%s: %w", serviceID, target, err)
 		}
 		if resolved.syntheticRouteParent {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target LIKE ?`, serviceID, routeTargetPrefix+"%"); err != nil {
+			if err := deleteStatusForServiceTargetPrefix(ctx, tx, serviceID, routeTargetPrefix+"%"); err != nil {
 				return fmt.Errorf("clear child route statuses %s/%s: %w", serviceID, target, err)
 			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target LIKE ?`, serviceID, routeTargetPrefix+"%"); err != nil {
-				return fmt.Errorf("clear child route history %s/%s: %w", serviceID, target, err)
-			}
 		}
-		if _, err := tx.ExecContext(ctx, `
-DELETE FROM status_history WHERE service_id=? AND target=?
-`, serviceID, target); err != nil {
+		if err := deleteStatusHistoryForServiceTarget(ctx, tx, serviceID, target); err != nil {
 			return fmt.Errorf("clear ignored status history %s/%s: %w", serviceID, target, err)
 		}
 	} else {
@@ -338,13 +333,22 @@ func (store *Store) PruneStatusTargets(ctx context.Context, serviceID, exactTarg
 		return err
 	}
 
-	for _, target := range removeTargets {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_results WHERE service_id=? AND target=?`, serviceID, target); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM status_history WHERE service_id=? AND target=?`, serviceID, target); err != nil {
-			return err
-		}
+	return store.commitStatusTargetPrune(ctx, tx, serviceID, removeTargets)
+}
+
+// commitStatusTargetPrune is the shared removal/commit/alert tail for
+// PruneStatusTargets and PruneStatusTargetsFromKnown: delete the given
+// targets' status_results and status_history rows within the caller's
+// already-open transaction, commit, and produce a health alert observation.
+// The two callers differ only in how they gather removeTargets (exclusion
+// consultation, keepExact) — that gather logic, and each caller's
+// transaction boundary, is preserved exactly.
+func (store *Store) commitStatusTargetPrune(ctx context.Context, tx *sql.Tx, serviceID string, removeTargets []string) error {
+	if err := deleteByServiceAndTargets(ctx, tx, "status_results", serviceID, removeTargets); err != nil {
+		return err
+	}
+	if err := deleteByServiceAndTargets(ctx, tx, "status_history", serviceID, removeTargets); err != nil {
+		return err
 	}
 	if err := store.commitAndInvalidateSummary(tx); err != nil {
 		return err
@@ -517,17 +521,7 @@ func (store *Store) PruneStatusTargetsFromKnown(ctx context.Context, serviceID, 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := deleteByServiceAndTargets(ctx, tx, "status_results", serviceID, removeTargets); err != nil {
-		return err
-	}
-	if err := deleteByServiceAndTargets(ctx, tx, "status_history", serviceID, removeTargets); err != nil {
-		return err
-	}
-	if err := store.commitAndInvalidateSummary(tx); err != nil {
-		return err
-	}
-	store.observeHealthAlert(ctx, serviceID, time.Now().UTC())
-	return nil
+	return store.commitStatusTargetPrune(ctx, tx, serviceID, removeTargets)
 }
 
 func applyLatestStatus(services []core.Service, statuses []core.StatusResult) {
@@ -663,9 +657,7 @@ ON CONFLICT(service_id, target) DO UPDATE SET
 		return fmt.Errorf("upsert status %s/%s: %w", status.ServiceID, status.Target, err)
 	}
 	if status.Health == core.HealthNotApplicable {
-		if _, err := tx.ExecContext(ctx, `
-DELETE FROM status_history WHERE service_id=? AND target=?
-`, status.ServiceID, status.Target); err != nil {
+		if err := deleteStatusHistoryForServiceTarget(ctx, tx, status.ServiceID, status.Target); err != nil {
 			return fmt.Errorf("clear not applicable status history %s/%s: %w", status.ServiceID, status.Target, err)
 		}
 		if err := store.commitAndInvalidateSummary(tx); err != nil {
@@ -851,7 +843,7 @@ func rollupObservationID(statuses []core.StatusResult) string {
 
 func (store *Store) PruneStatusHistory(ctx context.Context) error {
 	cutoff := time.Now().UTC().Add(-statusHistoryWindow).Format(time.RFC3339)
-	result, err := store.db.ExecContext(ctx, `DELETE FROM status_history WHERE checked_at < ?`, cutoff)
+	result, err := deleteStatusHistoryBefore(ctx, store.db, cutoff)
 	if err != nil {
 		return fmt.Errorf("prune status history: %w", err)
 	}
