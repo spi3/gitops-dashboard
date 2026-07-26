@@ -580,6 +580,16 @@ test("keeps slash-distinct route controls and override targets", async ({ page }
   });
 });
 
+test("serves a favicon linked from the page head", async ({ page }) => {
+  await page.goto(baseURL);
+  const iconLink = page.locator('link[rel="icon"]');
+  await expect(iconLink).toHaveAttribute("href", "/favicon.svg");
+  const iconHref = await iconLink.getAttribute("href");
+  const response = await page.request.get(new URL(iconHref ?? "", baseURL).toString());
+  expect(response.status()).toBe(200);
+  expect(response.headers()["content-type"]).toContain("image/svg+xml");
+});
+
 test.describe("agent report-driven compose service health", () => {
   const target = "agent-target";
   const token = "dashboard-agent-token";

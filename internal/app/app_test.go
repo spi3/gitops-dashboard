@@ -19,6 +19,7 @@ import (
 	"github.com/example/gitops-dashboard/internal/config"
 	"github.com/example/gitops-dashboard/internal/core"
 	"github.com/example/gitops-dashboard/internal/storage"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestMergeAgentsCombinesReportedAndConfigured(t *testing.T) {
@@ -125,6 +126,76 @@ func TestHandlerServesSummaryAndFrontend(t *testing.T) {
 	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
 	if res.Code != http.StatusOK {
 		t.Fatalf("frontend status = %d", res.Code)
+	}
+}
+
+func TestFaviconServedWithSVGContentTypeInDevNoAuth(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth:       config.AuthConfig{Mode: "dev-no-auth"},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler()
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/favicon.svg", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("favicon status = %d, want 200", res.Code)
+	}
+	if got := res.Header().Get("Content-Type"); got != "image/svg+xml" {
+		t.Fatalf("favicon Content-Type = %q, want %q", got, "image/svg+xml")
+	}
+}
+
+func TestFaviconRequiresBasicAuthCredentials(t *testing.T) {
+	t.Parallel()
+	hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Listen:       ":0",
+			DataDir:      t.TempDir(),
+			RepoCacheDir: filepath.Join(t.TempDir(), "repos"),
+		},
+		Auth: config.AuthConfig{
+			Mode:  "basic",
+			Users: []config.AuthUser{{Username: "admin", PasswordHash: string(hash)}},
+		},
+		Monitoring: config.MonitoringConfig{DefaultInterval: "30s"},
+	}
+	app, err := New(cfg, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	handler := app.Handler()
+
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/favicon.svg", nil))
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated favicon status = %d, want 401", res.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/favicon.svg", nil)
+	req.SetBasicAuth("admin", "secret")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("authenticated favicon status = %d, want 200", res.Code)
+	}
+	if got := res.Header().Get("Content-Type"); got != "image/svg+xml" {
+		t.Fatalf("favicon Content-Type = %q, want %q", got, "image/svg+xml")
 	}
 }
 
